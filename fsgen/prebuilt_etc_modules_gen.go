@@ -220,6 +220,7 @@ var (
 		"system":              etc.PrebuiltSystemFactory,
 		"res":                 etc.PrebuiltResFactory,
 		"rfs":                 etc.PrebuiltRfsFactory,
+		"tee":                 etc.PrebuiltTeeFactory,
 		"tts":                 etc.PrebuiltVoicepackFactory,
 		"tvconfig":            etc.PrebuiltTvConfigFactory,
 		"tvservice":           etc.PrebuiltTvServiceFactory,
@@ -231,6 +232,7 @@ var (
 		"usr/idc":             etc.PrebuiltUserIdcFactory,
 		"vendor":              etc.PrebuiltVendorFactory,
 		"vendor_dlkm":         etc.PrebuiltVendorDlkmFactory,
+		"vendor_overlay":      etc.PrebuiltVendorOverlayFactory,
 		"wallpaper":           etc.PrebuiltWallpaperFactory,
 		"wlc_upt":             etc.PrebuiltWlcUptFactory,
 	}
@@ -365,16 +367,14 @@ func createPrebuiltEtcModulesInDirectory(ctx android.LoadHookContext, partition,
 		}
 
 		if allCopyFileNamesUnchanged {
-			// Specify relative_install_path if it is not installed in the root directory of the
-			// partition
+			// Specify relative_install_path if it is not installed in the base directory of the module.
+			// In case of prebuilt_{root,any} this is equivalent to the root of the partition.
 			if !android.InList(relDestDirFromInstallDirBase, []string{"", "."}) {
 				propsList = append(propsList, &prebuiltSubdirProperties{
 					Relative_install_path: proptools.StringPtr(relDestDirFromInstallDirBase),
 				})
 			}
 		} else {
-			// If dsts property has to be set and the selected module type is prebuilt_root,
-			// use prebuilt_any instead.
 			dsts := proptools.NewConfigurable[[]string](nil, nil)
 			for _, installBaseFile := range installBaseFiles {
 				dsts.AppendSimpleValue([]string{filepath.Join(relDestDirFromInstallDirBase, installBaseFile)})

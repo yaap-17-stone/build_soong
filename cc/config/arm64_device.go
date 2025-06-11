@@ -53,6 +53,16 @@ var (
 			"-mbranch-protection=standard",
 			"-fno-stack-protector",
 		},
+		"armv9-3a": []string{
+			"-march=armv9.3-a",
+			"-mbranch-protection=standard",
+			"-fno-stack-protector",
+		},
+		"armv9-4a": []string{
+			"-march=armv9.4-a",
+			"-mbranch-protection=standard",
+			"-fno-stack-protector",
+		},
 	}
 
 	arm64Ldflags = []string{
@@ -102,7 +112,7 @@ var (
 		},
 		"exynos-m4": []string{
 			"-mcpu=exynos-m4",
-                },
+		},
 	}
 )
 
@@ -156,7 +166,7 @@ var (
 		"cortex-a76":  "${config.Arm64CortexA76Cflags}",
 		"kryo":        "${config.Arm64KryoCflags}",
 		"kryo385":     "${config.Arm64Kryo385Cflags}",
-		"kryo785":    "${config.Arm64Kryo785Cflags}",
+		"kryo785":     "${config.Arm64Kryo785Cflags}",
 		"exynos-m1":   "${config.Arm64ExynosM1Cflags}",
 		"exynos-m2":   "${config.Arm64ExynosM2Cflags}",
 		"exynos-m4":   "${config.Arm64ExynosM4Cflags}",
@@ -170,7 +180,6 @@ var (
 		"exynos-m1":  "${config.Arm64FixCortexA53Ldflags}",
 		"exynos-m2":  "${config.Arm64FixCortexA53Ldflags}",
 		"exynos-m4":  "${config.Arm64FixCortexA53Ldflags}",
-
 	}
 )
 

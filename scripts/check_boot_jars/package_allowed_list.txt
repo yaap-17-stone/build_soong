@@ -261,6 +261,11 @@ com\.google\.i18n\.phonenumbers
 org\.chromium\.arc
 org\.chromium\.arc\..*
 
+###################################################
+# Packages used for wear-sdk in Wear OS
+com\.google\.wear
+com\.google\.wear\..*
+
 # OPLUS adds
 com\.oplus\..*
 net\.oneplus\..*
