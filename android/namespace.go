@@ -88,14 +88,6 @@ type NameResolver struct {
 	// Map from dir to namespace. Will have duplicates if two dirs are part of the same namespace.
 	namespacesByDir syncmap.SyncMap[string, *Namespace]
 
-	// A cache for findNamespace(). Basically the same as namespacesByDir, except sub-directories
-	// will map to the namespace in their parent directories.
-	findNamespaceCache syncmap.SyncMap[string, *Namespace]
-
-	// A list of directories that already have a module added to them, used to detect if the
-	// namespace module is the first module in the bp file or not.
-	initializedDirectories syncmap.SyncMap[string, bool]
-
 	// func telling whether to export a namespace to Kati
 	namespaceExportFilter func(*Namespace) bool
 }
@@ -154,15 +146,17 @@ func (r *NameResolver) addNewNamespaceForModule(module *NamespaceModule, path st
 }
 
 func (r *NameResolver) addNamespace(namespace *Namespace) (err error) {
-	if _, exists := r.namespaceAt(namespace.Path); exists {
-		return fmt.Errorf("namespace %v already exists", namespace.Path)
+	existingNamespace, exists := r.namespaceAt(namespace.Path)
+	if exists {
+		if existingNamespace.Path == namespace.Path {
+			return fmt.Errorf("namespace %v already exists", namespace.Path)
+		} else {
+			// It would probably confuse readers if namespaces were declared anywhere but
+			// the top of the file, so we forbid declaring namespaces after anything else.
+			return fmt.Errorf("a namespace must be the first module in the file")
+		}
 	}
-	if _, ok := r.initializedDirectories.Load(namespace.Path); ok {
-		// It would probably confuse readers if namespaces were declared anywhere but
-		// the top of the file, so we forbid declaring namespaces after anything else.
-		return fmt.Errorf("a namespace must be the first module in the file")
-	}
-	if (namespace.exportToKati) {
+	if namespace.exportToKati {
 		r.rootNamespace.visibleNamespaces = append(r.rootNamespace.visibleNamespaces, namespace)
 	}
 	r.sortedNamespaces.add(namespace)
@@ -178,13 +172,8 @@ func (r *NameResolver) namespaceAt(path string) (namespace *Namespace, found boo
 
 // recursive search upward for a namespace
 func (r *NameResolver) findNamespace(path string) (namespace *Namespace) {
-	namespace, found := r.findNamespaceCache.Load(path)
+	namespace, found := r.namespaceAt(path)
 	if found {
-		return namespace
-	}
-	namespace, found = r.namespaceAt(path)
-	if found {
-		r.findNamespaceCache.Store(path, namespace)
 		return namespace
 	}
 	parentDir := filepath.Dir(path)
@@ -192,7 +181,7 @@ func (r *NameResolver) findNamespace(path string) (namespace *Namespace) {
 		return nil
 	}
 	namespace = r.findNamespace(parentDir)
-	r.findNamespaceCache.Store(path, namespace)
+	r.namespacesByDir.Store(path, namespace)
 	return namespace
 }
 
@@ -288,12 +277,8 @@ func (r *NameResolver) ModuleFromName(name string, namespace blueprint.Namespace
 	// handle fully qualified references like "//namespace_path:module_name"
 	modulePath, moduleName, isAbs := r.parseFullyQualifiedName(name)
 	if isAbs {
-		// TODO(b/432305765): We should not use findNamespace here, as it allows for many different
-		// ways to refer to the same module. We should require that the path exactly points to
-		// the folder the module is defined in. The //path:module syntax predates namespaces and
-		// used to work that way, and using the directory of the module is what bazel does.
-		namespace := r.findNamespace(modulePath)
-		if namespace == nil {
+		namespace, found := r.namespaceAt(modulePath)
+		if !found {
 			return blueprint.ModuleGroup{}, false
 		}
 		container := namespace.moduleContainer
@@ -306,6 +291,7 @@ func (r *NameResolver) ModuleFromName(name string, namespace blueprint.Namespace
 		}
 	}
 	return blueprint.ModuleGroup{}, false
+
 }
 
 func (r *NameResolver) Rename(oldName string, newName string, namespace blueprint.Namespace) []error {
@@ -318,28 +304,12 @@ func (r *NameResolver) FindNamespaceImports(namespace *Namespace) (err error) {
 	// search itself first
 	namespace.visibleNamespaces = append(namespace.visibleNamespaces, namespace)
 	// search its imports next
-	seen := make(map[string]bool)
-	var errs []error
 	for _, name := range namespace.importedNamespaceNames {
 		imp, ok := r.namespaceAt(name)
 		if !ok {
-			nextNsUp := r.findNamespace(name)
-			nextNsUpMsg := ""
-			if nextNsUp != nil && nextNsUp.Path != "." {
-				nextNsUpMsg = fmt.Sprintf(" Did you mean %q?", nextNsUp.Path)
-			}
-			errs = append(errs, fmt.Errorf("namespace %v does not exist; Some necessary modules may have been skipped by Soong. Check if PRODUCT_SOURCE_ROOT_DIRS is pruning necessary Android.bp files.%s", name, nextNsUpMsg))
-			continue
+			return fmt.Errorf("namespace %v does not exist; Some necessary modules may have been skipped by Soong. Check if PRODUCT_SOURCE_ROOT_DIRS is pruning necessary Android.bp files.", name)
 		}
-		if _, ok := seen[name]; ok {
-			errs = append(errs, fmt.Errorf("duplicate namespace import %s", name))
-			continue
-		}
-		seen[name] = true
 		namespace.visibleNamespaces = append(namespace.visibleNamespaces, imp)
-	}
-	if len(errs) > 0 {
-		return errors.Join(errs...)
 	}
 	// search the root namespace last
 	namespace.visibleNamespaces = append(namespace.visibleNamespaces, r.rootNamespace)
@@ -405,9 +375,7 @@ func (r *NameResolver) GetNamespace(ctx blueprint.NamespaceContext) blueprint.Na
 }
 
 func (r *NameResolver) findNamespaceFromCtx(ctx blueprint.NamespaceContext) *Namespace {
-	dir := filepath.Dir(ctx.ModulePath())
-	r.initializedDirectories.Store(dir, true)
-	return r.findNamespace(dir)
+	return r.findNamespace(filepath.Dir(ctx.ModulePath()))
 }
 
 func (r *NameResolver) UniqueName(ctx blueprint.NamespaceContext, name string) (unique string) {
