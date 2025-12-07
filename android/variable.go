@@ -235,6 +235,7 @@ type ProductVariables struct {
 	DeviceCurrentApiLevelForVendorModules *string  `json:",omitempty"`
 	DeviceSystemSdkVersions               []string `json:",omitempty"`
 	DeviceMaxPageSizeSupported            *string  `json:",omitempty"`
+	DeviceCheckPrebuiltMaxPageSize        *bool    `json:",omitempty"`
 	DeviceNoBionicPageSizeMacro           *bool    `json:",omitempty"`
 
 	VendorApiLevel             *string `json:",omitempty"`
@@ -275,10 +276,12 @@ type ProductVariables struct {
 	AAPTPreferredConfig *string  `json:",omitempty"`
 	AAPTPrebuiltDPI     []string `json:",omitempty"`
 
-	DefaultAppCertificate           *string  `json:",omitempty"`
-	ExtraOtaKeys                    []string `json:",omitempty"`
-	ExtraOtaRecoveryKeys            []string `json:",omitempty"`
-	MainlineSepolicyDevCertificates *string  `json:",omitempty"`
+	DefaultAppCertificate                    *string  `json:",omitempty"`
+	DefaultSystemDevCertificate              *string  `json:",omitempty"`
+	ExtraOtaKeys                             []string `json:",omitempty"`
+	ExtraOtaRecoveryKeys                     []string `json:",omitempty"`
+	MainlineSepolicyDevCertificates          *string  `json:",omitempty"`
+	MainlineBluetoothSepolicyDevCertificates *string  `json:",omitempty"`
 
 	AppsDefaultVersionName *string `json:",omitempty"`
 
@@ -296,6 +299,7 @@ type ProductVariables struct {
 	Binder32bit                  *bool    `json:",omitempty"`
 	UseABFS                      *bool    `json:",omitempty"`
 	UseRBE                       *bool    `json:",omitempty"`
+	UseREWrapper                 *bool    `json:",omitempty"`
 	UseRBEJAVAC                  *bool    `json:",omitempty"`
 	UseRBER8                     *bool    `json:",omitempty"`
 	UseRBED8                     *bool    `json:",omitempty"`
@@ -462,6 +466,7 @@ type ProductVariables struct {
 	BuildBrokenInputDirModules          []string `json:",omitempty"`
 	BuildBrokenDontCheckSystemSdk       bool     `json:",omitempty"`
 	BuildBrokenDupSysprop               bool     `json:",omitempty"`
+	BuildBrokenPrebuiltELFFiles         bool     `json:",omitempty"`
 
 	BuildDebugfsRestrictionsEnabled bool `json:",omitempty"`
 
@@ -514,8 +519,6 @@ type ProductVariables struct {
 
 	ProductDefaultWifiChannels []string `json:",omitempty"`
 
-	BoardUseVbmetaDigestInFingerprint *bool `json:",omitempty"`
-
 	OemProperties []string `json:",omitempty"`
 
 	ArtTargetIncludeDebugBuild *bool `json:",omitempty"`
@@ -547,8 +550,6 @@ type ProductVariables struct {
 	OdmManifestFiles       []string `json:",omitempty"`
 	OdmManifestSkus        []string `json:",omitempty"`
 
-	UseSoongNoticeXML *bool `json:",omitempty"`
-
 	StripByDefault *bool `json:",omitempty"`
 
 	CompatibilityTestcases map[string]CompatibilityTestcaseJSON
@@ -559,6 +560,8 @@ type ProductVariables struct {
 	EnforceSELinuxTrebleLabeling *bool `json:",omitempty"`
 
 	SELinuxTrebleLabelingTrackingListFile *string `json:",omitempty"`
+
+	BuildOTAPackage *bool `json:",omitempty"`
 }
 
 type CompatibilityTestcaseJSON struct {
@@ -572,6 +575,7 @@ type PartitionQualifiedVariablesType struct {
 	BoardErofsCompressor        string `json:",omitempty"`
 	BoardErofsCompressHints     string `json:",omitempty"`
 	BoardErofsPclusterSize      string `json:",omitempty"`
+	BoardErofsBlockSize         string `json:",omitempty"`
 	BoardExtfsInodeCount        string `json:",omitempty"`
 	BoardExtfsRsvPct            string `json:",omitempty"`
 	BoardF2fsSloadCompressFlags string `json:",omitempty"`
@@ -608,6 +612,18 @@ type ChainedAvbPartitionProps struct {
 	RollbackIndexLocation string   `json:",omitempty"`
 }
 
+type ProductPackagesVariables struct {
+	ProductPackages                   []string `json:",omitempty"`
+	ProductPackagesDebug              []string `json:",omitempty"`
+	ProductPackagesEng                []string `json:",omitempty"`
+	ProductPackagesDebugAsan          []string `json:",omitempty"`
+	ProductPackagesDebugJavaCoverage  []string `json:",omitempty"`
+	ProductPackagesArm64              []string `json:",omitempty"`
+	ProductPackagesShippingApiLevel29 []string `json:",omitempty"`
+	ProductPackagesShippingApiLevel33 []string `json:",omitempty"`
+	ProductPackagesShippingApiLevel34 []string `json:",omitempty"`
+}
+
 type PartitionVariables struct {
 	ProductDirectory            string `json:",omitempty"`
 	PartitionQualifiedVariables map[string]PartitionQualifiedVariablesType
@@ -623,6 +639,7 @@ type PartitionVariables struct {
 	BoardErofsCompressor           string `json:",omitempty"`
 	BoardErofsCompressorHints      string `json:",omitempty"`
 	BoardErofsPclusterSize         string `json:",omitempty"`
+	BoardErofsBlockSize            string `json:",omitempty"`
 	BoardErofsShareDupBlocks       string `json:",omitempty"`
 	BoardErofsUseLegacyCompression string `json:",omitempty"`
 	BoardExt4ShareDupBlocks        string `json:",omitempty"`
@@ -652,7 +669,6 @@ type PartitionVariables struct {
 	BoardInitBootimagePartitionSize   string   `json:",omitempty"`
 	BoardBootHeaderVersion            string   `json:",omitempty"`
 	BoardInitBootHeaderVersion        string   `json:",omitempty"`
-	TargetKernelPath                  string   `json:",omitempty"`
 	BoardUsesGenericKernelImage       bool     `json:",omitempty"`
 	BootSecurityPatch                 string   `json:",omitempty"`
 	InitBootSecurityPatch             string   `json:",omitempty"`
@@ -660,6 +676,33 @@ type PartitionVariables struct {
 	InternalKernelCmdline             []string `json:",omitempty"`
 	InternalBootconfig                []string `json:",omitempty"`
 	InternalBootconfigFile            string   `json:",omitempty"`
+	BoardPrebuiltBootImage            string   `json:",omitempty"`
+	BoardKernelPath16k                string   `json:",omitempty"`
+	BoardPrebuiltDtboImage            string   `json:",omitempty"`
+	BoardPrebuiltDtboImage16kb        string   `json:",omitempty"`
+	BoardDtboPartitionSize            string   `json:",omitempty"`
+	Board16kOtaUseIncremental         bool     `json:",omitempty"`
+	Board16kOtaMoveVendor             bool     `json:",omitempty"`
+	BoardPrebuiltDtbDir               string   `json:",omitempty"`
+	BoardKernelModules16K             []string `json:",omitempty"`
+	BoardKernelModulesLoad16K         []string `json:",omitempty"`
+	BuildingDebugBootImage            bool     `json:",omitempty"`
+	BuildingDebugVendorBootImage      bool     `json:",omitempty"`
+	BoardVendorRamdiskFragments       []string `json:",omitempty"`
+
+	// Radio stuff
+	AbOtaRadioPartitions       []string `json:",omitempty"`
+	BootloaderFilePath         string   `json:",omitempty"`
+	AbOtaBootloaderPartitions  []string `json:",omitempty"`
+	BoardRadioImagePath        string   `json:",omitempty"`
+	BoardPrebuiltTzswImagePath string   `json:",omitempty"`
+
+	// pvmfw stuff
+	BoardUsesPvmfwImage              bool   `json:",omitempty"`
+	BoardPvmfwPartitionSize          string `json:",omitempty"`
+	BoardPvmfwImagePrebuilt          string `json:",omitempty"`
+	BoardPvmfwBinPrebuilt            string `json:",omitempty"`
+	BoardPvmfwEmbeddedAvbkeyPrebuilt string `json:",omitempty"`
 
 	// Super image stuff
 	ProductUseDynamicPartitions       bool                                     `json:",omitempty"`
@@ -667,6 +710,8 @@ type PartitionVariables struct {
 	ProductBuildSuperPartition        bool                                     `json:",omitempty"`
 	BuildingSuperEmptyImage           bool                                     `json:",omitempty"`
 	BoardSuperPartitionSize           string                                   `json:",omitempty"`
+	BoardSuperPartitionWarnLimit      string                                   `json:",omitempty"`
+	BoardSuperPartitionErrorLimit     string                                   `json:",omitempty"`
 	BoardSuperPartitionMetadataDevice string                                   `json:",omitempty"`
 	BoardSuperPartitionBlockDevices   []string                                 `json:",omitempty"`
 	BoardSuperPartitionGroups         map[string]BoardSuperPartitionGroupProps `json:",omitempty"`
@@ -690,22 +735,30 @@ type PartitionVariables struct {
 	BuildingVbmetaImage     bool                                `json:",omitempty"`
 	ChainedVbmetaPartitions map[string]ChainedAvbPartitionProps `json:",omitempty"`
 
-	ProductPackages                   []string `json:",omitempty"`
-	ProductPackagesDebug              []string `json:",omitempty"`
-	ProductPackagesEng                []string `json:",omitempty"`
-	ProductPackagesDebugAsan          []string `json:",omitempty"`
-	ProductPackagesDebugJavaCoverage  []string `json:",omitempty"`
-	ProductPackagesArm64              []string `json:",omitempty"`
-	ProductPackagesShippingApiLevel29 []string `json:",omitempty"`
-	ProductPackagesShippingApiLevel33 []string `json:",omitempty"`
-	ProductPackagesShippingApiLevel34 []string `json:",omitempty"`
-	VendorLinkerConfigSrcs            []string `json:",omitempty"`
-	ProductLinkerConfigSrcs           []string `json:",omitempty"`
+	ProductPackagesSet      map[string]ProductPackagesVariables `json:",omitempty"`
+	VendorLinkerConfigSrcs  []string                            `json:",omitempty"`
+	ProductLinkerConfigSrcs []string                            `json:",omitempty"`
 
 	BoardInfoFiles      []string `json:",omitempty"`
 	BootLoaderBoardName string   `json:",omitempty"`
 
 	ProductCopyFiles []string `json:",omitempty"`
+
+	// To be used in artifact_path_requirements.
+	// We still need this even in soong-only build until we remove PRODUCT_PACKAGES from the make
+	// world.
+	EnforceArtifactPathRequirements             string              `json:",omitempty"`
+	ArtifactPathRequirementAllowedList          []string            `json:",omitempty"`
+	ArtifactPathRequirementProducts             []string            `json:",omitempty"`
+	ArtifactPathRequirementSyspropAllowedList   []string            `json:",omitempty"`
+	ProductSystemProperties                     []string            `json:",omitempty"`
+	ProductSystemDefaultProperties              []string            `json:",omitempty"`
+	ArtifactPathRequirementsOfMakefile          map[string][]string `json:",omitempty"`
+	ArtifactPathAllowedListOfMakefile           map[string][]string `json:",omitempty"`
+	SystemPropertiesOfMakefile                  map[string][]string `json:",omitempty"`
+	SystemDefaultPropertiesOfMakefile           map[string][]string `json:",omitempty"`
+	DeviceFcmFileOfMakefile                     map[string][]string `json:",omitempty"`
+	ArtifactPathRequirementsIsRelaxedOfMakefile map[string]bool     `json:",omitempty"`
 
 	BuildingSystemDlkmImage             bool     `json:",omitempty"`
 	SystemKernelModules                 []string `json:",omitempty"`
@@ -713,6 +766,7 @@ type PartitionVariables struct {
 	SystemKernelLoadModules             []string `json:",omitempty"`
 	BuildingVendorDlkmImage             bool     `json:",omitempty"`
 	VendorKernelModules                 []string `json:",omitempty"`
+	VendorKernelModulesLoad             []string `json:",omitempty"`
 	VendorKernelBlocklistFile           string   `json:",omitempty"`
 	VendorKernelModules2ndStage16kbMode []string `json:",omitempty"`
 	BuildingOdmDlkmImage                bool     `json:",omitempty"`
@@ -725,6 +779,9 @@ type PartitionVariables struct {
 	VendorRamdiskKernelOptionsFile   string   `json:",omitempty"`
 	DoNotStripVendorRamdiskModules   bool     `json:",omitempty"`
 	DoNotStripVendorModules          bool     `json:",omitempty"`
+
+	VendorKernelRamdiskKernelModules              []string `json:",omitempty"`
+	VendorKernelRamdiskKernelModulesBlocklistFile string   `json:",omitempty"`
 
 	ProductFsverityGenerateMetadata bool `json:",omitempty"`
 
@@ -747,6 +804,14 @@ type PartitionVariables struct {
 	BoardFastbootInfoFile string `json:",omitempty"`
 
 	TargetRecoveryWipe string `json:",omitempty"`
+
+	TargetRecoveryFstab        string `json:",omitempty"`
+	TargetRecoveryFstabGenrule string `json:",omitempty"`
+	TargetRecoveryFstabDefault string `json:",omitempty"`
+
+	VendorBlobsLicense string `json:",omitempty"`
+
+	MinimalFontFootprint bool `json:",omitempty"`
 }
 
 func boolPtr(v bool) *bool {

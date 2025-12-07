@@ -52,7 +52,7 @@ func init() {
 type toolchainArm struct {
 	toolchain32Bit
 	toolchainRustFlags string
-	ldflags string
+	ldflags            string
 }
 
 func (t *toolchainArm) RustTriple() string {
@@ -96,6 +96,6 @@ func ArmToolchainFactory(arch android.Arch) Toolchain {
 
 	return &toolchainArm{
 		toolchainRustFlags: strings.Join(toolchainRustFlags, " "),
-		ldflags: strings.ReplaceAll(cc_toolchain.Ldflags(), "${config.", "${cc_config."),
+		ldflags:            strings.ReplaceAll(cc_toolchain.Ldflags(), "${config.", "${cc_config."),
 	}
 }

@@ -65,7 +65,7 @@ func init() {
 type toolchainX86 struct {
 	toolchain32Bit
 	toolchainRustFlags string
-	ldflags string
+	ldflags            string
 }
 
 func (t *toolchainX86) RustTriple() string {
@@ -73,7 +73,7 @@ func (t *toolchainX86) RustTriple() string {
 }
 
 func (t *toolchainX86) ToolchainLinkFlags() string {
-	// Prepend the ld flags from cc_config so we stay in sync with cc
+	// Prepend the lld flags from cc_config so we stay in sync with cc
 	return "${config.DeviceGlobalLinkFlags} " + t.ldflags + " ${config.X86ToolchainLinkFlags}"
 }
 
@@ -109,6 +109,6 @@ func x86ToolchainFactory(arch android.Arch) Toolchain {
 
 	return &toolchainX86{
 		toolchainRustFlags: strings.Join(toolchainRustFlags, " "),
-		ldflags: strings.ReplaceAll(cc_toolchain.Ldflags(), "${config.", "${cc_config."),
+		ldflags:            strings.ReplaceAll(cc_toolchain.Ldflags(), "${config.", "${cc_config."),
 	}
 }

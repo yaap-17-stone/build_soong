@@ -20,6 +20,7 @@ package java
 
 import (
 	"fmt"
+	"maps"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -266,6 +267,11 @@ type UsesLibraryDependencyInfo struct {
 	ClassLoaderContexts dexpreopt.ClassLoaderContextMap
 }
 
+// Return a deep copy of ClassLoaderContexts.
+func (u *UsesLibraryDependencyInfo) GetClassLoaderContexts() dexpreopt.ClassLoaderContextMap {
+	return u.ClassLoaderContexts.DeepCopy()
+}
+
 type ProvidesUsesLibInfo struct {
 	ProvidesUsesLib *string
 }
@@ -343,6 +349,8 @@ type JavaInfo struct {
 
 	// SrcJarDeps is a list of paths to depend on when packaging the sources of this module.
 	SrcJarDeps android.Paths
+
+	KSnapshotFiles map[string]android.Path
 
 	// The source files of this module and all its transitive static dependencies.
 	TransitiveSrcFiles depset.DepSet[android.Path]
@@ -450,13 +458,13 @@ type JavaInfo struct {
 
 	DexpreopterInfo *DexpreopterInfo
 
-	XrefJavaFiles         android.Paths
-	XrefKotlinFiles       android.Paths
-	OverrideMinSdkVersion *string
-	CompileDex            *bool
-	SystemModules         string
-	Installable           bool
-	ApexDependencyInfo    *ApexDependencyInfo
+	XrefJavaFiles            android.Paths
+	XrefKotlinFiles          android.Paths
+	HasOverrideMinSdkVersion bool
+	CompileDex               *bool
+	SystemModules            string
+	Installable              bool
+	ApexDependencyInfo       *ApexDependencyInfo
 
 	MaxSdkVersion android.ApiLevel
 }
@@ -766,6 +774,7 @@ type deps struct {
 	aidlPreprocess          android.OptionalPath
 	composeEmbeddablePlugin android.OptionalPath
 	composePlugin           android.OptionalPath
+	kSnapshotFiles          map[string]android.Path
 	kotlinPlugins           android.Paths
 	aconfigProtoFiles       android.Paths
 
@@ -818,6 +827,7 @@ const (
 	JAVA_VERSION_11          = 11
 	JAVA_VERSION_17          = 17
 	JAVA_VERSION_21          = 21
+	JAVA_VERSION_25          = 25
 )
 
 func (v javaVersion) String() string {
@@ -838,6 +848,8 @@ func (v javaVersion) String() string {
 		return "17"
 	case JAVA_VERSION_21:
 		return "21"
+	case JAVA_VERSION_25:
+		return "25"
 	default:
 		return "unsupported"
 	}
@@ -882,6 +894,8 @@ func normalizeJavaVersion(ctx android.BaseModuleContext, javaVersion string) jav
 		return JAVA_VERSION_17
 	case "21":
 		return JAVA_VERSION_21
+	case "25":
+		return JAVA_VERSION_25
 	case "10", "12", "13", "14", "15", "16":
 		ctx.PropertyErrorf("java_version", "Java language level %s is not supported", javaVersion)
 		return JAVA_VERSION_UNSUPPORTED
@@ -1142,7 +1156,8 @@ func (j *Library) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 
 	// Check min_sdk_version of the transitive dependencies if this module is created from
 	// java_sdk_library.
-	if j.overridableProperties.Min_sdk_version != nil && j.SdkLibraryName() != nil {
+	overridableMinSdkVersion := j.overridableProperties.Min_sdk_version.Get(ctx)
+	if overridableMinSdkVersion.IsPresent() && j.SdkLibraryName() != nil {
 		j.CheckDepsMinSdkVersion(ctx)
 	}
 
@@ -1170,7 +1185,7 @@ func (j *Library) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 
 	apexInfo, _ := android.ModuleProvider(ctx, android.ApexInfoProvider)
 	if !apexInfo.IsForPlatform() {
-		j.hideApexVariantFromMake = true
+		j.HideFromMake()
 	}
 
 	j.checkSdkVersions(ctx)
@@ -1190,7 +1205,7 @@ func (j *Library) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 			j.dexpreopter.disableDexpreopt()
 		}
 	}
-	javaInfo := j.compile(ctx, nil, nil, nil, nil)
+	javaInfo := j.compile(ctx)
 
 	j.setInstallRules(ctx)
 
@@ -1240,6 +1255,18 @@ func (j *Library) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 			ClassesJar:         j.implementationAndResourcesJar,
 		})
 	}
+
+	if ctx.Os() == android.Windows {
+		// Make does not support Windows Java modules
+		j.HideFromMake()
+	} else if !j.ApexModuleBase.AvailableFor(android.AvailableToPlatform) && !j.hostDexNeeded() {
+		// Platform variant.  If not available for the platform, we don't need Make module, unless
+		// hostdex is enabled, in which case only the hostdex variant is visible to make.
+		j.HideFromMake()
+	} else if proptools.Bool(j.properties.Headers_only) {
+		// If generating headers only then don't expose to Make.
+		j.HideFromMake()
+	}
 }
 
 func (j *Library) javaLibraryModuleInfoJSON(ctx android.ModuleContext) *android.ModuleInfoJSON {
@@ -1261,9 +1288,6 @@ func (j *Library) javaLibraryModuleInfoJSON(ctx android.ModuleContext) *android.
 		hostDexModuleInfoJSON.SupportedVariantsOverride = []string{"HOST"}
 	}
 
-	if j.hideApexVariantFromMake {
-		moduleInfoJSON.Disabled = true
-	}
 	return moduleInfoJSON
 }
 
@@ -1274,7 +1298,7 @@ func buildComplianceMetadata(ctx android.ModuleContext) {
 	for _, paths := range ctx.GetOutputFiles().TaggedOutputFiles {
 		builtFiles = append(builtFiles, paths.Strings()...)
 	}
-	complianceMetadataInfo.SetListValue(android.ComplianceMetadataProp.BUILT_FILES, android.SortedUniqueStrings(builtFiles))
+	complianceMetadataInfo.AddBuiltFiles(builtFiles...)
 
 	// Static deps
 	staticDepNames := make([]string, 0)
@@ -1366,6 +1390,7 @@ func (j *Library) createApiXmlFile(ctx android.ModuleContext) {
 			Output: j.apiXmlFile,
 		})
 		ctx.DistForGoal("dist_files", j.apiXmlFile)
+		ctx.SetOutputFiles(android.Paths{j.apiXmlFile}, ".api.xml")
 	}
 }
 
@@ -1454,7 +1479,7 @@ func (p *librarySdkMemberProperties) PopulateFromVariant(ctx android.SdkMemberCo
 
 	// If the min_sdk_version was set then add the canonical representation of the API level to the
 	// snapshot.
-	if javaInfo.OverrideMinSdkVersion != nil {
+	if javaInfo.HasOverrideMinSdkVersion {
 		canonical, err := android.ReplaceFinalizedCodenames(mctx.Config(), commonInfo.MinSdkVersion.ApiLevel.String())
 		if err != nil {
 			ctx.ModuleErrorf("%s", err)
@@ -1618,6 +1643,11 @@ type testProperties struct {
 	// the common arch variation. Useful for a device test that wants to depend on a host
 	// module, for example to include a custom Tradefed test runner.
 	Host_common_data []string `android:"path_host_common"`
+
+	// Same as data, but will add dependencies on modules using the host's os variation and
+	// the host's arch variation. Useful for a device test that wants to depend on a host
+	// non-java module.
+	Host_first_data []string `android:"path_host_first"`
 
 	// Flag to indicate whether or not to create test config automatically. If AndroidTest.xml
 	// doesn't exist next to the Android.bp, this attribute doesn't need to be set to true
@@ -1926,6 +1956,7 @@ func (j *Test) generateAndroidBuildActionsWithConfig(ctx android.ModuleContext, 
 	j.data = append(j.data, android.PathsForModuleSrc(ctx, j.testProperties.Device_first_data)...)
 	j.data = append(j.data, android.PathsForModuleSrc(ctx, j.testProperties.Device_first_prefer32_data)...)
 	j.data = append(j.data, android.PathsForModuleSrc(ctx, j.testProperties.Host_common_data)...)
+	j.data = append(j.data, android.PathsForModuleSrc(ctx, j.testProperties.Host_first_data)...)
 
 	j.extraTestConfigs = android.PathsForModuleSrc(ctx, j.testProperties.Test_options.Extra_test_configs)
 
@@ -2023,6 +2054,7 @@ func (j *Test) javaTestSetTestsuiteInfo(ctx android.ModuleContext) {
 		NeedsArchFolder:      ctx.Device(),
 		NonArchData:          testData,
 		PerTestcaseDirectory: proptools.Bool(j.testProperties.Per_testcase_directory),
+		IsUnitTest:           Bool(j.testProperties.Test_options.Unit_test),
 	})
 
 	android.SetProvider(ctx, JavaTestInfoProvider, JavaTestInfo{
@@ -2247,6 +2279,12 @@ type Binary struct {
 	androidMkNamesOfJniLibs []string
 }
 
+func (a *Binary) IsNativeCoverageNeeded(ctx cc.IsNativeCoverageNeededContext) bool {
+	return ctx.Device() && ctx.DeviceConfig().NativeCoverageEnabled()
+}
+
+var _ cc.UseCoverage = &Binary{}
+
 func (j *Binary) HostToolPath() android.OptionalPath {
 	return android.OptionalPathForPath(j.binaryFile)
 }
@@ -2452,7 +2490,15 @@ type ApiLibrary struct {
 	stubsType StubsType
 
 	aconfigProtoFiles android.Paths
+
+	kSnapshotFiles map[string]android.Path
 }
+
+func (al ApiLibrary) JarToSnapshotMap() map[string]android.Path {
+	return al.kSnapshotFiles
+}
+
+var _ KSnapshotContainer = ApiLibrary{}
 
 type JavaApiLibraryProperties struct {
 	// name of the API surface
@@ -2543,7 +2589,7 @@ func metalavaStubCmd(ctx android.ModuleContext, rule *android.RuleBuilder,
 	cmd := rule.Command()
 	cmd.FlagWithArg("ANDROID_PREFS_ROOT=", homeDir.String())
 
-	if metalavaUseRbe(ctx) {
+	if metalavaUseRewrapper(ctx) {
 		rule.Remoteable(android.RemoteRuleSupports{RBE: true})
 		execStrategy := ctx.Config().GetenvWithDefault("RBE_METALAVA_EXEC_STRATEGY", remoteexec.LocalExecStrategy)
 		labels := map[string]string{"type": "tool", "name": "metalava"}
@@ -2706,6 +2752,8 @@ func (al *ApiLibrary) validateProperties(ctx android.ModuleContext) {
 func (al *ApiLibrary) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	al.validateProperties(ctx)
 
+	al.kSnapshotFiles = make(map[string]android.Path)
+
 	rule := android.NewRuleBuilder(pctx, ctx)
 
 	rule.Sbox(android.PathForModuleOut(ctx, "metalava"),
@@ -2736,16 +2784,19 @@ func (al *ApiLibrary) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 			if provider, ok := android.OtherModuleProvider(ctx, dep, JavaInfoProvider); ok {
 				classPaths = append(classPaths, provider.HeaderJars...)
 				al.aconfigProtoFiles = append(al.aconfigProtoFiles, provider.AconfigIntermediateCacheOutputPaths...)
+				maps.Copy(al.kSnapshotFiles, provider.KSnapshotFiles)
 			}
 		case bootClasspathTag:
 			if provider, ok := android.OtherModuleProvider(ctx, dep, JavaInfoProvider); ok {
 				bootclassPaths = append(bootclassPaths, provider.HeaderJars...)
 				al.aconfigProtoFiles = append(al.aconfigProtoFiles, provider.AconfigIntermediateCacheOutputPaths...)
+				maps.Copy(al.kSnapshotFiles, provider.KSnapshotFiles)
 			}
 		case staticLibTag:
 			if provider, ok := android.OtherModuleProvider(ctx, dep, JavaInfoProvider); ok {
 				staticLibs = append(staticLibs, provider.HeaderJars...)
 				al.aconfigProtoFiles = append(al.aconfigProtoFiles, provider.AconfigIntermediateCacheOutputPaths...)
+				maps.Copy(al.kSnapshotFiles, provider.KSnapshotFiles)
 			}
 		case systemModulesTag:
 			if sm, ok := android.OtherModuleProvider(ctx, dep, SystemModulesProvider); ok {
@@ -2831,7 +2882,7 @@ func (al *ApiLibrary) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	annoSrcJar := android.PathForModuleOut(ctx, ctx.ModuleName(), "anno.srcjar")
 
 	TransformJavaToClasses(ctx, al.stubsJarWithoutStaticLibs, 0, android.Paths{},
-		android.Paths{al.stubsSrcJar}, annoSrcJar, javacFlags, android.Paths{})
+		android.Paths{al.stubsSrcJar}, annoSrcJar, javacFlags, android.Paths{}, nil)
 
 	builder := android.NewRuleBuilder(pctx, ctx)
 	builder.Command().
@@ -2840,6 +2891,7 @@ func (al *ApiLibrary) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 		Inputs(android.Paths{al.stubsJarWithoutStaticLibs}).
 		Inputs(staticLibs)
 	builder.Build("merge_zips", "merge jar files")
+	al.addKSnapshot(ctx, al.stubsJar)
 
 	// compile stubs to .dex for hiddenapi processing
 	dexParams := &compileDexParams{
@@ -2856,6 +2908,8 @@ func (al *ApiLibrary) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	al.dexJarFile = makeDexJarPathFromPath(dexOutputFile)
 
 	ctx.Phony(ctx.ModuleName(), al.stubsJar)
+
+	al.addKSnapshot(ctx, al.stubsJar)
 
 	javaInfo := &JavaInfo{
 		HeaderJars:                             android.PathsIfNonNil(al.stubsJar),
@@ -2879,6 +2933,16 @@ func (al *ApiLibrary) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	moduleInfoJSON.SystemSharedLibs = []string{"none"}
 }
 
+func (al *ApiLibrary) addKSnapshot(ctx android.ModuleContext, jarFile android.Path) {
+	if jarFile == nil {
+		return
+	}
+	if _, exists := al.kSnapshotFiles[jarFile.String()]; !exists {
+		snapshot := SnapshotJarForKotlin(ctx, jarFile.(android.WritablePath))
+		al.kSnapshotFiles[jarFile.String()] = snapshot
+	}
+}
+
 func (al *ApiLibrary) DexJarBuildPath(ctx android.ModuleErrorfContext) OptionalDexJarPath {
 	return al.dexJarFile
 }
@@ -2894,12 +2958,12 @@ func (al *ApiLibrary) ClassLoaderContexts() dexpreopt.ClassLoaderContextMap {
 // Most java_api_library constitues the sdk, but there are some java_api_library that
 // does not contribute to the api surface. Such modules are allowed to set sdk_version
 // other than "none"
-func (al *ApiLibrary) SdkVersion(ctx android.EarlyModuleContext) android.SdkSpec {
+func (al *ApiLibrary) SdkVersion(ctx android.ConfigContext) android.SdkSpec {
 	return android.SdkSpecFrom(ctx, proptools.String(al.properties.Sdk_version))
 }
 
 // java_api_library is always at "current". Return FutureApiLevel
-func (al *ApiLibrary) MinSdkVersion(ctx android.EarlyModuleContext) android.ApiLevel {
+func (al *ApiLibrary) MinSdkVersion(ctx android.MinSdkVersionFromValueContext) android.ApiLevel {
 	return al.SdkVersion(ctx).ApiLevel
 }
 
@@ -2955,7 +3019,7 @@ type ImportProperties struct {
 
 	// The minimum version of the SDK that this module supports. Defaults to sdk_version if not
 	// specified.
-	Min_sdk_version *string
+	Min_sdk_version proptools.Configurable[string] `android:"replace_instead_of_append"`
 
 	// The max sdk version placeholder used to replace maxSdkVersion attributes on permission
 	// and uses-permission tags in manifest_fixer.
@@ -3029,7 +3093,7 @@ type Import struct {
 	classLoaderContexts        dexpreopt.ClassLoaderContextMap
 	exportAidlIncludeDirs      android.Paths
 
-	hideApexVariantFromMake bool
+	kSnapshotFiles map[string]android.Path
 
 	sdkVersion    android.SdkSpec
 	minSdkVersion android.ApiLevel
@@ -3043,7 +3107,7 @@ func (j *Import) PermittedPackagesForUpdatableBootJars() []string {
 	return j.properties.Permitted_packages
 }
 
-func (j *Import) SdkVersion(ctx android.EarlyModuleContext) android.SdkSpec {
+func (j *Import) SdkVersion(ctx android.ConfigContext) android.SdkSpec {
 	return android.SdkSpecFrom(ctx, String(j.properties.Sdk_version))
 }
 
@@ -3051,9 +3115,10 @@ func (j *Import) SystemModules() string {
 	return "none"
 }
 
-func (j *Import) MinSdkVersion(ctx android.EarlyModuleContext) android.ApiLevel {
-	if j.properties.Min_sdk_version != nil {
-		return android.ApiLevelFrom(ctx, *j.properties.Min_sdk_version)
+func (j *Import) MinSdkVersion(ctx android.MinSdkVersionFromValueContext) android.ApiLevel {
+	minSdkVersion := j.properties.Min_sdk_version.Get(j.ConfigurableEvaluator(ctx))
+	if minSdkVersion.IsPresent() {
+		return android.ApiLevelFrom(ctx, minSdkVersion.Get())
 	}
 	return j.SdkVersion(ctx).ApiLevel
 }
@@ -3111,7 +3176,7 @@ func (j *Import) commonBuildActions(ctx android.ModuleContext) {
 
 	apexInfo, _ := android.ModuleProvider(ctx, android.ApexInfoProvider)
 	if !apexInfo.IsForPlatform() {
-		j.hideApexVariantFromMake = true
+		j.HideFromMake()
 	}
 
 	if ctx.Windows() {
@@ -3130,6 +3195,8 @@ func (j *Import) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 
 	j.classLoaderContexts = make(dexpreopt.ClassLoaderContextMap)
 
+	j.kSnapshotFiles = make(map[string]android.Path)
+
 	var flags javaBuilderFlags
 
 	var transitiveClasspathHeaderJars []depset.DepSet[android.Path]
@@ -3145,6 +3212,7 @@ func (j *Import) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	ctx.VisitDirectDepsProxy(func(module android.ModuleProxy) {
 		tag := ctx.OtherModuleDependencyTag(module)
 		if dep, ok := android.OtherModuleProvider(ctx, module, JavaInfoProvider); ok {
+			maps.Copy(j.kSnapshotFiles, dep.KSnapshotFiles)
 			switch tag {
 			case libTag, sdkLibTag:
 				flags.classpath = append(flags.classpath, dep.HeaderJars...)
@@ -3185,6 +3253,8 @@ func (j *Import) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	TransformJarsToJar(ctx, localCombinedHeaderJar, "combine local prebuilt implementation jars", localJars, android.OptionalPath{},
 		false, j.properties.Exclude_files, j.properties.Exclude_dirs)
 	localStrippedJars := android.Paths{localCombinedHeaderJar}
+
+	j.addKSnapshot(ctx, localCombinedHeaderJar)
 
 	completeStaticLibsHeaderJars := depset.New(depset.PREORDER, localStrippedJars, transitiveStaticLibsHeaderJars)
 	completeStaticLibsImplementationJars := depset.New(depset.PREORDER, localStrippedJars, transitiveStaticLibsImplementationJars)
@@ -3228,11 +3298,12 @@ func (j *Import) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 		jetifierOutputFile := android.PathForModuleOut(ctx, "jetifier", jarName)
 		TransformJetifier(ctx, jetifierOutputFile, outputFile)
 		outputFile = jetifierOutputFile
-
+		j.addKSnapshot(ctx, jetifierOutputFile)
 		if !reuseImplementationJarAsHeaderJar {
 			jetifierHeaderJar := android.PathForModuleOut(ctx, "jetifier-headers", jarName)
 			TransformJetifier(ctx, jetifierHeaderJar, headerJar)
 			headerJar = jetifierHeaderJar
+			j.addKSnapshot(ctx, jetifierHeaderJar)
 		} else {
 			headerJar = outputFile
 		}
@@ -3277,7 +3348,7 @@ func (j *Import) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	j.combinedHeaderFile = headerJar.WithoutRel()
 	j.combinedImplementationFile = outputFile.WithoutRel()
 
-	j.maybeInstall(ctx, jarName, outputFile)
+	installFile := j.maybeInstall(ctx, jarName, outputFile)
 
 	j.exportAidlIncludeDirs = android.PathsForModuleSrc(ctx, j.properties.Aidl.Export_include_dirs)
 
@@ -3336,6 +3407,7 @@ func (j *Import) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	}
 
 	javaInfo := &JavaInfo{
+		InstallFile:                            installFile,
 		HeaderJars:                             android.PathsIfNonNil(j.combinedHeaderFile),
 		LocalHeaderJars:                        android.PathsIfNonNil(j.combinedHeaderFile),
 		TransitiveLibsHeaderJarsForR8:          j.transitiveLibsHeaderJarsForR8,
@@ -3348,6 +3420,7 @@ func (j *Import) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 		ResourceJars:                           android.PathsIfNonNil(resourceJarFile),
 		AidlIncludeDirs:                        j.exportAidlIncludeDirs,
 		StubsLinkType:                          j.stubsLinkType,
+		KSnapshotFiles:                         j.kSnapshotFiles,
 		// TODO(b/289117800): LOCAL_ACONFIG_FILES for prebuilts
 	}
 	setExtraJavaInfo(ctx, j, javaInfo)
@@ -3371,9 +3444,19 @@ func (j *Import) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	moduleInfoJSON.SystemSharedLibs = []string{"none"}
 }
 
-func (j *Import) maybeInstall(ctx android.ModuleContext, jarName string, outputFile android.Path) {
-	if !Bool(j.properties.Installable) {
+func (j *Import) addKSnapshot(ctx android.ModuleContext, jarFile android.Path) {
+	if jarFile == nil {
 		return
+	}
+	if _, exists := j.kSnapshotFiles[jarFile.String()]; !exists {
+		snapshot := SnapshotJarForKotlin(ctx, jarFile.(android.WritablePath))
+		j.kSnapshotFiles[jarFile.String()] = snapshot
+	}
+}
+
+func (j *Import) maybeInstall(ctx android.ModuleContext, jarName string, outputFile android.Path) android.Path {
+	if !Bool(j.properties.Installable) {
+		return nil
 	}
 
 	var installDir android.InstallPath
@@ -3386,7 +3469,7 @@ func (j *Import) maybeInstall(ctx android.ModuleContext, jarName string, outputF
 	} else {
 		installDir = android.PathForModuleInstall(ctx, "framework")
 	}
-	ctx.InstallFile(installDir, jarName, outputFile)
+	return ctx.InstallFile(installDir, jarName, outputFile)
 }
 
 func (j *Import) HeaderJars() android.Paths {
@@ -3550,8 +3633,6 @@ type DexImport struct {
 	dexJarFile OptionalDexJarPath
 
 	dexpreopter
-
-	hideApexVariantFromMake bool
 }
 
 func (j *DexImport) Prebuilt() *android.Prebuilt {
@@ -3581,7 +3662,7 @@ func (j *DexImport) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 
 	apexInfo, _ := android.ModuleProvider(ctx, android.ApexInfoProvider)
 	if !apexInfo.IsForPlatform() {
-		j.hideApexVariantFromMake = true
+		j.HideFromMake()
 	}
 
 	j.dexpreopter.installPath = j.dexpreopter.getInstallPath(
@@ -3827,9 +3908,9 @@ func addCLCFromDep(ctx android.ModuleContext, depModule android.ModuleProxy,
 		}
 		clcMap.AddContext(ctx, dexpreopt.AnySdkVersion, *sdkLib, optional,
 			dep.DexJarBuildPath.PathOrNil(),
-			dep.UsesLibraryDependencyInfo.DexJarInstallPath, dep.UsesLibraryDependencyInfo.ClassLoaderContexts)
+			dep.UsesLibraryDependencyInfo.DexJarInstallPath, dep.UsesLibraryDependencyInfo.GetClassLoaderContexts())
 	} else {
-		clcMap.AddContextMap(dep.UsesLibraryDependencyInfo.ClassLoaderContexts, depName)
+		clcMap.AddContextMap(dep.UsesLibraryDependencyInfo.GetClassLoaderContexts(), depName)
 	}
 }
 
@@ -3978,5 +4059,12 @@ func setExtraJavaInfo(ctx android.ModuleContext, module android.Module, javaInfo
 			HeaderJars:                     ap.HeaderJars(),
 			ImplementationAndResourcesJars: ap.ImplementationAndResourcesJars(),
 		}
+	}
+
+	if ksc, ok := module.(KSnapshotContainer); ok {
+		if javaInfo.KSnapshotFiles == nil {
+			javaInfo.KSnapshotFiles = make(map[string]android.Path)
+		}
+		maps.Copy(javaInfo.KSnapshotFiles, ksc.JarToSnapshotMap())
 	}
 }
