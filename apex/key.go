@@ -18,9 +18,12 @@ import (
 	"fmt"
 
 	"android/soong/android"
+
 	"github.com/google/blueprint"
 	"github.com/google/blueprint/proptools"
 )
+
+//go:generate go run ../../blueprint/gobtools/codegen
 
 var String = proptools.String
 
@@ -30,9 +33,10 @@ func init() {
 
 func registerApexKeyBuildComponents(ctx android.RegistrationContext) {
 	ctx.RegisterModuleType("apex_key", ApexKeyFactory)
-	ctx.RegisterParallelSingletonModuleType("all_apex_certs", allApexCertsFactory)
+	ctx.RegisterModuleType("all_apex_certs", allApexCertsFactory)
 }
 
+// @auto-generate: gob
 type ApexKeyInfo struct {
 	PublicKeyFile  android.Path
 	PrivateKeyFile android.Path
@@ -173,7 +177,10 @@ func writeApexKeys(ctx android.ModuleContext, module android.Module) android.Wri
 var (
 	pemToDer = pctx.AndroidStaticRule("pem_to_der",
 		blueprint.RuleParams{
-			Command:     `openssl x509 -inform PEM -outform DER -in $in -out $out`,
+			Command2: blueprint.NewCommand(
+				`$openssl x509 -inform PEM -outform DER -in $in -out $out`,
+			),
+			CommandDeps: []string{"${openssl}"},
 			Description: "Convert certificate from PEM to DER format",
 		},
 	)
@@ -183,17 +190,21 @@ var (
 // It provides two types of output files
 // 1. .pem: This is usually the checked-in x509 certificate in PEM format
 // 2. .der: This is DER format of the certificate, and is generated from the PEM certificate using `openssl x509`
-func allApexCertsFactory() android.SingletonModule {
+func allApexCertsFactory() android.Module {
 	m := &allApexCerts{}
 	android.InitAndroidArchModule(m, android.DeviceSupported, android.MultilibCommon)
 	return m
 }
 
 type allApexCerts struct {
-	android.SingletonModuleBase
+	android.ModuleBase
 }
 
 func (_ *allApexCerts) GenerateAndroidBuildActions(ctx android.ModuleContext) {
+	if ctx.ModuleName() != "all_apex_certs" || ctx.Namespace().Path != "." {
+		ctx.ModuleErrorf(`all_apex_certs can only be used by a single module named "all_apex_certs" in the root namespace.`)
+	}
+
 	var avbpubkeys android.Paths
 	var certificatesPem android.Paths
 	ctx.VisitDirectDepsProxy(func(m android.ModuleProxy) {
@@ -226,7 +237,4 @@ func (_ *allApexCerts) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	ctx.SetOutputFiles(certificatesPem, ".pem")
 	ctx.SetOutputFiles(certificatesDer, ".der")
 	ctx.SetOutputFiles(avbpubkeys, ".avbpubkey")
-}
-
-func (_ *allApexCerts) GenerateSingletonBuildActions(ctx android.SingletonContext) {
 }

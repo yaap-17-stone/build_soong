@@ -49,8 +49,15 @@ type BaseLinkerProperties struct {
 	// list of modules that should only provide headers for this module.
 	Header_libs proptools.Configurable[[]string] `android:"arch_variant,variant_prepend"`
 
+	// List of lfi libs to statically link into this module. The lfi libs must be cc binaries
+	// with lfi: { enabled: true }.
+	//
+	// Lfi stands for Lightweight Fault Isolation and is a form of in-process sandboxing. The
+	// lfi libs each are run in their own sandbox.
+	Lfi_libs []string
+
 	// list of module-specific flags that will be used for all link steps
-	Ldflags []string `android:"arch_variant"`
+	Ldflags proptools.Configurable[[]string] `android:"arch_variant"`
 
 	// list of system libraries that will be dynamically linked to
 	// shared library and executable modules.  If unset, generally defaults to libc,
@@ -243,13 +250,18 @@ type BaseLinkerProperties struct {
 
 	// local files to pass to the linker as --script.  Not supported on darwin or windows, and will fail to build
 	// if provided to the darwin or windows variant of a module.
-	Linker_scripts []string `android:"path,arch_variant"`
+	Linker_scripts proptools.Configurable[[]string] `android:"path,arch_variant"`
 
 	// list of static libs that should not be used to build this module
 	Exclude_static_libs []string `android:"arch_variant"`
 
 	// list of shared libs that should not be used to build this module
 	Exclude_shared_libs []string `android:"arch_variant"`
+
+	// Xom controls whether or not xom should be enabled for this module. Setting
+	// this to false will disable xom for all dependents which link this module
+	// statically.
+	Xom *bool
 }
 
 func (blp *BaseLinkerProperties) crt() bool {
@@ -280,10 +292,6 @@ type baseLinker struct {
 	sanitize *sanitize
 }
 
-func (linker *baseLinker) appendLdflags(flags []string) {
-	linker.Properties.Ldflags = append(linker.Properties.Ldflags, flags...)
-}
-
 // linkerInit initializes dynamic properties of the linker.
 func (linker *baseLinker) linkerInit(ctx BaseModuleContext) {
 }
@@ -294,6 +302,14 @@ func (linker *baseLinker) linkerProps() []interface{} {
 
 func (linker *baseLinker) baseLinkerProps() BaseLinkerProperties {
 	return linker.Properties
+}
+
+func (linker *baseLinker) Xom() *bool {
+	return linker.Properties.Xom
+}
+
+func (linker *baseLinker) extraOutputFilePaths() map[string]android.Paths {
+	return nil
 }
 
 func CoalesceLibs(ctx android.BaseModuleContext, props *BaseLinkerProperties, deps Deps) Deps {
@@ -307,6 +323,7 @@ func CoalesceLibs(ctx android.BaseModuleContext, props *BaseLinkerProperties, de
 	deps.StaticLibs = append(deps.StaticLibs, props.Static_libs.GetOrDefault(ctx, nil)...)
 	deps.SharedLibs = append(deps.SharedLibs, props.Shared_libs.GetOrDefault(ctx, nil)...)
 	deps.RuntimeLibs = append(deps.RuntimeLibs, props.Runtime_libs...)
+	deps.LfiLibs = props.Lfi_libs
 
 	deps.ReexportHeaderLibHeaders = append(deps.ReexportHeaderLibHeaders, props.Export_header_lib_headers.GetOrDefault(ctx, nil)...)
 	deps.ReexportStaticLibHeaders = append(deps.ReexportStaticLibHeaders, props.Export_static_lib_headers...)
@@ -499,9 +516,11 @@ func CommonLinkerFlags(ctx android.ModuleContext, flags Flags, toolchain config.
 		flags.Global.LdFlags = append(flags.Global.LdFlags, "-Wl,--no-undefined")
 	}
 
-	flags.Global.LdFlags = append(flags.Global.LdFlags, toolchain.Ldflags())
+	ldFlags := toolchain.Ldflags(ctx)
+	flags.Global.LdFlags = append(flags.Global.LdFlags, ldFlags.Flags)
+	flags.LdFlagsDeps = append(flags.LdFlagsDeps, ldFlags.Deps...)
 
-	if !toolchain.Bionic() && ctx.Os() != android.LinuxMusl {
+	if !toolchain.Bionic() && ctx.Os() != android.LinuxMusl && !toolchain.Lfi() {
 		if !ctx.Windows() {
 			// Add -ldl, -lpthread, -lm and -lrt to host builds to match the default behavior of device
 			// builds
@@ -519,8 +538,12 @@ func CommonLinkerFlags(ctx android.ModuleContext, flags Flags, toolchain config.
 	if ctx.Host() && !ctx.Windows() && !staticLib {
 		flags.Global.LdFlags = append(flags.Global.LdFlags, RpathFlags(ctx)...)
 	}
-
-	flags.Global.LdFlags = append(flags.Global.LdFlags, toolchain.ToolchainLdflags())
+	if ctx.Device() {
+		flags.Local.LdFlags = append(flags.Local.LdFlags, XomFlags(ctx)...)
+	}
+	toolchainLdFlags := toolchain.ToolchainLdflags()
+	flags.Global.LdFlags = append(flags.Global.LdFlags, toolchainLdFlags.Flags)
+	flags.LdFlagsDeps = append(flags.LdFlagsDeps, toolchainLdFlags.Deps...)
 	return flags
 }
 
@@ -530,12 +553,13 @@ func (linker *baseLinker) linkerFlags(ctx ModuleContext, flags Flags) Flags {
 
 	flags = CommonLinkerFlags(ctx, flags, toolchain, allow_undefined_symbols)
 
-	if !toolchain.Bionic() && ctx.Os() != android.LinuxMusl {
+	if toolchain.Glibc() || ctx.Os() == android.Windows || ctx.Os() == android.Darwin {
 		CheckBadHostLdlibs(ctx, "host_ldlibs", linker.Properties.Host_ldlibs)
 		flags.Local.LdFlags = append(flags.Local.LdFlags, linker.Properties.Host_ldlibs...)
 	}
 
-	CheckBadLinkerFlags(ctx, "ldflags", linker.Properties.Ldflags)
+	ldflags := linker.Properties.Ldflags.GetOrDefault(ctx, nil)
+	CheckBadLinkerFlags(ctx, "ldflags", ldflags)
 
 	if !BoolDefault(linker.Properties.Pack_relocations, packRelocationsDefault) {
 		flags.Global.LdFlags = append(flags.Global.LdFlags, "-Wl,--pack-dyn-relocs=none")
@@ -555,7 +579,7 @@ func (linker *baseLinker) linkerFlags(ctx ModuleContext, flags Flags) Flags {
 		}
 	}
 
-	flags.Local.LdFlags = append(flags.Local.LdFlags, proptools.NinjaAndShellEscapeList(linker.Properties.Ldflags)...)
+	flags.Local.LdFlags = append(flags.Local.LdFlags, proptools.NinjaAndShellEscapeList(ldflags)...)
 
 	// Version_script is not needed when linking stubs lib where the version
 	// script is created from the symbol map file.
@@ -601,7 +625,7 @@ func (linker *baseLinker) linkerFlags(ctx ModuleContext, flags Flags) Flags {
 			}
 		}
 
-		linkerScriptPaths := android.PathsForModuleSrc(ctx, linker.Properties.Linker_scripts)
+		linkerScriptPaths := android.PathsForModuleSrc(ctx, linker.Properties.Linker_scripts.GetOrDefault(ctx, nil))
 		if len(linkerScriptPaths) > 0 {
 			if ctx.Darwin() {
 				ctx.AddMissingDependencies([]string{"linker_scripts_not_supported_on_darwin"})
@@ -694,7 +718,8 @@ var injectVersionSymbol = pctx.AndroidStaticRule("injectVersionSymbol",
 	blueprint.RuleParams{
 		Command: "$symbolInjectCmd -i $in -o $out -s soong_build_number " +
 			"-from 'SOONG BUILD NUMBER PLACEHOLDER' -v $$(cat $buildNumberFile)",
-		CommandDeps: []string{"$symbolInjectCmd"},
+		CommandDeps:     []string{"$symbolInjectCmd"},
+		SandboxDisabled: true,
 	},
 	"buildNumberFile")
 
@@ -717,7 +742,8 @@ var checkElfFileRule = pctx.AndroidStaticRule("checkElfFile",
 		Command: "${checkElfFileCmd} --skip-unknown-elf-machine $args" +
 			" --llvm-readobj=${config.ClangBin}/llvm-readobj $in" +
 			" && touch $out",
-		CommandDeps: []string{"$checkElfFileCmd", "${config.ClangBin}/llvm-readobj"},
+		CommandDeps:     []string{"$checkElfFileCmd", "${config.ClangBin}/llvm-readobj"},
+		SandboxDisabled: true,
 	}, "args")
 
 // checkElfFile creates a rule that runs a prebuilt ELF file (shared library or binary) through the check_elf_file
@@ -764,4 +790,105 @@ func (linker *baseLinker) checkElfFile(ctx ModuleContext, sharedLibStem string, 
 	})
 
 	return outputFile
+}
+
+func XomFlags(ctx android.ModuleContext) []string {
+	flags := []string{}
+
+	// XOM is only supported on arm64 devices currently.
+	if ctx.Arch().ArchType != android.Arm64 {
+		return flags
+	}
+
+	// If XOM is explicitly false, do nothing
+	if XomDisabledByModule(ctx) {
+		return flags
+	}
+
+	// XOM is only supported on LinkableInterfaces (Rust and CC modules)
+	mod, ok := ctx.Module().(LinkableInterface)
+	if !ok {
+		return flags
+	}
+
+	enableXom := false
+	// If XOM is enabled by the config and it's not disabled by path, enable XOM for this module
+	if ctx.Config().EnableXOM() && !ctx.Config().XOMDisabledForPath(ctx.ModuleDir()) {
+		enableXom = true
+	}
+	// If XOM is explicitly true, enable it for this module.
+	if XomEnabledByModule(ctx) {
+		enableXom = true
+	}
+
+	// If any static dependencies have XOM disabled, we should disable XOM in this module (unless explicitly set),
+	// the assumption being if it's been explicitly disabled then there's probably incompatible
+	// code in the library which may get pulled in.
+	if enableXom {
+		ctx.VisitDirectDepsProxy(func(dep android.ModuleProxy) {
+			depInfo, hasLinkableInfo := android.OtherModuleProvider(ctx, dep, LinkableInfoProvider)
+
+			// If the dep isn't statically linked or isn't a Linkable, ignore
+			if !hasLinkableInfo || !(depInfo.Static || depInfo.Rlib) {
+				return
+			}
+
+			// If XOM is explicitly disabled, disable it for this module
+			if depInfo.Xom != nil && !*depInfo.Xom {
+				enableXom = false
+				return
+			}
+
+			// If XOM is disabled by path and XOM is not explicitly set to true, disable it for this module.
+			if depInfo.XomDisabledByPath && !Bool(depInfo.Xom) {
+				enableXom = false
+				return
+			}
+		})
+	}
+
+	// Enable execute-only if none of the dependencies disable it,
+	// or if it's explicitly set true (allows overriding deps or paths disabling it).
+	if enableXom || Bool(mod.Xom()) {
+		flags = append(flags,
+			"-Wl,--execute-only",
+			"-Wl,--rosegment",
+		)
+	}
+
+	return flags
+}
+
+// XomDisabledByModule returns true if XOM is explicitly disabled by the module
+// otherwise it returns false
+func XomDisabledByModule(ctx android.BaseModuleContext) bool {
+	c, ok := ctx.Module().(LinkableInterface)
+	if ok && c.Xom() != nil && !*c.Xom() {
+		return true
+	}
+
+	// disable XOM for Apex modules
+	if info, ok := android.ModuleProvider(ctx, android.ApexInfoProvider); ok && !info.IsForPlatform() {
+		return true
+	}
+
+	return false
+}
+
+// XomEnabledByModule returns true if XOM is explicitly enabled by the module
+// otherwise it returns false
+func XomEnabledByModule(ctx android.BaseModuleContext) bool {
+	c, ok := ctx.Module().(LinkableInterface)
+	if ok && c.Xom() != nil && *c.Xom() {
+		return true
+	}
+	return false
+}
+
+// XomEnabledForModule returns whether the module implicitly or explicitly has XOM
+// enabled. This differs from XomEnabledByModule, which checks if XOM is explicitly
+// enabled.
+func XomEnabledForModule(ctx android.BaseModuleContext) bool {
+	return ctx.Arch().ArchType == android.Arm64 && ctx.Config().EnableXOM() &&
+		!ctx.Config().XOMDisabledForPath(ctx.ModuleDir()) && !XomDisabledByModule(ctx)
 }

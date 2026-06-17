@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 
@@ -39,7 +40,8 @@ var (
 		blueprint.RuleParams{
 			Command: "$ndkStubGenerator --arch $arch --api $apiLevel " +
 				"--api-map $apiMap $flags $in $out",
-			CommandDeps: []string{"$ndkStubGenerator"},
+			CommandDeps:     []string{"$ndkStubGenerator"},
+			SandboxDisabled: true,
 		}, "arch", "apiLevel", "apiMap", "flags")
 
 	// $headersList should include paths to public headers. All types
@@ -50,8 +52,9 @@ var (
 	// so there is no need to add them to dependencies.
 	stg = pctx.AndroidStaticRule("stg",
 		blueprint.RuleParams{
-			Command:     "$stg -S :$symbolList --file-filter :$headersList --elf $in -o $out",
-			CommandDeps: []string{"$stg"},
+			Command:         "$stg -S :$symbolList --file-filter :$headersList --elf $in -o $out",
+			CommandDeps:     []string{"$stg"},
+			SandboxDisabled: true,
 		}, "symbolList", "headersList")
 
 	stgdiff = pctx.AndroidStaticRule("stgdiff",
@@ -60,8 +63,9 @@ var (
 			// because we don't want to spam the build output with "nothing
 			// changed" messages, so redirect output message to $out, and if
 			// changes were detected print the output and fail.
-			Command:     "$stgdiff $args --stg $in -o $out || (cat $out && echo 'Run $$ANDROID_BUILD_TOP/development/tools/ndk/update_ndk_abi.sh to update the ABI dumps.' && false)",
-			CommandDeps: []string{"$stgdiff"},
+			Command:         "$stgdiff $args --stg $in -o $out || (cat $out && echo 'Run $$ANDROID_BUILD_TOP/development/tools/ndk/update_ndk_abi.sh to update the ABI dumps.' && false)",
+			CommandDeps:     []string{"$stgdiff"},
+			SandboxDisabled: true,
 		}, "args")
 
 	ndkLibrarySuffix = ".ndk"
@@ -102,6 +106,16 @@ type libraryProperties struct {
 	// used. This is only needed to work around platform bugs like
 	// https://github.com/android-ndk/ndk/issues/265.
 	Unversioned_until *string
+
+	// If true, allow all symbols in this library to be called in native-only
+	// app processes. This should be only used by libraries that have no
+	// dependency on the Android Runtime. If symbols need to be exposed
+	// selectively, use the artless tag in the symbol map file instead.
+	//
+	// As an exception, libraries that have duplicate symbol names also need
+	// this, as the denylist currently gather symbols from all libraries into
+	// one shared library.
+	Bypass_artless_denylist *bool
 
 	// DO NOT USE THIS
 	// NDK libraries should not export their headers. Headers belonging to NDK
@@ -524,9 +538,21 @@ func (linker *stubDecorator) Name(name string) string {
 	return name + ndkLibrarySuffix
 }
 
+func AddStubLibraryLinkerFlags(ctx android.ModuleContext, flags Flags) Flags {
+	// Undo the global -Wl,-z,bti-report=error for stubs, because there's
+	// no point having BTI in stubs, and it's easier to just undo the
+	// bti-report option than it is to actually add BTI.
+	if ctx.Target().Arch.ArchType == android.Arm64 &&
+		slices.Contains(ctx.Target().Arch.ArchFeatures, "branchprot") {
+		flags.Local.LdFlags = append(flags.Local.LdFlags, "-Wl,-z,bti-report=none")
+	}
+	return flags
+}
+
 func (stub *stubDecorator) linkerFlags(ctx ModuleContext, flags Flags) Flags {
 	stub.libraryDecorator.libName = ctx.baseModuleName()
-	return stub.libraryDecorator.linkerFlags(ctx, flags)
+	flags = stub.libraryDecorator.linkerFlags(ctx, flags)
+	return AddStubLibraryLinkerFlags(ctx, flags)
 }
 
 func (stub *stubDecorator) link(ctx ModuleContext, flags Flags, deps PathDeps,
@@ -572,7 +598,7 @@ func (stub *stubDecorator) install(ctx ModuleContext, path android.Path) {
 	installDir := getVersionedLibraryInstallPath(ctx, stub.apiLevel)
 	out := installDir.Join(ctx, path.Base())
 	ctx.Build(pctx, android.BuildParams{
-		Rule:   android.Cp,
+		Rule:   android.CpRule,
 		Input:  path,
 		Output: out,
 	})
@@ -598,6 +624,31 @@ func newStubLibrary() *Module {
 	module.Properties.Sdk_version = StringPtr("current")
 
 	module.AddProperties(&stub.properties, &library.MutatedProperties)
+
+	module.SetDefaultableHook(func(ctx android.DefaultableHookContext) {
+		libName := strings.TrimSuffix(ctx.ModuleName(), ndkLibrarySuffix)
+		if proptools.Bool(stub.properties.Bypass_artless_denylist) {
+			// Create an empty denylist to satisfy all_artless_denylists, which
+			// unconditionally adds dependencies for all NDK libraries.
+			props := &struct {
+				Name *string
+			}{
+				Name: proptools.StringPtr(libName + "_denylist"),
+			}
+			ctx.CreateModule(ArtlessDenylistFactory, props)
+			return
+		}
+		if stub.properties.Symbol_file != nil {
+			props := &struct {
+				Name        *string
+				Symbol_file *string `android:"path"`
+			}{
+				Name:        proptools.StringPtr(libName + "_denylist"),
+				Symbol_file: stub.properties.Symbol_file,
+			}
+			ctx.CreateModule(ArtlessDenylistFactory, props)
+		}
+	})
 
 	return module
 }

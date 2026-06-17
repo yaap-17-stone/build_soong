@@ -15,6 +15,7 @@
 package android
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/google/blueprint"
@@ -65,17 +66,31 @@ func GetProtoFlags(ctx ModuleContext, p *ProtoProperties) ProtoFlags {
 	var flags []string
 	var deps Paths
 
+	// Create a phony only once for each include dir to save on ninja file size.
+	// (saves ~145 MB at time of writing)
+	createPhonyForIncludeDir := func(deps *Paths, includeDir string) {
+		phonyName := fmt.Sprintf("protoIncDir_%s", strings.ReplaceAll(includeDir, "/", "__"))
+		phony := ctx.CreateNinjaPhonyOnce(phonyName, []string{includeDir + "/**/*.proto"})
+		*deps = append(*deps, phony)
+	}
+
 	if len(p.Proto.Local_include_dirs) > 0 {
-		localProtoIncludeDirs := PathsForModuleSrc(ctx, p.Proto.Local_include_dirs)
-		flags = append(flags, JoinWithPrefix(localProtoIncludeDirs.Strings(), "-I"))
+		localProtoIncludeDirs := PathsForModuleSrc(ctx, p.Proto.Local_include_dirs).Strings()
+		flags = append(flags, JoinWithPrefix(localProtoIncludeDirs, "-I"))
+		for _, includeDir := range localProtoIncludeDirs {
+			createPhonyForIncludeDir(&deps, includeDir)
+		}
 	}
 	if len(p.Proto.Include_dirs) > 0 {
-		rootProtoIncludeDirs := PathsForSource(ctx, p.Proto.Include_dirs)
-		flags = append(flags, JoinWithPrefix(rootProtoIncludeDirs.Strings(), "-I"))
+		rootProtoIncludeDirs := PathsForSource(ctx, p.Proto.Include_dirs).Strings()
+		flags = append(flags, JoinWithPrefix(rootProtoIncludeDirs, "-I"))
+		for _, includeDir := range rootProtoIncludeDirs {
+			createPhonyForIncludeDir(&deps, includeDir)
+		}
 	}
 
 	ctx.VisitDirectDepsProxyWithTag(ProtoPluginDepTag, func(dep ModuleProxy) {
-		if h, ok := OtherModuleProvider(ctx, dep, HostToolProviderInfoProvider); !ok || !h.HostToolPath.Valid() {
+		if h := GetHostToolInfo(ctx, dep); h == nil || !h.HostToolPath.Valid() {
 			ctx.PropertyErrorf("proto.plugin", "module %q is not a host tool provider",
 				ctx.OtherModuleName(dep))
 		} else {
@@ -137,16 +152,18 @@ func ProtoRule(rule *RuleBuilder, protoFile Path, flags ProtoFlags, deps Paths,
 		protoBase = strings.TrimSuffix(protoFile.String(), rel)
 	}
 
-	rule.Command().
+	cmd := rule.Command().
 		BuiltTool("aprotoc").
-		FlagWithArg(flags.OutTypeFlag+"=", strings.Join(flags.OutParams, ",")+":"+outDir.String()).
-		FlagWithDepFile("--dependency_out=", depFile).
-		FlagWithArg("-I ", protoBase).
+		FlagWithArg(flags.OutTypeFlag+"=", strings.Join(flags.OutParams, ",")+":"+outDir.String())
+	if depFile != nil {
+		cmd.FlagWithDepFile("--dependency_out=", depFile)
+
+		rule.Command().
+			BuiltTool("dep_fixer").Flag(depFile.String())
+	}
+	cmd.FlagWithArg("-I ", protoBase).
 		Flags(flags.Flags).
 		Input(protoFile).
 		Implicits(deps).
 		ImplicitOutputs(outputs)
-
-	rule.Command().
-		BuiltTool("dep_fixer").Flag(depFile.String())
 }

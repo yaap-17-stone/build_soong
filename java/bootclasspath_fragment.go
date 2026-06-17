@@ -28,6 +28,8 @@ import (
 	"github.com/google/blueprint"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 func init() {
 	registerBootclasspathFragmentBuildComponents(android.InitRegistrationContext)
 
@@ -40,6 +42,7 @@ func registerBootclasspathFragmentBuildComponents(ctx android.RegistrationContex
 	ctx.RegisterModuleType("prebuilt_bootclasspath_fragment", prebuiltBootclasspathFragmentFactory)
 }
 
+// @auto-generate: gob
 type BootclasspathFragmentInfo struct {
 	ImageName               *string
 	Contents                []string
@@ -47,6 +50,7 @@ type BootclasspathFragmentInfo struct {
 	CorePlatformApiStubLibs []string
 	Fragments               []ApexVariantReference
 	ProfilePathOnHost       android.Path
+	DexPreoptProfileGuided  bool
 }
 
 var BootclasspathFragmentInfoProvider = blueprint.NewProvider[BootclasspathFragmentInfo]()
@@ -141,6 +145,11 @@ type bootclasspathFragmentProperties struct {
 	// If specified then it must be one of "art" or "boot".
 	Image_name *string
 
+	Dex_preopt struct {
+		// If set, provides the path to boot image profile.
+		Profile proptools.Configurable[string] `android:"path,replace_instead_of_append"`
+	}
+
 	// Properties whose values need to differ with and without coverage.
 	BootclasspathFragmentCoverageAffectedProperties
 	Coverage BootclasspathFragmentCoverageAffectedProperties
@@ -170,7 +179,7 @@ type HiddenAPIPackageProperties struct {
 		//
 		// This affects the signature patterns file that is used to select the subset of monolithic
 		// hidden API flags. See split_packages property for more details.
-		Package_prefixes []string
+		Package_prefixes proptools.Configurable[[]string]
 
 		// A list of individual packages that are provided solely by this
 		// bootclasspath_fragment but which cannot be listed in package_prefixes
@@ -235,7 +244,7 @@ type HiddenAPIPackageProperties struct {
 		// exported to the sdk snapshot in the signature patterns file. That is something that should be
 		// avoided where possible. Specifying package_prefixes and split_packages allows those
 		// implementation details to be excluded from the snapshot.
-		Split_packages []string
+		Split_packages proptools.Configurable[[]string]
 	}
 }
 
@@ -245,10 +254,10 @@ type SourceOnlyBootclasspathProperties struct {
 }
 
 type BootclasspathFragmentModule struct {
-	android.ModuleBase
+	ClasspathFragmentBase
 	android.DefaultableModuleBase
 	android.ApexModuleBase
-	ClasspathFragmentBase
+	blueprint.ModuleUsesIncrementalWalkDeps
 
 	// True if this fragment is for testing purposes.
 	testFragment bool
@@ -328,7 +337,7 @@ func (m *BootclasspathFragmentModule) bootclasspathFragmentPropertyCheck(ctx and
 	}
 
 	if m.properties.Image_name == nil {
-		// Nothing to do.
+		// Mainline bootclasspath fragments are checked at #configuredJars function.
 		return
 	}
 
@@ -383,6 +392,7 @@ var BootclasspathFragmentApexContentInfoProvider = blueprint.NewProvider[Bootcla
 
 // BootclasspathFragmentApexContentInfo contains the bootclasspath_fragments contributions to the
 // apex contents.
+// @auto-generate: gob
 type BootclasspathFragmentApexContentInfo struct {
 	// Map from the base module name (without prebuilt_ prefix) of a fragment's contents module to the
 	// hidden API encoded dex jar path.
@@ -427,6 +437,7 @@ func (m *BootclasspathFragmentModule) GetDepInSameApexChecker() android.DepInSam
 	return BootclasspathFragmentDepInSameApexChecker{}
 }
 
+// @auto-generate: gob
 type BootclasspathFragmentDepInSameApexChecker struct {
 	android.BaseDepInSameApexChecker
 }
@@ -464,11 +475,10 @@ func (b BootclasspathFragmentDepInSameApexChecker) OutgoingDepIsInSameApex(tag b
 	if _, ok := tag.(hiddenAPIStubsDependencyTag); ok {
 		return false
 	}
+	if _, ok := tag.(android.HostToolDepTagType); ok {
+		return false
+	}
 	panic(fmt.Errorf("boot_image module should not have a dependency tag %s", android.PrettyPrintTag(tag)))
-}
-
-func (m *BootclasspathFragmentModule) MinSdkVersionSupported(ctx android.BaseModuleContext) android.ApiLevel {
-	return android.MinApiLevel
 }
 
 // ComponentDepsMutator adds dependencies onto modules before any prebuilt modules without a
@@ -534,6 +544,8 @@ func (b *BootclasspathFragmentModule) GenerateAndroidBuildActions(ctx android.Mo
 		b.bootclasspathFragmentPropertyCheck(ctx)
 	}
 
+	b.checkMinSdkVersionConstraint(ctx)
+
 	// Generate classpaths.proto config
 	classpathProtoOutputPath := b.generateClasspathProtoBuildActions(ctx)
 
@@ -550,17 +562,38 @@ func (b *BootclasspathFragmentModule) GenerateAndroidBuildActions(ctx android.Mo
 		}
 	})
 
-	fragments, _ := gatherFragments(ctx)
+	fragments, fragmentsMap := gatherFragments(ctx)
 
 	// Perform hidden API processing.
 	hiddenAPIOutput := b.generateHiddenAPIBuildActions(ctx, contents, fragments)
+
+	// Zip all encoded jars and set an output tag for other modules to use.
+	encodedJars := hiddenAPIOutput.EncodedBootDexFilesByModule.bootDexJars()
+	outputZipPath := android.PathForModuleOut(ctx, "encoded-jars.zip")
+	rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
+	cmd := rule.Command().
+		Tool(ctx.Config().HostToolPath(ctx, "soong_zip")).
+		Flag("-o").Output(outputZipPath).
+		Flag("-j")
+
+	for _, jar := range encodedJars {
+		cmd.Flag("-f").Input(jar)
+	}
+
+	rule.Build("zip_encoded_jars", "zip encoded jars")
+
+	ctx.SetOutputFiles(android.Paths{outputZipPath}, ".encoded_jars_zip")
 
 	if android.IsModulePrebuilt(ctx, ctx.Module()) {
 		b.profilePath = ctx.Module().(*PrebuiltBootclasspathFragmentModule).produceBootImageProfile(ctx)
 	} else {
 		b.profilePath = b.produceBootImageProfileFromSource(ctx, contents, hiddenAPIOutput.EncodedBootDexFilesByModule)
+
 		// Provide the apex content info. A prebuilt fragment cannot contribute to an apex.
 		b.provideApexContentInfo(ctx, hiddenAPIOutput, b.profilePath)
+
+		// Neither can the prebuilt fragment provide associated proguard info.
+		b.provideApexProguardInfo(ctx, contents)
 	}
 
 	// In order for information about bootclasspath_fragment modules to be added to module-info.json
@@ -573,41 +606,52 @@ func (b *BootclasspathFragmentModule) GenerateAndroidBuildActions(ctx android.Mo
 		b.HideFromMake()
 	}
 
+	filteredFragmentProperties := b.properties.BootclasspathFragmentsDepsProperties.filterForSdkSnapshot(ctx, fragmentsMap)
+
 	android.SetProvider(ctx, BootclasspathFragmentInfoProvider, BootclasspathFragmentInfo{
 		ImageName:               b.properties.Image_name,
 		Contents:                b.properties.Contents.GetOrDefault(ctx, nil),
 		ApiStubLibs:             b.properties.Api.Stub_libs.GetOrDefault(ctx, nil),
 		CorePlatformApiStubLibs: b.properties.Core_platform_api.Stub_libs.GetOrDefault(ctx, nil),
-		Fragments:               b.properties.Fragments,
+		Fragments:               filteredFragmentProperties,
 		ProfilePathOnHost:       b.profilePath,
+		DexPreoptProfileGuided:  ctx.Config().GetBuildFlagBool("RELEASE_ART_COMPILE_BCP_APEX_SPEED_PROFILE") && b.properties.Dex_preopt.Profile.GetOrDefault(ctx, "") != "",
 	})
 
 	ctx.ComplianceMetadataInfo().AddBuiltFiles(classpathProtoOutputPath.String())
 	ctx.ComplianceMetadataInfo().AddBuiltFiles(hiddenAPIOutput.EncodedBootDexFilesByModule.bootDexJars().Strings()...)
 }
 
-// getProfileProviderApex returns the name of the apex that provides a boot image profile, or an
-// empty string if this module should not provide a boot image profile.
-func (b *BootclasspathFragmentModule) getProfileProviderApex(ctx android.BaseModuleContext) string {
+// getProfileProviderApexFromSource returns the name and profile path of the apex
+// that provides a boot image profile, or an empty string and nil if this module
+// should not provide a boot image profile.
+func (b *BootclasspathFragmentModule) getProfileProviderApexFromSource(ctx android.BaseModuleContext) (string, android.Path) {
 	// Only use the profile from the module that is preferred.
 	if !android.IsModulePreferredProxy(ctx, ctx.Module()) {
-		return ""
+		return "", nil
 	}
 
 	// Bootclasspath fragment modules that are for the platform do not produce boot related files.
 	apexInfo, _ := android.ModuleProvider(ctx, android.ApexInfoProvider)
 	if apexInfo.IsForPlatform() {
-		return ""
+		return "", nil
 	}
 
-	for _, config := range genBootImageConfigs(ctx) {
-		if config.profileProviderModule == b.BaseModuleName() {
-			if len(config.profileImports) > 0 {
-				return config.profileImports[0]
-			}
+	// Only use the profile from the art apex if the RELEASE_ART_COMPILE_BCP_APEX_SPEED_PROFILE
+	// flag is disabled.
+	if "art" != proptools.String(b.properties.Image_name) && !ctx.Config().GetBuildFlagBool("RELEASE_ART_COMPILE_BCP_APEX_SPEED_PROFILE") {
+		return "", nil
+	}
+
+	profile := b.properties.Dex_preopt.Profile.GetOrDefault(ctx, "")
+	if profile != "" {
+		// If the profile is specified, then it should exist, otherwise fail the build.
+		path := android.PathForSource(ctx, profile)
+		if apexInfo.BaseApexName != "" {
+			return apexInfo.BaseApexName, path
 		}
 	}
-	return ""
+	return "", nil
 }
 
 // provideApexContentInfo creates, initializes and stores the apex content info for use by other
@@ -626,6 +670,18 @@ func (b *BootclasspathFragmentModule) provideApexContentInfo(ctx android.ModuleC
 
 	// Make the apex content info available for other modules.
 	android.SetProvider(ctx, BootclasspathFragmentApexContentInfoProvider, info)
+}
+
+func (b *BootclasspathFragmentModule) provideApexProguardInfo(ctx android.ModuleContext, contents []android.ModuleProxy) {
+	var proguardInfos ProguardInfos
+	for _, module := range contents {
+		if infos, ok := android.OtherModuleProvider(ctx, module, ProguardProvider); ok {
+			proguardInfos = append(proguardInfos, infos...)
+		}
+	}
+	if len(proguardInfos) > 0 {
+		android.SetProvider(ctx, ProguardProvider, proguardInfos)
+	}
 }
 
 // generateClasspathProtoBuildActions generates all required build actions for classpath.proto config
@@ -681,6 +737,7 @@ func (b *BootclasspathFragmentModule) configuredJars(ctx android.ModuleContext) 
 
 var ClasspathFragmentValidationInfoProvider = blueprint.NewProvider[ClasspathFragmentValidationInfo]()
 
+// @auto-generate: gob
 type ClasspathFragmentValidationInfo struct {
 	ClasspathFragmentModuleName string
 	UnknownJars                 []string
@@ -758,7 +815,7 @@ func (b *BootclasspathFragmentModule) createHiddenAPIFlagInput(ctx android.Modul
 	input.extractFlagFilesFromProperties(ctx, &b.properties.HiddenAPIFlagFileProperties)
 
 	// Populate with package rules from the properties.
-	input.extractPackageRulesFromProperties(&b.sourceOnlyProperties.HiddenAPIPackageProperties)
+	input.extractPackageRulesFromProperties(ctx, &b.sourceOnlyProperties.HiddenAPIPackageProperties)
 
 	input.gatherPropertyInfo(ctx, contents)
 
@@ -870,7 +927,7 @@ func (b *BootclasspathFragmentModule) produceHiddenAPIOutput(ctx android.ModuleC
 // produceBootImageProfileFromSource builds the boot image profile from the source if it is required.
 func (b *BootclasspathFragmentModule) produceBootImageProfileFromSource(ctx android.ModuleContext,
 	contents []android.ModuleProxy, modules bootDexJarByModule) android.WritablePath {
-	apex := b.getProfileProviderApex(ctx)
+	apex, bootProfilePath := b.getProfileProviderApexFromSource(ctx)
 	if apex == "" {
 		return nil
 	}
@@ -883,7 +940,11 @@ func (b *BootclasspathFragmentModule) produceBootImageProfileFromSource(ctx andr
 	}
 
 	// Build a profile for the modules in this fragment.
-	return bootImageProfileRuleCommon(ctx, b.Name(), dexPaths, dexLocations)
+	var bootProfilePaths android.Paths
+	if bootProfilePath != nil {
+		bootProfilePaths = append(bootProfilePaths, bootProfilePath)
+	}
+	return bootImageProfileRuleCommon(ctx, b.Name(), dexPaths, dexLocations, bootProfilePaths)
 }
 
 func (b *BootclasspathFragmentModule) PrepareAndroidMKProviderInfo(config android.Config) *android.AndroidMkProviderInfo {
@@ -979,6 +1040,12 @@ type bootclasspathFragmentSdkMemberProperties struct {
 
 	// The path to the generated filtered-flags.csv file.
 	Filtered_flags_path android.OptionalPath `supported_build_releases:"Tiramisu+"`
+
+	// Whether to use profile-guided dexpreopt.
+	DexPreoptProfileGuided bool `supported_build_releases:"CinnamonBun+"`
+
+	// The value of the min_sdk_version property, translated into a number where possible.
+	MinSdkVersion *string `supported_build_releases:"CinnamonBun+"`
 }
 
 func (b *bootclasspathFragmentSdkMemberProperties) PopulateFromVariant(ctx android.SdkMemberContext, variant android.ModuleProxy) {
@@ -1004,12 +1071,23 @@ func (b *bootclasspathFragmentSdkMemberProperties) PopulateFromVariant(ctx andro
 	b.Filtered_stub_flags_path = android.OptionalPathForPath(hiddenAPIInfo.FilteredStubFlagsPath)
 	b.Filtered_flags_path = android.OptionalPathForPath(hiddenAPIInfo.FilteredFlagsPath)
 
+	commonInfo := android.OtherModulePointerProviderOrDefault(mctx, variant, android.CommonModuleInfoProvider)
+	if commonInfo.MinSdkVersion.ApiLevel != nil {
+		canonical, err := android.ReplaceFinalizedCodenames(mctx.Config(), commonInfo.MinSdkVersion.ApiLevel.String())
+		if err != nil {
+			ctx.ModuleErrorf("%s", err)
+		}
+		b.MinSdkVersion = proptools.StringPtr(canonical)
+	}
+
 	// Copy stub_libs properties.
 	b.Stub_libs = module.ApiStubLibs
 	b.Core_platform_stub_libs = module.CorePlatformApiStubLibs
 
 	// Copy fragment properties.
 	b.Fragments = module.Fragments
+
+	b.DexPreoptProfileGuided = module.DexPreoptProfileGuided
 }
 
 func (b *bootclasspathFragmentSdkMemberProperties) AddToPropertySet(ctx android.SdkMemberContext, propertySet android.BpPropertySet) {
@@ -1032,8 +1110,16 @@ func (b *bootclasspathFragmentSdkMemberProperties) AddToPropertySet(ctx android.
 		corePlatformApiPropertySet := propertySet.AddPropertySet("core_platform_api")
 		corePlatformApiPropertySet.AddPropertyWithTag("stub_libs", b.Core_platform_stub_libs, requiredMemberDependency)
 	}
+	if b.MinSdkVersion != nil && *b.MinSdkVersion != "" {
+		propertySet.AddProperty("min_sdk_version", *b.MinSdkVersion)
+	}
 	if len(b.Fragments) > 0 {
 		propertySet.AddProperty("fragments", b.Fragments)
+	}
+
+	if b.DexPreoptProfileGuided {
+		dexPreoptSet := propertySet.AddPropertySet("dex_preopt")
+		dexPreoptSet.AddProperty("profile_guided", b.DexPreoptProfileGuided)
 	}
 
 	hiddenAPISet := propertySet.AddPropertySet("hidden_api")
@@ -1106,6 +1192,10 @@ type prebuiltBootclasspathFragmentProperties struct {
 
 		// The path to the filtered-flags.csv file created by the bootclasspath_fragment.
 		Filtered_flags *string `android:"path"`
+	}
+	Dex_preopt struct {
+		// True if profile-guided optimization is actually enabled.
+		Profile_guided bool `android:"replace_instead_of_append"`
 	}
 }
 
@@ -1184,13 +1274,19 @@ var _ commonBootclasspathFragment = (*PrebuiltBootclasspathFragmentModule)(nil)
 // RequiredFilesFromPrebuiltApex returns the list of all files the prebuilt_bootclasspath_fragment
 // requires from a prebuilt .apex file.
 //
-// If there is no image config associated with this fragment then it returns nil. Otherwise, it
-// returns the files that are listed in the image config.
+// If there are no files required from this fragment then it returns nil. Otherwise,
+// it returns the list of required files.
 func (module *PrebuiltBootclasspathFragmentModule) RequiredFilesFromPrebuiltApex(ctx android.BaseModuleContext) []string {
-	for _, apex := range module.ApexProperties.Apex_available {
-		if isProfileProviderApex(ctx, apex) {
-			return []string{ProfileInstallPathInApex}
-		}
+	if module.prebuiltProperties.Dex_preopt.Profile_guided {
+		return []string{ProfileInstallPathInApex}
+	}
+
+	// TODO(b/342163020): Remove once the prebuilt has the profile_guided property
+	// (expected when CP2A is finalized).
+	if module.Name() == "prebuilt_art-bootclasspath-fragment" {
+		// For old ART prebuilts, the profile is always present in the apex.
+		// This is for backwards compatibility.
+		return []string{ProfileInstallPathInApex}
 	}
 	return nil
 }
@@ -1208,6 +1304,7 @@ func prebuiltBootclasspathFragmentFactory() android.Module {
 	// array.
 	android.InitPrebuiltModule(m, &[]string{"placeholder"})
 	android.InitApexModule(m)
+	initClasspathFragment(m, BOOTCLASSPATH)
 	android.InitAndroidArchModule(m, android.HostAndDeviceSupported, android.MultilibCommon)
 	android.InitDefaultableModule(m)
 

@@ -42,6 +42,7 @@ var allowedPluginsByName = map[string]bool{
 	"aidl-soong-rules":                       true,
 	"arm_compute_library_nn_driver":          true,
 	"cuttlefish-soong-rules":                 true,
+	"ferrochrome-soong-rules":                true,
 	"gki-soong-rules":                        true,
 	"hidl-soong-rules":                       true,
 	"kernel-config-soong-rules":              true,
@@ -61,9 +62,8 @@ var allowedPluginsByName = map[string]bool{
 	"soong-llvm":                             true,
 	"soong-noto-fonts":                       true,
 	"soong-robolectric":                      true,
-	"soong-rust-prebuilts":                   true,
+	"soong-sdv_binary_pdk":                   true,
 	"soong-selinux":                          true,
-	"soong-wayland-protocol-codegen":         true,
 	"treble_report_app":                      true,
 	"treble_report_local":                    true,
 	"treble_report_module":                   true,
@@ -103,11 +103,9 @@ func (p *pluginSingleton) GenerateBuildActions(ctx SingletonContext) {
 	maybeAddInternalPluginsToAllowlist(ctx)
 
 	disallowedPlugins := map[string]bool{}
-	ctx.VisitAllModuleProxies(func(module ModuleProxy) {
-		if ctx.ModuleName(module) != "soong_build" {
-			return
-		}
-
+	soongBuildModule := ctx.GetModuleProxy("soong_build", ctx.Config().BuildOSTarget.Variations())
+	// Still visit all the variants because we also have a windows variant on the linux build.
+	ctx.VisitAllModuleVariantProxies(soongBuildModule, func(module ModuleProxy) {
 		ctx.VisitDirectDepsProxies(module, func(module ModuleProxy) {
 			if ctx.OtherModuleDependencyTag(module) != bootstrap.PluginDepTag {
 				return
@@ -136,4 +134,10 @@ func (p *pluginSingleton) GenerateBuildActions(ctx SingletonContext) {
 	if len(disallowedPlugins) > 0 {
 		ctx.Errorf("New plugins are not supported; however %q were found. Please reach out to the build team or use BUILD_BROKEN_PLUGIN_VALIDATION (see Changes.md for more info).", SortedKeys(disallowedPlugins))
 	}
+}
+
+func (p *pluginSingleton) IncrementalSupported() bool {
+	// pluginSingleton depends on the contents of the vendor/google/build/soong/internal_plugins.json file
+	// that is not tracked as an incremental analysis input.
+	return false
 }

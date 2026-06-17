@@ -200,7 +200,8 @@ func runKati(ctx Context, config Config, e *TraceEvent, extraSuffix string, args
 	//
 	// In general, the partial compile features will be implemented in Soong-based rules. We
 	// also allow them to be used in makefiles.  Clear the environment variable when calling
-	// kati so that we avoid reanalysis when the user changes it.  We will pass it to Ninja.
+	// kati so that we avoid reanalysis when the user changes it.  We will pass it to Ninja
+	// (via the file `${OUT_DIR}/soong/use_partial_compile-${TARGET_PRODUCT}.sh`).
 	// As a result, rules where we want to allow the developer to toggle the feature ("use
 	// the partial compile feature" vs "legacy, aka full compile behavior") need to use this
 	// in the rule, since changing it will not cause reanalysis.
@@ -273,7 +274,7 @@ func runKatiBuild(ctx Context, config Config) {
 	runKati(ctx, config, e, katiBuildSuffix, args, func(env *Environment) {})
 
 	// compress and dist the main build ninja file.
-	distGzipFile(ctx, config, config.KatiBuildNinjaFile())
+	distGzipFile(ctx, config, config.KatiBuildNinjaFile(), "soong_ui")
 
 	// Cleanup steps.
 	cleanCopyHeaders(ctx, config)
@@ -347,18 +348,13 @@ func cleanOldInstalledFiles(ctx Context, config Config) {
 
 // Generate the Ninja file containing the packaging command lines for the dist
 // dir.
-func runKatiPackage(ctx Context, config Config, soongOnly bool) {
+func runKatiPackage(ctx Context, config Config) {
 	e := ctx.BeginTrace(metrics.RunKati, "kati package")
 	defer e.End()
 
 	entryPoint := "build/make/packaging/main.mk"
 	suffix := katiPackageSuffix
 	ninjaFile := config.KatiPackageNinjaFile()
-	if soongOnly {
-		entryPoint = "build/make/packaging/main_soong_only.mk"
-		suffix = katiSoongOnlyPackageSuffix
-		ninjaFile = config.KatiSoongOnlyPackageNinjaFile()
-	}
 
 	args := []string{
 		// Mark the dist dir as writable.
@@ -372,6 +368,7 @@ func runKatiPackage(ctx Context, config Config, soongOnly bool) {
 		// Directory containing .mk files for packaging purposes, such as
 		// the dist.mk file, containing dist-for-goals data.
 		"KATI_PACKAGE_MK_DIR=" + config.KatiPackageMkDir(),
+		"KATI_SUFFIX=" + config.KatiSuffix(),
 	}
 
 	// Run Kati against a restricted set of environment variables.
@@ -403,7 +400,7 @@ func runKatiPackage(ctx Context, config Config, soongOnly bool) {
 	})
 
 	// Compress and dist the packaging Ninja file.
-	distGzipFile(ctx, config, ninjaFile)
+	distGzipFile(ctx, config, ninjaFile, "soong_ui")
 }
 
 // Run Kati on the cleanspec files to clean the build.

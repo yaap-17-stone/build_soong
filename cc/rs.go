@@ -20,6 +20,8 @@ import (
 	"strings"
 
 	"android/soong/android"
+	"android/soong/cc/config"
+
 	"github.com/google/blueprint"
 )
 
@@ -44,10 +46,11 @@ touch $out
 var (
 	rsCpp = pctx.AndroidStaticRule("rsCpp",
 		blueprint.RuleParams{
-			Command:     rsCppCmdLine,
-			CommandDeps: []string{"$rsCmd"},
-			Depfile:     "${out}.d",
-			Deps:        blueprint.DepsGCC,
+			Command:         rsCppCmdLine,
+			CommandDeps:     []string{"$rsCmd"},
+			Depfile:         "${out}.d",
+			Deps:            blueprint.DepsGCC,
+			SandboxDisabled: true,
 		},
 		"depFiles", "outDir", "rsFlags", "stampFile")
 )
@@ -120,7 +123,9 @@ func rsFlags(ctx ModuleContext, flags Flags, properties *BaseCompilerProperties)
 	} else {
 		flags.rsFlags = append(flags.rsFlags, "-m32")
 	}
-	flags.rsFlags = append(flags.rsFlags, "${config.RsGlobalIncludes}")
+
+	globalIncludePaths := android.ExistentPathsForSources(ctx, config.RsGlobalIncludes)
+	flags.rsFlags = append(flags.rsFlags, android.JoinWithPrefix(globalIncludePaths.Strings(), " -I"))
 
 	rootRsIncludeDirs := android.PathsForSource(ctx, properties.Renderscript.Include_dirs)
 	flags.rsFlags = append(flags.rsFlags, includeDirsToFlags(rootRsIncludeDirs))

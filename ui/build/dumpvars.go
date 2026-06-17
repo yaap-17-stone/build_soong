@@ -19,11 +19,30 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"slices"
+	"strconv"
 	"strings"
 
 	"android/soong/ui/metrics"
 	"android/soong/ui/status"
 )
+
+type dumpvarsType int
+
+const (
+	_ dumpvarsType = iota
+	DUMPVARS_PRE_CONFIG
+	DUMPVARS_PRODUCT_CONFIG
+	DUMPVARS_USER
+)
+
+// These are needed to configure Siso's RBE rules.
+var sisoStringVars = []string{
+	"JAVA_HOME",
+	"OUT_DIR",
+	"RBE_container_image",
+	"RELEASE_BUILD_CLANG_VERSION",
+}
 
 // DumpMakeVars can be used to extract the values of Make variables after the
 // product configurations are loaded. This is roughly equivalent to the
@@ -40,9 +59,11 @@ import (
 // to call into make, to retain compatibility.
 func DumpMakeVars(ctx Context, config Config, goals, vars []string) (map[string]string, error) {
 	soongUiVars := map[string]func() string{
-		"OUT_DIR":  func() string { return config.OutDir() },
-		"DIST_DIR": func() string { return config.DistDir() },
-		"TMPDIR":   func() string { return absPath(ctx, config.TempDir()) },
+		"OUT_DIR":     func() string { return config.OutDir() },
+		"DIST_DIR":    func() string { return config.DistDir() },
+		"TMPDIR":      func() string { return absPath(ctx, config.TempDir()) },
+		"SOONG_NINJA": func() string { return config.ninjaCommand.String() },
+		"SOONG_ONLY":  func() string { return strconv.FormatBool(config.soongOnlyRequested) },
 	}
 
 	makeVars := make([]string, 0, len(vars))
@@ -62,9 +83,9 @@ func DumpMakeVars(ctx Context, config Config, goals, vars []string) (map[string]
 		defer os.RemoveAll(tmpDir)
 
 		SetupLitePath(ctx, config, tmpDir)
-		SetProductReleaseConfigMaps(ctx, config, QueryProductReleaseConfigMaps(ctx, config))
+		CollectEarlyReleaseConfig(ctx, config, QueryEarlyReleaseConfig(ctx, config))
 
-		ret, err = dumpMakeVars(ctx, config, goals, makeVars, false, tmpDir)
+		ret, err = dumpMakeVars(ctx, config, goals, makeVars, tmpDir, DUMPVARS_USER)
 		if err != nil {
 			return ret, err
 		}
@@ -81,14 +102,13 @@ func DumpMakeVars(ctx Context, config Config, goals, vars []string) (map[string]
 	return ret, nil
 }
 
-func dumpMakeVars(ctx Context, config Config, goals, vars []string, write_soong_vars bool, tmpDir string) (map[string]string, error) {
+func dumpMakeVars(ctx Context, config Config, goals, vars []string, tmpDir string, which dumpvarsType) (map[string]string, error) {
 	e := ctx.BeginTrace(metrics.RunKati, "dumpvars")
 	defer e.End()
 
 	tool := ctx.Status.StartTool()
-	if write_soong_vars {
-		// only print this when write_soong_vars is true so that it's not printed when using
-		// the get_build_var command.
+	if which == DUMPVARS_PRODUCT_CONFIG {
+		// Only print this during product config.
 		tool.Status("Running product configuration...")
 	}
 	defer tool.Finish()
@@ -100,10 +120,14 @@ func dumpMakeVars(ctx Context, config Config, goals, vars []string, write_soong_
 		"--kati_stats",
 		"dump-many-vars",
 		"MAKECMDGOALS="+strings.Join(goals, " "))
-	cmd.Environment.Set("CALLED_FROM_SETUP", "true")
-	if write_soong_vars {
+	switch which {
+	case DUMPVARS_PRE_CONFIG:
+		cmd.Environment.Set("CALLED_PRE_PRODUCT_CONFIG", "true")
+	case DUMPVARS_PRODUCT_CONFIG:
 		cmd.Environment.Set("WRITE_SOONG_VARIABLES", "true")
+	default:
 	}
+	cmd.Environment.Set("CALLED_FROM_SETUP", "true")
 	cmd.Environment.Set("DUMP_MANY_VARS", strings.Join(vars, " "))
 	if tmpDir != "" {
 		cmd.Environment.Set("TMPDIR", tmpDir)
@@ -113,12 +137,16 @@ func dumpMakeVars(ctx Context, config Config, goals, vars []string, write_soong_
 	cmd.Stdout = &output
 	pipe, err := cmd.StderrPipe()
 	if err != nil {
-		ctx.Fatalln("Error getting output pipe for kati:", err)
+		return nil, fmt.Errorf("Error getting output pipe for kati: %s", err)
 	}
-	cmd.StartOrFatal()
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
 	// TODO: error out when Stderr contains any content
 	status.KatiReader(tool, pipe)
-	cmd.WaitOrFatal()
+	if err := cmd.Wait(); err != nil {
+		return nil, err
+	}
 
 	ret := make(map[string]string, len(vars))
 	for _, line := range strings.Split(output.String(), "\n") {
@@ -201,8 +229,12 @@ func Banner(config Config, make_vars map[string]string) string {
 	// Only show USE_RBE and USE_REWRAPPER when the user has explicitly set SOONG_NINJA
 	if config.ninjaCommand != NINJA_DEFAULT {
 		fmt.Fprintf(b, "SOONG_NINJA=%s\n", config.ninjaCommand.String())
+	}
+	if config.UseRBE() {
 		fmt.Fprintf(b, "USE_RBE=%t\n", config.UseRBE())
-		fmt.Fprintf(b, "USE_REWRAPPER=%t\n", config.UseRewrapper())
+		if config.ninjaCommand == NINJA_SISO {
+			fmt.Fprintf(b, "USE_REWRAPPER=%t\n", config.UseRewrapper())
+		}
 	}
 
 	// Normally config.soongOnlyRequested already takes into account PRODUCT_SOONG_ONLY,
@@ -211,6 +243,12 @@ func Banner(config Config, make_vars map[string]string) string {
 		fmt.Fprintf(b, "SOONG_ONLY=%t\n", config.soongOnlyRequested)
 	} else { // default for this product
 		fmt.Fprintf(b, "SOONG_ONLY=%t\n", make_vars["PRODUCT_SOONG_ONLY"] == "true")
+	}
+
+	fmt.Fprintf(b, "SOONG_INCREMENTAL_ANALYSIS=%t\n", config.incrementalBuildActions)
+
+	if len(config.partialAnalysisTargets) > 0 {
+		fmt.Fprintf(b, "SOONG_PARTIAL_ANALYSIS=%s\n", config.partialAnalysisTargets)
 	}
 
 	fmt.Fprint(b, "============================================")
@@ -249,7 +287,7 @@ func runMakeProductConfig(ctx Context, config Config) {
 		"TOOLCHAIN_RUSAGE_OUTPUT",
 	}
 
-	allVars := append(append([]string{
+	allVars := slices.Concat([]string{
 		// Used to execute Kati and Ninja
 		"NINJA_GOALS",
 		"KATI_GOALS",
@@ -279,6 +317,7 @@ func runMakeProductConfig(ctx Context, config Config) {
 		"BUILD_BROKEN_MISSING_OUTPUTS",
 
 		"PRODUCT_SOONG_ONLY",
+		"PRODUCT_SOONG_INCREMENTAL_ANALYSIS",
 
 		// Not used, but useful to be in the soong.log
 		"TARGET_BUILD_TYPE",
@@ -313,14 +352,24 @@ func runMakeProductConfig(ctx Context, config Config) {
 		"BUILD_BROKEN_USES_BUILD_STATIC_JAVA_LIBRARY",
 		"BUILD_BROKEN_USES_BUILD_STATIC_LIBRARY",
 		"RELEASE_BUILD_EXECUTION_METRICS",
-		"RELEASE_SRC_DIR_IS_READ_ONLY",
 		"RELEASE_USE_RKATI",
 		"RELEASE_BUILD_WITH_JDK_25",
-	}, exportEnvVars...), BannerVars...)
+		"RELEASE_SOONG_INCREMENTAL_ANALYSIS",
+		"SOONG_INCREMENTAL_ANALYSIS",
+	}, exportEnvVars, BannerVars, sisoStringVars, earlyReleaseConfigVars)
 
-	makeVars, err := dumpMakeVars(ctx, config, config.Arguments(), allVars, true, "")
+	makeVars, err := dumpMakeVars(ctx, config, config.Arguments(), allVars, "", DUMPVARS_PRODUCT_CONFIG)
 	if err != nil {
 		ctx.Fatalln("Error dumping make vars:", err)
+	}
+
+	// Verify that none of the earlyVars changed values.
+	for _, name := range earlyReleaseConfigVars {
+		if config.earlyVars[name] != makeVars[name] {
+			ctx.Fatalf("Product config value for %q is not consistent: %q (early call) became %q (final call).\n",
+				name, config.earlyVars[name], makeVars[name])
+
+		}
 	}
 
 	// Populate the environment
@@ -345,6 +394,7 @@ func runMakeProductConfig(ctx Context, config Config) {
 	config.useRkati = makeVars["RELEASE_USE_RKATI"] == "true" || os.Getenv("SOONG_USE_RKATI") == "true"
 	config.setupSandboxConfig(ctx, makeVars)
 
+	config.updateSisoConfigVars(makeVars)
 	config.SetBuildBrokenDupRules(makeVars["BUILD_BROKEN_DUP_RULES"] == "true")
 	config.SetBuildBrokenUsesNetwork(makeVars["BUILD_BROKEN_USES_NETWORK"] == "true")
 	config.SetBuildBrokenNinjaUsesEnvVars(strings.Fields(makeVars["BUILD_BROKEN_NINJA_USES_ENV_VARS"]))
@@ -360,6 +410,12 @@ func runMakeProductConfig(ctx Context, config Config) {
 	}
 
 	ctx.Metrics.SetSoongOnly(config.soongOnlyRequested)
+
+	// Enable incremental analysis by default if requested by the build flag, unless it
+	// was set explicitly in the environment.
+	if !config.incrementalBuildActionsSetInEnv && makeVars["RELEASE_SOONG_INCREMENTAL_ANALYSIS"] == "true" {
+		config.incrementalBuildActions = true
+	}
 
 	// Print the banner like make did
 	if !env.IsEnvTrue("ANDROID_QUIET_BUILD") {

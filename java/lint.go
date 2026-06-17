@@ -28,7 +28,7 @@ import (
 	"android/soong/remoteexec"
 )
 
-//go:generate go run ../../blueprint/gobtools/codegen/gob_gen.go
+//go:generate go run ../../blueprint/gobtools/codegen
 
 // lint checks automatically enforced for modules that have different min_sdk_version than
 // sdk_version
@@ -332,7 +332,7 @@ func (l *linter) writeLintProjectXML(ctx android.ModuleContext, rule *android.Ru
 }
 
 func VerifyStrictUpdatabilityChecks(ctx android.ModuleContext, baselines android.Paths) android.Path {
-	rule := android.NewRuleBuilder(pctx, ctx)
+	rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	baselineRspFile := android.PathForModuleOut(ctx, "lint_strict_updatability_check_baselines.rsp")
 	outputFile := android.PathForModuleOut(ctx, "lint_strict_updatability_check.stamp")
 	rule.Command().Text("rm -f").Output(outputFile)
@@ -434,9 +434,9 @@ func (l *linter) lint(ctx android.ModuleContext) {
 	depSets := depSetsBuilder.Build()
 
 	rule := android.NewRuleBuilder(pctx, ctx).
+		SandboxDisabled().
 		Sbox(android.PathForModuleOut(ctx, "lint"),
-			android.PathForModuleOut(ctx, "lint.sbox.textproto")).
-		SandboxInputs()
+			android.PathForModuleOut(ctx, "lint.sbox.textproto"))
 
 	if ctx.Config().UseREWrapper() && ctx.Config().IsEnvTrue("RBE_LINT") {
 		pool := ctx.Config().GetenvWithDefault("RBE_LINT_POOL", "java16")
@@ -591,6 +591,7 @@ func BuildModuleLintReportZips(ctx android.ModuleContext, depSets LintDepSets, v
 	return android.Paths{htmlZip, textZip, xmlZip}
 }
 
+// @auto-generate: gob
 type ModuleLintReportZipsInfo struct {
 	HtmlZip android.Path
 	TextZip android.Path
@@ -658,13 +659,13 @@ func (l *lintSingleton) copyLintDependencies(ctx android.SingletonContext) {
 		}
 
 		ctx.Build(pctx, android.BuildParams{
-			Rule:   android.CpIfChanged,
+			Rule:   android.CpIfChangedRule,
 			Input:  android.OutputFileForModule(ctx, *sdkAnnotations, ""),
 			Output: copiedLintDatabaseFilesPath(ctx, files.annotationCopiedName),
 		})
 
 		ctx.Build(pctx, android.BuildParams{
-			Rule:   android.CpIfChanged,
+			Rule:   android.CpIfChangedRule,
 			Input:  android.OutputFileForModule(ctx, *apiVersionsDb, ".api_versions.xml"),
 			Output: copiedLintDatabaseFilesPath(ctx, files.apiVersionsCopiedName),
 		})
@@ -743,7 +744,7 @@ func lintZip(ctx android.BuilderContext, paths android.Paths, outputPath android
 		return paths[i].String() < paths[j].String()
 	})
 
-	rule := android.NewRuleBuilder(pctx, ctx)
+	rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 
 	rule.Command().BuiltTool("soong_zip").
 		FlagWithOutput("-o ", outputPath).

@@ -23,7 +23,7 @@ import (
 	"github.com/google/blueprint"
 )
 
-//go:generate go run ../../blueprint/gobtools/codegen/gob_gen.go
+//go:generate go run ../../blueprint/gobtools/codegen
 
 // ----------------------------------------------------------------------------
 // Start of the definitions of exception functions and the lookup table.
@@ -195,8 +195,6 @@ type unstableInfo struct {
 	ContainsPlatformPrivateApis bool
 }
 
-var unstableInfoProvider = blueprint.NewProvider[unstableInfo]()
-
 func determineUnstableModule(mctx ModuleContext) bool {
 	module := mctx.Module()
 
@@ -204,8 +202,8 @@ func determineUnstableModule(mctx ModuleContext) bool {
 	if installable, ok := module.(InstallableModule); ok {
 		for _, staticDepTag := range installable.StaticDependencyTags() {
 			mctx.VisitDirectDepsProxyWithTag(staticDepTag, func(dep ModuleProxy) {
-				if unstableInfo, ok := OtherModuleProvider(mctx, dep, unstableInfoProvider); ok {
-					unstableModule = unstableModule || unstableInfo.ContainsPlatformPrivateApis
+				if commonInfo, ok := OtherModuleProvider(mctx, dep, CommonModuleInfoProvider); ok && commonInfo.UnstableInfo != nil {
+					unstableModule = unstableModule || commonInfo.UnstableInfo.ContainsPlatformPrivateApis
 				}
 			})
 		}
@@ -236,6 +234,7 @@ type InstallableModule interface {
 	DynamicDependencyTags() []blueprint.DependencyTag
 }
 
+// @auto-generate: gob
 type restriction struct {
 	// container of the dependency
 	dependency *container
@@ -248,6 +247,8 @@ type restriction struct {
 	// considered allowed and an error will not be thrown.
 	allowedExceptions []exceptionHandleFuncLabel
 }
+
+// @auto-generate: gob
 type container struct {
 	// The name of the container i.e. partition, api domain
 	name string
@@ -373,6 +374,7 @@ func initializeApexContainer() *container {
 	return apexContainer
 }
 
+// @auto-generate: gob
 type ContainersInfo struct {
 	belongingContainers []*container
 
@@ -454,24 +456,28 @@ func generateContainerInfo(ctx ModuleContext) ContainersInfo {
 }
 
 func getContainerModuleInfo(ctx ModuleContext, module ModuleOrProxy) (ContainersInfo, bool) {
+	var info *ContainersInfo
 	if EqualModules(ctx.Module(), module) {
-		return ctx.getContainersInfo(), true
+		info = ctx.getContainersInfo()
+	} else {
+		info = OtherModulePointerProviderOrDefault(ctx, module, CommonModuleInfoProvider).Containers
 	}
-
-	return OtherModuleProvider(ctx, module, ContainersInfoProvider)
+	if info != nil {
+		return *info, true
+	}
+	return ContainersInfo{}, false
 }
 
-func setContainerInfo(ctx ModuleContext) {
-	// Required to determine the unstable container. This provider is set here instead of the
-	// unstableContainerBoundaryFunc in order to prevent setting the provider multiple times.
-	SetProvider(ctx, unstableInfoProvider, unstableInfo{
-		ContainsPlatformPrivateApis: determineUnstableModule(ctx),
-	})
-
+func setContainerInfo(ctx ModuleContext) *unstableInfo {
 	if _, ok := ctx.Module().(InstallableModule); ok {
 		containersInfo := generateContainerInfo(ctx)
-		ctx.setContainersInfo(containersInfo)
-		SetProvider(ctx, ContainersInfoProvider, containersInfo)
+		ctx.setContainersInfo(&containersInfo)
+	}
+
+	// Required to determine the unstable container. This provider is set module.go instead of the
+	// unstableContainerBoundaryFunc in order to prevent setting the provider multiple times.
+	return &unstableInfo{
+		ContainsPlatformPrivateApis: determineUnstableModule(ctx),
 	}
 }
 

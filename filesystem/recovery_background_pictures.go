@@ -62,10 +62,9 @@ var (
 )
 
 func (f *recoveryBackgroundPictures) GenerateAndroidBuildActions(ctx android.ModuleContext) {
-	rule := android.NewRuleBuilder(pctx, ctx).
+	rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled().
 		Sbox(android.PathForModuleOut(ctx, "images"),
-			android.PathForModuleOut(ctx, "gen.sbox.textproto")).
-		SandboxInputs()
+			android.PathForModuleOut(ctx, "gen.sbox.textproto"))
 
 	fontDir, resDir := f.assembleFontsAndRes(ctx, rule)
 	var images android.Paths

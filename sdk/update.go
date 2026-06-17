@@ -57,6 +57,7 @@ var (
 			CommandDeps: []string{
 				"${config.Zip2ZipCmd}",
 			},
+			SandboxDisabled: true,
 		},
 		"destdir")
 
@@ -66,8 +67,9 @@ var (
 			CommandDeps: []string{
 				"${config.SoongZipCmd}",
 			},
-			Rspfile:        "$out.rsp",
-			RspfileContent: "$in",
+			Rspfile:         "$out.rsp",
+			RspfileContent:  "$in",
+			SandboxDisabled: true,
 		},
 		"basedir")
 
@@ -77,6 +79,7 @@ var (
 			CommandDeps: []string{
 				"${config.MergeZipsCmd}",
 			},
+			SandboxDisabled: true,
 		})
 )
 
@@ -637,7 +640,7 @@ func (s *sdk) generateInfoData(ctx android.ModuleContext, memberVariantDeps []sd
 			}
 
 			additionalSdkInfo, _ := android.OtherModuleProvider(ctx, module, android.AdditionalSdkInfoProvider)
-			info.memberSpecific = additionalSdkInfo.Properties
+			info.memberSpecific = additionalSdkInfo.Properties.ToMap()
 
 			name2Info[name] = info
 		}
@@ -795,10 +798,10 @@ func (t emptyClasspathContentsTransformation) transformModule(module *bpModule) 
 		"prebuilt_systemserverclasspath_fragment",
 	}
 	if module != nil && android.InList(module.moduleType, classpathModuleTypes) {
-		if contents, ok := module.bpPropertySet.properties["contents"].([]string); ok {
-			if len(contents) == 0 {
-				return nil
-			}
+		contents, contentsOk := module.bpPropertySet.properties["contents"].([]string)
+		standaloneContents, standaloneContentsOk := module.bpPropertySet.properties["standalone_contents"].([]string)
+		if (!contentsOk || len(contents) == 0) && (!standaloneContentsOk || len(standaloneContents) == 0) {
+			return nil
 		}
 	}
 	return module
@@ -1049,7 +1052,7 @@ func (s *snapshotBuilder) CopyToSnapshot(src android.Path, dest string) {
 	} else {
 		path := s.snapshotDir.Join(s.ctx, dest)
 		s.ctx.Build(pctx, android.BuildParams{
-			Rule:   android.Cp,
+			Rule:   android.CpRule,
 			Input:  src,
 			Output: path,
 		})
@@ -1085,7 +1088,7 @@ func (s *snapshotBuilder) EmptyFile() android.Path {
 		ctx := s.ctx
 		s.emptyFile = android.PathForModuleOut(ctx, "empty")
 		s.ctx.Build(pctx, android.BuildParams{
-			Rule:   android.Touch,
+			Rule:   android.TouchRule,
 			Output: s.emptyFile,
 		})
 	}
@@ -1130,7 +1133,8 @@ func (s *snapshotBuilder) AddPrebuiltModule(member android.SdkMember, moduleType
 	}
 
 	// Where available copy apex_available properties from the member.
-	if info, ok := android.OtherModuleProvider(s.ctx, variant, android.CommonModuleInfoProvider); ok && info.IsApexModule {
+	info, ok := android.OtherModuleProvider(s.ctx, variant, android.CommonModuleInfoProvider)
+	if ok && info.IsApexModule {
 		apexAvailable := info.ApexAvailable
 		if len(apexAvailable) == 0 {
 			// //apex_available:platform is the default.
@@ -1146,8 +1150,8 @@ func (s *snapshotBuilder) AddPrebuiltModule(member android.SdkMember, moduleType
 
 	// The licenses are the same for all variants.
 	mctx := s.ctx
-	licenseInfo, _ := android.OtherModuleProvider(mctx, variant, android.LicensesInfoProvider)
-	if len(licenseInfo.Licenses) > 0 {
+	licenseInfo := info.Licenses
+	if licenseInfo != nil && len(licenseInfo.Licenses) > 0 {
 		m.AddPropertyWithTag("licenses", licenseInfo.Licenses, s.OptionalSdkMemberReferencePropertyTag())
 	}
 

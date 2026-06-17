@@ -26,6 +26,8 @@ import (
 	"android/soong/android"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 // Build rules and utilities to generate individual packages/modules/common/proto/classpaths.proto
 // config files based on build configuration to embed into /system and /apex on a device.
 //
@@ -52,6 +54,11 @@ type classpathFragmentProperties struct {
 	// or platform_systemserverclasspath. This is useful for non-updatable APEX boot jars, to keep
 	// them as part of dexopt on device. Defaults to true.
 	Generate_classpaths_proto *bool
+
+	// If not blank, the minimum SDK version that the fragment will be included in. This is mostly
+	// relevant when other fragments depend on this one through the `fragments` property, to prune
+	// those dependencies in SDKs where this fragment doesn't exist.
+	Min_sdk_version proptools.Configurable[string] `android:"replace_instead_of_append"`
 }
 
 // classpathFragment interface is implemented by a module that contributes jars to a *CLASSPATH
@@ -60,11 +67,19 @@ type classpathFragment interface {
 	android.Module
 
 	classpathFragmentBase() *ClasspathFragmentBase
+
+	// MinSdkVersion returns the value of the min_sdk_version property.
+	MinSdkVersion(ctx android.MinSdkVersionFromValueContext) android.ApiLevel
+
+	// ConfigurableEvaluator returns the ConfigurableEvaluator for the module.
+	ConfigurableEvaluator(ctx android.ConfigurableEvaluatorContext) proptools.ConfigurableEvaluator
 }
 
 // ClasspathFragmentBase is meant to be embedded in any module types that implement classpathFragment;
 // such modules are expected to call initClasspathFragment().
 type ClasspathFragmentBase struct {
+	android.ModuleBase
+
 	properties classpathFragmentProperties
 
 	classpathType classpathType
@@ -75,6 +90,34 @@ type ClasspathFragmentBase struct {
 
 func (c *ClasspathFragmentBase) classpathFragmentBase() *ClasspathFragmentBase {
 	return c
+}
+
+func (c *ClasspathFragmentBase) MinSdkVersion(ctx android.MinSdkVersionFromValueContext) android.ApiLevel {
+	minSdkVersion := c.properties.Min_sdk_version.Get(c.ConfigurableEvaluator(ctx))
+	if minSdkVersion.IsPresent() {
+		return android.ApiLevelFrom(ctx, minSdkVersion.Get())
+	}
+	return android.MinApiLevel
+}
+
+func (c *ClasspathFragmentBase) MinSdkVersionSupported(ctx android.BaseModuleContext) android.ApiLevel {
+	// Return MinApiLevel since fragments should be allowed to have newer min_sdk_version's than their
+	// APEX'es because they may be added to existing modules to add classpath jars on newer platform
+	// releases.
+	return android.MinApiLevel
+}
+
+func (c *ClasspathFragmentBase) checkMinSdkVersionConstraint(ctx android.ModuleContext) {
+	apexInfo, _ := android.ModuleProvider(ctx, android.ApexInfoProvider)
+	if !apexInfo.IsForPlatform() && !apexInfo.MinSdkVersion.IsCurrent() {
+		fragmentMinSdk := c.properties.Min_sdk_version.Get(c.ConfigurableEvaluator(ctx))
+		if fragmentMinSdk.IsPresent() {
+			apiLevel := android.ApiLevelFrom(ctx, fragmentMinSdk.Get())
+			if apiLevel.LessThan(apexInfo.MinSdkVersion) {
+				ctx.ModuleErrorf("fragment min_sdk_version %v lower than its APEX (%v)", apiLevel, apexInfo.MinSdkVersion)
+			}
+		}
+	}
 }
 
 // Initializes ClasspathFragmentBase struct. Must be called by all modules that include ClasspathFragmentBase.
@@ -172,7 +215,7 @@ func (c *ClasspathFragmentBase) generateClasspathProtoBuildActions(ctx android.M
 		generatedTextproto := android.PathForModuleOut(ctx, outputFilename+".textproto")
 		writeClasspathsTextproto(ctx, generatedTextproto, jars)
 
-		rule := android.NewRuleBuilder(pctx, ctx)
+		rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 		rule.Command().
 			BuiltTool("conv_classpaths_proto").
 			Flag("encode").
@@ -226,6 +269,7 @@ func (c *ClasspathFragmentBase) androidMkInfo() android.AndroidMkInfo {
 
 var ClasspathFragmentProtoContentInfoProvider = blueprint.NewProvider[ClasspathFragmentProtoContentInfo]()
 
+// @auto-generate: gob
 type ClasspathFragmentProtoContentInfo struct {
 	// Whether the classpaths.proto config is generated for the fragment.
 	ClasspathFragmentProtoGenerated bool

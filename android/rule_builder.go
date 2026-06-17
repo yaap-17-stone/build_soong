@@ -18,6 +18,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -34,7 +35,7 @@ import (
 	"android/soong/shared"
 )
 
-//go:generate go run ../../blueprint/gobtools/codegen/gob_gen.go
+//go:generate go run ../../blueprint/gobtools/codegen
 
 const sboxSandboxBaseDir = "__SBOX_SANDBOX_DIR__"
 const sboxOutSubDir = "out"
@@ -57,11 +58,10 @@ type RuleBuilder struct {
 	sbox             bool
 	highmem          bool
 	remoteable       RemoteRuleSupports
+	toolchainPaths   []string
 	rbeParams        *remoteexec.REParams
 	outDir           WritablePath
 	sboxOutSubDir    string
-	sboxTools        bool
-	sboxInputs       bool
 	sboxManifestPath WritablePath
 	missingDeps      []string
 	args             map[string]string
@@ -70,6 +70,7 @@ type RuleBuilder struct {
 	nsjailBasePath   WritablePath
 	nsjailImplicits  Paths
 	dirDepsFile      WritablePath
+	sandboxDisabled  bool
 }
 
 // NewRuleBuilder returns a newly created RuleBuilder.
@@ -153,13 +154,18 @@ func (r *RuleBuilder) Remoteable(supports RemoteRuleSupports) *RuleBuilder {
 	return r
 }
 
+// ToolchianPaths adds toolchain paths.
+func (r *RuleBuilder) ToolchainPaths(paths ...string) {
+	r.toolchainPaths = append(r.toolchainPaths, paths...)
+}
+
 // Rewrapper marks the rule as running inside rewrapper using the given params in order to support
 // running on RBE.  During RuleBuilder.Build the params will be combined with the inputs, outputs
 // and tools known to RuleBuilder to prepend an appropriate rewrapper command line to the rule's
 // command line.
 func (r *RuleBuilder) Rewrapper(params *remoteexec.REParams) *RuleBuilder {
-	if !r.sboxInputs {
-		panic(fmt.Errorf("RuleBuilder.Rewrapper must be called after RuleBuilder.SandboxInputs"))
+	if !r.sbox {
+		panic(fmt.Errorf("RuleBuilder.Rewrapper must be called after RuleBuilder.Sbox"))
 	}
 	r.rbeParams = params
 	return r
@@ -180,6 +186,11 @@ func (r *RuleBuilder) Sbox(outputDir WritablePath, manifestPath WritablePath) *R
 	if r.nsjail {
 		panic("Sbox() may not be called after Nsjail()")
 	}
+	// TODO: b/454726435 - Re-enable this check once all dependencies are specified
+	// as the inputs to Sbox
+	// if r.sandboxDisabled {
+	// 	panic("Sbox() may not be called for rules that call SandboxDisabled()")
+	// }
 	r.sbox = true
 	r.outDir = outputDir
 	r.sboxManifestPath = manifestPath
@@ -234,38 +245,6 @@ func (r *RuleBuilder) NsjailKeepGendir() *RuleBuilder {
 	return r
 }
 
-// SandboxTools enables tool sandboxing for the rule by copying any referenced tools into the
-// sandbox.
-func (r *RuleBuilder) SandboxTools() *RuleBuilder {
-	if !r.sbox {
-		panic("SandboxTools() must be called after Sbox()")
-	}
-	if len(r.commands) > 0 {
-		panic("SandboxTools() may not be called after Command()")
-	}
-	r.sboxTools = true
-	return r
-}
-
-// SandboxInputs enables input sandboxing for the rule by copying any referenced inputs into the
-// sandbox.  It also implies SandboxTools().
-//
-// Sandboxing inputs requires RuleBuilder to be aware of all references to input paths.  Paths
-// that are passed to RuleBuilder outside of the methods that expect inputs, for example
-// FlagWithArg, must use RuleBuilderCommand.PathForInput to translate the path to one that matches
-// the sandbox layout.
-func (r *RuleBuilder) SandboxInputs() *RuleBuilder {
-	if !r.sbox {
-		panic("SandboxInputs() must be called after Sbox()")
-	}
-	if len(r.commands) > 0 {
-		panic("SandboxInputs() may not be called after Command()")
-	}
-	r.sboxTools = true
-	r.sboxInputs = true
-	return r
-}
-
 // Install associates an output of the rule with an install location, which can be retrieved later using
 // RuleBuilder.Installs.
 func (r *RuleBuilder) Install(from Path, to string) {
@@ -302,7 +281,7 @@ func (r *RuleBuilder) DeleteTemporaryFiles() {
 		return temporariesList[i].String() < temporariesList[j].String()
 	})
 
-	r.Command().Text("rm").Flag("-f").Outputs(temporariesList)
+	r.Command().BuiltTool("rm").Flag("-f").Outputs(temporariesList)
 }
 
 // Inputs returns the list of paths that were passed to the RuleBuilderCommand methods that take
@@ -518,6 +497,7 @@ type BuilderContext interface {
 	PathContext
 	Rule(PackageContext, string, blueprint.RuleParams, ...string) blueprint.Rule
 	Build(PackageContext, BuildParams)
+	OtherModuleProviderContext
 }
 
 var _ BuilderContext = ModuleContext(nil)
@@ -540,15 +520,21 @@ func (r *RuleBuilder) dirsToDepFileCmd(dirs DirectoryPaths, target WritablePath)
 		Text(strings.Join(dirs.Strings(), " "))
 }
 
-// Build adds the built command line to the build graph, with dependencies on Inputs and Tools, and output files for
-// Outputs.
-func (r *RuleBuilder) Build(name string, desc string) {
-	r.build(name, desc)
+func (r *RuleBuilder) SandboxDisabled() *RuleBuilder {
+	// TODO: b/454726435 - Re-enable this check once all dependencies are specified
+	// as the inputs to Sbox
+	// if r.sbox {
+	// 	panic("SandboxDisabled() may not be called for rules that call Sbox()")
+	// }
+	r.sandboxDisabled = true
+	return r
 }
 
 var sandboxEnvOnceKey = NewOnceKey("sandbox_environment_variables")
 
-func (r *RuleBuilder) build(name string, desc string) {
+// Build adds the built command line to the build graph, with dependencies on Inputs and Tools, and output files for
+// Outputs.
+func (r *RuleBuilder) Build(name string, desc string) {
 	name = ninjaNameEscape(name)
 
 	if len(r.missingDeps) > 0 {
@@ -661,12 +647,13 @@ func (r *RuleBuilder) build(name string, desc string) {
 			}
 		}
 
-		// These five directories are necessary to run native host tools like /bin/bash and py3-cmd.
+		// These directories are necessary to run native host tools like /bin/bash and py3-cmd.
 		nsjailCmd.WriteString(" -R /bin")
 		nsjailCmd.WriteString(" -R /lib")
 		nsjailCmd.WriteString(" -R /lib64")
 		nsjailCmd.WriteString(" -R /dev")
 		nsjailCmd.WriteString(" -R /usr")
+		nsjailCmd.WriteString(" -R /etc")
 
 		nsjailCmd.WriteString(" -m none:/tmp:tmpfs:size=1073741824") // 1GB, should be enough
 		nsjailCmd.WriteString(" -D nsjail_build_sandbox")
@@ -689,115 +676,109 @@ func (r *RuleBuilder) build(name string, desc string) {
 		manifest.Commands = append(manifest.Commands, &command)
 		command.Command = proto.String(commandString)
 
-		// If sandboxing tools is enabled, add copy rules to the manifest to copy each tool
-		// into the sbox directory.
-		if r.sboxTools {
-			for _, tool := range tools {
-				command.CopyBefore = append(command.CopyBefore, &sbox_proto.Copy{
-					From: proto.String(tool.String()),
-					To:   proto.String(sboxPathForToolRel(r.ctx, tool)),
-				})
-			}
-			for _, c := range r.commands {
-				for _, tool := range c.packagedTools {
-					if tool.srcPath != nil {
-						command.CopyBefore = append(command.CopyBefore, &sbox_proto.Copy{
-							From:       proto.String(tool.srcPath.String()),
-							To:         proto.String(sboxPathForPackagedToolRel(tool)),
-							Executable: proto.Bool(tool.executable),
-						})
-						tools = append(tools, tool.srcPath)
-					} else if tool.SymlinkTarget() == "" {
-						// We ignore symlinks for now, could be added later if needed
-						panic("Expected tool packagingSpec to either be a file or symlink")
-					}
+		// add copy rules to the manifest to copy each tool into the sbox directory.
+		for _, tool := range tools {
+			command.CopyBefore = append(command.CopyBefore, &sbox_proto.Copy{
+				From: proto.String(tool.String()),
+				To:   proto.String(sboxPathForToolRel(r.ctx, tool)),
+			})
+		}
+		for _, c := range r.commands {
+			for _, tool := range c.packagedTools {
+				if tool.srcPath != nil {
+					command.CopyBefore = append(command.CopyBefore, &sbox_proto.Copy{
+						From:       proto.String(tool.srcPath.String()),
+						To:         proto.String(sboxPathForPackagedToolRel(tool)),
+						Executable: proto.Bool(tool.executable),
+					})
+					tools = append(tools, tool.srcPath)
+				} else if tool.SymlinkTarget() == "" {
+					// We ignore symlinks for now, could be added later if needed
+					panic("Expected tool packagingSpec to either be a file or symlink")
 				}
 			}
 		}
 
-		// If sandboxing inputs is enabled, add copy rules to the manifest to copy each input
-		// into the sbox directory.
-		if r.sboxInputs {
-			for _, input := range inputs {
-				command.CopyBefore = append(command.CopyBefore, &sbox_proto.Copy{
-					From: proto.String(input.String()),
-					To:   proto.String(r.sboxPathForInputRel(input)),
+		// add copy rules to the manifest to copy each input into the sbox directory.
+		for _, input := range inputs {
+			command.CopyBefore = append(command.CopyBefore, &sbox_proto.Copy{
+				From: proto.String(input.String()),
+				To:   proto.String(r.sboxPathForInputRel(input)),
+			})
+		}
+		for _, input := range r.OrderOnlys() {
+			command.CopyBefore = append(command.CopyBefore, &sbox_proto.Copy{
+				From: proto.String(input.String()),
+				To:   proto.String(r.sboxPathForInputRel(input)),
+			})
+		}
+		for _, c := range r.commands {
+			for _, directory := range c.implicitDirectories {
+				command.CopyDirBefore = append(command.CopyDirBefore, &sbox_proto.CopyDir{
+					From: proto.String(directory.String()),
+					To:   proto.String(directory.String()),
 				})
 			}
-			for _, input := range r.OrderOnlys() {
-				command.CopyBefore = append(command.CopyBefore, &sbox_proto.Copy{
-					From: proto.String(input.String()),
-					To:   proto.String(r.sboxPathForInputRel(input)),
-				})
-			}
-			for _, c := range r.commands {
-				for _, directory := range c.implicitDirectories {
-					command.CopyDirBefore = append(command.CopyDirBefore, &sbox_proto.CopyDir{
-						From: proto.String(directory.String()),
-						To:   proto.String(directory.String()),
-					})
-				}
-			}
+		}
 
-			// If using rsp files copy them and their contents into the sbox directory with
-			// the appropriate path mappings.
-			for _, rspFile := range rspFiles {
-				command.RspFiles = append(command.RspFiles, &sbox_proto.RspFile{
-					File: proto.String(rspFile.file.String()),
-					// These have to match the logic in sboxPathForInputRel
-					PathMappings: []*sbox_proto.PathMapping{
-						{
-							From: proto.String(r.outDir.String()),
-							To:   proto.String(sboxOutSubDir),
-						},
-						{
-							From: proto.String(r.ctx.Config().OutDir()),
-							To:   proto.String(sboxOutSubDir),
-						},
+		// If using rsp files copy them and their contents into the sbox directory with
+		// the appropriate path mappings.
+		for _, rspFile := range rspFiles {
+			command.RspFiles = append(command.RspFiles, &sbox_proto.RspFile{
+				File: proto.String(rspFile.file.String()),
+				// These have to match the logic in sboxPathForInputRel
+				PathMappings: []*sbox_proto.PathMapping{
+					{
+						From: proto.String(r.outDir.String()),
+						To:   proto.String(sboxOutSubDir),
 					},
-				})
-			}
+					{
+						From: proto.String(r.ctx.Config().OutDir()),
+						To:   proto.String(sboxOutSubDir),
+					},
+				},
+			})
+		}
 
-			// Only allow the build to access certain environment variables
-			command.DontInheritEnv = proto.Bool(true)
-			command.Env = r.ctx.Config().Once(sandboxEnvOnceKey, func() interface{} {
-				// The list of allowed variables was found by running builds of all
-				// genrules and seeing what failed
-				var result []*sbox_proto.EnvironmentVariable
-				inheritedVars := []string{
-					"PATH",
-					"JAVA_HOME",
-					"TMPDIR",
-					// Allow RBE variables because the art tests invoke RBE manually
-					"RBE_log_dir",
-					"RBE_platform",
-					"RBE_server_address",
-					// TODO: RBE_exec_root is set to the absolute path to the root of the source
-					// tree, which we don't want sandboxed actions to find. Remap it to ".".
-					"RBE_exec_root",
-				}
-				for _, v := range inheritedVars {
-					result = append(result, &sbox_proto.EnvironmentVariable{
-						Name: proto.String(v),
-						State: &sbox_proto.EnvironmentVariable_Inherit{
-							Inherit: true,
-						},
-					})
-				}
-				// Set OUT_DIR to the relative path of the sandboxed out directory.
-				// Otherwise, OUT_DIR will be inherited from the rest of the build,
-				// which will allow scripts to escape the sandbox if OUT_DIR is an
-				// absolute path.
+		// Only allow the build to access certain environment variables
+		command.DontInheritEnv = proto.Bool(true)
+		command.Env = r.ctx.Config().Once(sandboxEnvOnceKey, func() interface{} {
+			// The list of allowed variables was found by running builds of all
+			// genrules and seeing what failed
+			var result []*sbox_proto.EnvironmentVariable
+			inheritedVars := []string{
+				"PATH",
+				"JAVA_HOME",
+				"TMPDIR",
+				// Allow RBE variables because the art tests invoke RBE manually
+				"RBE_log_dir",
+				"RBE_platform",
+				"RBE_server_address",
+				// TODO: RBE_exec_root is set to the absolute path to the root of the source
+				// tree, which we don't want sandboxed actions to find. Remap it to ".".
+				"RBE_exec_root",
+			}
+			for _, v := range inheritedVars {
 				result = append(result, &sbox_proto.EnvironmentVariable{
-					Name: proto.String("OUT_DIR"),
-					State: &sbox_proto.EnvironmentVariable_Value{
-						Value: sboxOutSubDir,
+					Name: proto.String(v),
+					State: &sbox_proto.EnvironmentVariable_Inherit{
+						Inherit: true,
 					},
 				})
-				return result
-			}).([]*sbox_proto.EnvironmentVariable)
-			command.Chdir = proto.Bool(true)
-		}
+			}
+			// Set OUT_DIR to the relative path of the sandboxed out directory.
+			// Otherwise, OUT_DIR will be inherited from the rest of the build,
+			// which will allow scripts to escape the sandbox if OUT_DIR is an
+			// absolute path.
+			result = append(result, &sbox_proto.EnvironmentVariable{
+				Name: proto.String("OUT_DIR"),
+				State: &sbox_proto.EnvironmentVariable_Value{
+					Value: sboxOutSubDir,
+				},
+			})
+			return result
+		}).([]*sbox_proto.EnvironmentVariable)
+		command.Chdir = proto.Bool(true)
 
 		// Add copy rules to the manifest to copy each output file from the sbox directory.
 		// to the output directory after running the commands.
@@ -848,7 +829,8 @@ func (r *RuleBuilder) build(name string, desc string) {
 		// converts it to a string to replace commandString.
 		sboxCmd := &RuleBuilderCommand{
 			rule: &RuleBuilder{
-				ctx: r.ctx,
+				ctx:             r.ctx,
+				sandboxDisabled: r.sandboxDisabled,
 			},
 		}
 		sboxCmd.builtToolWithoutDeps("sbox").
@@ -866,6 +848,10 @@ func (r *RuleBuilder) build(name string, desc string) {
 		tools = append(tools, sboxCmd.tools...)
 		inputs = append(inputs, sboxCmd.inputs...)
 
+		if len(r.toolchainPaths) > 0 {
+			// set PATH for java command etc here.
+			commandString = "PATH=" + strings.Join(r.toolchainPaths, ":") + ":$PATH " + commandString
+		}
 		if r.rbeParams != nil && r.ctx.Config().UseREWrapper() {
 			// RBE needs a list of input files to copy to the remote builder.  For inputs already
 			// listed in an rsp file, pass the rsp file directly to rewrapper.  For the rest,
@@ -930,7 +916,7 @@ func (r *RuleBuilder) build(name string, desc string) {
 		pool = remotePool
 	} else if r.highmem {
 		pool = highmemPool
-	} else if r.ctx.Config().UseRemoteBuild() {
+	} else if r.ctx.Config().REWrapperRemoteBuild() {
 		pool = localPool
 	}
 
@@ -954,14 +940,30 @@ func (r *RuleBuilder) build(name string, desc string) {
 		args_vars[i] = k
 		i++
 	}
+
+	_, file, line, ok := runtime.Caller(1)
+	if !ok {
+		panic("Could not get caller of rulebuilder")
+	}
+	// absSrcDir is "" in tests
+	if absSrcDir != "" {
+		var err error
+		file, err = filepath.Rel(absSrcDir, file)
+		if err != nil {
+			panic(err)
+		}
+	}
+
 	r.ctx.Build(r.pctx, BuildParams{
 		Rule: r.ctx.Rule(r.pctx, name, blueprint.RuleParams{
-			Command:        commandString,
-			CommandDeps:    proptools.NinjaEscapeList(tools.Strings()),
-			Restat:         r.restat,
-			Rspfile:        proptools.NinjaEscape(rspFile),
-			RspfileContent: rspFileContent,
-			Pool:           pool,
+			Command:         commandString,
+			CommandDeps:     proptools.NinjaEscapeList(tools.Strings()),
+			Restat:          r.restat,
+			Rspfile:         proptools.NinjaEscape(rspFile),
+			RspfileContent:  rspFileContent,
+			Pool:            pool,
+			SandboxDisabled: r.sandboxDisabled,
+			Source:          fmt.Sprintf("%s:%d", file, line),
 		}, args_vars...),
 		Inputs:          rspFileInputs,
 		Implicits:       inputs,
@@ -1040,6 +1042,18 @@ func (c *RuleBuilderCommand) PathForInput(path Path) string {
 	return path.String()
 }
 
+// PathForInputFromFile is like PathForInput but for file paths specified in a file which is used on the command line.
+// If sbox is enabled it doesn't prepend sboxSandboxBaseDir to the returned path.
+func (c *RuleBuilderCommand) PathForInputFromFile(path Path) string {
+	if c.rule.sbox {
+		rel, _ := c.rule._sboxPathForInputRel(path)
+		return rel
+	} else if c.rule.nsjail {
+		return c.rule.nsjailPathForInputRel(path)
+	}
+	return path.String()
+}
+
 // PathsForInputs takes a list of input paths and returns the appropriate paths to use on the
 // command line.  If sbox was enabled via a call to RuleBuilder.Sbox() a path was an output path, it
 // returns the path with the placeholder prefix used for outputs in sbox.  If sbox is not enabled it
@@ -1087,14 +1101,12 @@ func (r *RuleBuilder) _sboxPathForInputRel(path Path) (rel string, inSandbox boo
 	if isRelSboxOut {
 		return filepath.Join(sboxOutSubDir, rel), true
 	}
-	if r.sboxInputs {
-		// When sandboxing inputs all inputs have to be copied into the sandbox.  Input files that
-		// are outputs of other rules could be an arbitrary absolute path if OUT_DIR is set, so they
-		// will be copied to relative paths under __SBOX_OUT_DIR__/out.
-		rel, isRelOut, _ := maybeRelErr(r.ctx.Config().OutDir(), path.String())
-		if isRelOut {
-			return filepath.Join(sboxOutSubDir, rel), true
-		}
+	// When sandboxing inputs all inputs have to be copied into the sandbox.  Input files that
+	// are outputs of other rules could be an arbitrary absolute path if OUT_DIR is set, so they
+	// will be copied to relative paths under __SBOX_OUT_DIR__/out.
+	rel, isRelOut, _ := maybeRelErr(r.ctx.Config().OutDir(), path.String())
+	if isRelOut {
+		return filepath.Join(sboxOutSubDir, rel), true
 	}
 	return path.String(), false
 }
@@ -1102,14 +1114,6 @@ func (r *RuleBuilder) _sboxPathForInputRel(path Path) (rel string, inSandbox boo
 func (r *RuleBuilder) sboxPathForInputRel(path Path) string {
 	rel, _ := r._sboxPathForInputRel(path)
 	return rel
-}
-
-func (r *RuleBuilder) sboxPathsForInputsRel(paths Paths) []string {
-	ret := make([]string, len(paths))
-	for i, path := range paths {
-		ret[i] = r.sboxPathForInputRel(path)
-	}
-	return ret
 }
 
 func sboxPathForPackagedToolRel(spec PackagingSpec) string {
@@ -1152,12 +1156,12 @@ func nsjailPathForPackagedToolRel(spec PackagingSpec) string {
 // tool after copying it into the sandbox.  This can be used  on the RuleBuilder command line to
 // reference the tool.
 func (c *RuleBuilderCommand) PathForPackagedTool(spec PackagingSpec) string {
-	if c.rule.sboxTools {
+	if c.rule.sbox {
 		return filepath.Join(sboxSandboxBaseDir, sboxPathForPackagedToolRel(spec))
 	} else if c.rule.nsjail {
 		return nsjailPathForPackagedToolRel(spec)
 	} else {
-		panic("PathForPackagedTool() requires SandboxTools() or Nsjail()")
+		panic("PathForPackagedTool() requires Sbox() or Nsjail()")
 	}
 }
 
@@ -1165,7 +1169,7 @@ func (c *RuleBuilderCommand) PathForPackagedTool(spec PackagingSpec) string {
 // the corresponding path for the tool in the sbox sandbox if sbox is enabled, or the original path
 // if it is not.  This can be used  on the RuleBuilder command line to reference the tool.
 func (c *RuleBuilderCommand) PathForTool(path Path) string {
-	if c.rule.sbox && c.rule.sboxTools {
+	if c.rule.sbox {
 		return filepath.Join(sboxSandboxBaseDir, sboxPathForToolRel(c.rule.ctx, path))
 	} else if c.rule.nsjail {
 		return nsjailPathForToolRel(c.rule.ctx, path)
@@ -1177,7 +1181,7 @@ func (c *RuleBuilderCommand) PathForTool(path Path) string {
 // returns the corresponding paths for the tools in the sbox sandbox if sbox is enabled, or the
 // original paths if it is not.  This can be used  on the RuleBuilder command line to reference the tool.
 func (c *RuleBuilderCommand) PathsForTools(paths Paths) []string {
-	if c.rule.sbox && c.rule.sboxTools {
+	if c.rule.sbox {
 		var ret []string
 		for _, path := range paths {
 			ret = append(ret, filepath.Join(sboxSandboxBaseDir, sboxPathForToolRel(c.rule.ctx, path)))
@@ -1194,24 +1198,24 @@ func (c *RuleBuilderCommand) PathsForTools(paths Paths) []string {
 }
 
 // PackagedTool adds the specified tool path to the command line.  It can only be used with tool
-// sandboxing enabled by SandboxTools(), and will copy the tool into the sandbox.
+// sandboxing enabled by Sbox(), and will copy the tool into the sandbox.
 func (c *RuleBuilderCommand) PackagedTool(spec PackagingSpec) *RuleBuilderCommand {
 	c.packagedTools = append(c.packagedTools, spec)
-	if c.rule.sboxTools {
+	if c.rule.sbox {
 		c.Text(sboxPathForPackagedToolRel(spec))
 	} else if c.rule.nsjail {
 		c.Text(nsjailPathForPackagedToolRel(spec))
 	} else {
-		panic("PackagedTool() requires SandboxTools() or Nsjail()")
+		panic("PackagedTool() requires Sbox() or Nsjail()")
 	}
 	return c
 }
 
 // ImplicitPackagedTool copies the specified tool into the sandbox without modifying the command
-// line.  It can only be used with tool sandboxing enabled by SandboxTools().
+// line.  It can only be used with tool sandboxing enabled by Sbox().
 func (c *RuleBuilderCommand) ImplicitPackagedTool(spec PackagingSpec) *RuleBuilderCommand {
-	if !c.rule.sboxTools && !c.rule.nsjail {
-		panic("ImplicitPackagedTool() requires SandboxTools() or Nsjail()")
+	if !c.rule.sbox && !c.rule.nsjail {
+		panic("ImplicitPackagedTool() requires Sbox() or Nsjail()")
 	}
 
 	c.packagedTools = append(c.packagedTools, spec)
@@ -1219,10 +1223,10 @@ func (c *RuleBuilderCommand) ImplicitPackagedTool(spec PackagingSpec) *RuleBuild
 }
 
 // ImplicitPackagedTools copies the specified tools into the sandbox without modifying the command
-// line.  It can only be used with tool sandboxing enabled by SandboxTools().
+// line.  It can only be used with tool sandboxing enabled by Sbox().
 func (c *RuleBuilderCommand) ImplicitPackagedTools(specs []PackagingSpec) *RuleBuilderCommand {
-	if !c.rule.sboxTools && !c.rule.nsjail {
-		panic("ImplicitPackagedTools() requires SandboxTools() or Nsjail()")
+	if !c.rule.sbox && !c.rule.nsjail {
+		panic("ImplicitPackagedTools() requires Sbox() or Nsjail()")
 	}
 
 	c.packagedTools = append(c.packagedTools, specs...)
@@ -1320,6 +1324,87 @@ func (c *RuleBuilderCommand) ImplicitTools(paths Paths) *RuleBuilderCommand {
 	return c
 }
 
+// Returns the [ModuleProxy] of the tool from dependencies.
+func (c *RuleBuilderCommand) getToolModule(tool string) ModuleProxy {
+	// TODO(jihoonkang): Establish sbox dependency for all modules that utilizes
+	// RuleBuilder.
+	if tool == "sbox" {
+		return ModuleProxy{}
+	}
+	ctx := c.rule.ctx
+	toolModule := ModuleProxy{}
+
+	type ctxInfoStruct struct {
+		// Whether the visiting context is exempt from throwing an error
+		allowlisted bool
+		// The error function to use
+		errorFunc func(string, ...any)
+	}
+
+	var ctxInfo ctxInfoStruct
+	switch ctxType := ctx.(type) {
+	case ModuleContext:
+		ctxInfo = ctxInfoStruct{
+			allowlisted: false,
+			errorFunc:   ctxType.ModuleErrorf,
+		}
+		toolModule = ctxType.GetDirectDepProxyWithTag(tool, HostToolDepTag)
+	case SingletonContext:
+		ctxInfo = ctxInfoStruct{
+			allowlisted: false,
+			errorFunc:   ctxType.Errorf,
+		}
+		toolModule = ctxType.GetModuleProxy(tool, ctxType.Config().BuildOSTarget.Variations())
+		if toolModule.IsNil() {
+			toolModule = ctxType.GetModuleProxy(tool, ctxType.Config().BuildOSCommonTarget.Variations())
+		}
+	case builderContextForTests:
+		ctxInfo = ctxInfoStruct{
+			allowlisted: true,
+		}
+	default:
+		ctxInfo = ctxInfoStruct{
+			allowlisted: false,
+			errorFunc: func(fmtStr string, args ...interface{}) {
+				panic(fmt.Errorf(fmtStr, args...))
+			},
+		}
+	}
+
+	if !c.rule.sandboxDisabled && !ctxInfo.allowlisted && toolModule.IsNil() {
+		if ctx.Config().AllowMissingDependencies() {
+			c.rule.MissingDeps([]string{tool})
+		} else {
+			ctxInfo.errorFunc("Host tool %s not found in deps. Please add a dependency to the tool using AddHostToolDependencies", tool)
+		}
+	}
+	return toolModule
+}
+
+func (c *RuleBuilderCommand) getToolTransitiveDeps(tool string) InstallPaths {
+	toolModule := c.getToolModule(tool)
+	var transitiveInstallFiles InstallPaths
+	if !toolModule.IsNil() {
+		if info := OtherModulePointerProviderOrDefault(c.rule.ctx, toolModule, CommonModuleInfoProvider).InstallFiles; info != nil {
+			transitiveInstallFiles = info.TransitiveInstallFiles.ToList()
+		}
+	}
+
+	return transitiveInstallFiles
+}
+
+func (c *RuleBuilderCommand) getHostToolRuntimeDeps(tool string) Paths {
+	toolModule := c.getToolModule(tool)
+	var runtimeHostToolDeps Paths
+	if !toolModule.IsNil() {
+		if deps := OtherModulePointerProviderOrDefault(c.rule.ctx, toolModule, CommonModuleInfoProvider).RuntimeHostToolDeps; deps != nil {
+			runtimeHostToolDeps = append(runtimeHostToolDeps, deps...)
+		}
+	}
+
+	return runtimeHostToolDeps
+}
+
 // BuiltTool adds the specified tool path that was built using a host Soong module to the command line.  The path will
 // be also added to the dependencies returned by RuleBuilder.Tools.
 //
@@ -1340,7 +1425,24 @@ func (c *RuleBuilderCommand) BuiltTool(tool string) *RuleBuilderCommand {
 // builtToolWithoutDeps is similar to BuiltTool, but doesn't add any dependencies.  It is used
 // internally by RuleBuilder for helper tools that are known to be compiled statically.
 func (c *RuleBuilderCommand) builtToolWithoutDeps(tool string) *RuleBuilderCommand {
-	return c.Tool(c.rule.ctx.Config().HostToolPath(c.rule.ctx, tool))
+	ctx := c.rule.ctx
+	if _, ok := commonToyboxSymlinks[tool]; ok {
+		binary := PathForSource(ctx, fmt.Sprintf("prebuilts/build-tools/%s/bin/toybox", ctx.Config().PrebuiltOS()))
+		symlink := PathForSource(ctx, fmt.Sprintf("prebuilts/build-tools/path/%s/%s", ctx.Config().PrebuiltOS(), tool))
+		c.Tool(symlink)
+		c.ImplicitTool(binary)
+		return c
+	}
+
+	cmd := c.Tool(ctx.Config().HostToolPath(c.rule.ctx, tool))
+	transitiveInstallFiles := c.getToolTransitiveDeps(tool).Paths()
+	if len(transitiveInstallFiles) > 0 {
+		cmd.ImplicitTools(transitiveInstallFiles)
+	}
+
+	cmd.ImplicitTools(c.getHostToolRuntimeDeps(tool))
+
+	return cmd
 }
 
 // PrebuiltBuildTool adds the specified tool path from prebuils/build-tools.  The path will be also added to the
@@ -1619,12 +1721,17 @@ func BuilderContextForTesting(config Config) BuilderContext {
 
 type builderContextForTests struct {
 	PathContext
+	OtherModuleProviderContext
 }
 
 func (builderContextForTests) Rule(PackageContext, string, blueprint.RuleParams, ...string) blueprint.Rule {
 	return nil
 }
 func (builderContextForTests) Build(PackageContext, BuildParams) {}
+
+func (builderContextForTests) otherModuleProvider(m ModuleOrProxy, provider blueprint.AnyProviderKey) (any, bool) {
+	return nil, false
+}
 
 func writeRspFileRule(ctx BuilderContext, rspFile WritablePath, paths Paths) {
 	buf := &strings.Builder{}

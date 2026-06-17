@@ -99,6 +99,7 @@ func (library *Library) prepareAndroidMKProviderInfo(config android.Config) *and
 		requiredUsesLibs, optionalUsesLibs := library.classLoaderContexts.UsesLibs()
 		info.PrimaryInfo.AddStrings("LOCAL_EXPORT_SDK_LIBRARIES", append(requiredUsesLibs, optionalUsesLibs...)...)
 
+		// TODO(b470068827): Ensure proguard artifact propagation for APEX-only libraries and apps.
 		info.PrimaryInfo.SetOptionalPath("LOCAL_SOONG_PROGUARD_DICT", library.dexer.proguardDictionary)
 		info.PrimaryInfo.SetOptionalPath("LOCAL_SOONG_PROGUARD_USAGE_ZIP", library.dexer.proguardUsageZip)
 		info.PrimaryInfo.SetString("LOCAL_MODULE_STEM", library.Stem())
@@ -346,12 +347,6 @@ func (app *AndroidApp) PrepareAndroidMKProviderInfo(config android.Config) *andr
 	}
 
 	info.PrimaryInfo.AddStrings("LOCAL_SOONG_LOGTAGS_FILES", app.logtagsSrcs.Strings()...)
-	if app.javaApiUsedByOutputFile.String() != "" {
-		info.PrimaryInfo.FooterStrings = append(info.PrimaryInfo.FooterStrings,
-
-			fmt.Sprintf("$(call dist-for-goals,%s,%s:%s/$(notdir %s))\n",
-				app.installApkName, app.javaApiUsedByOutputFile.String(), "java_apis_used_by_apex", app.javaApiUsedByOutputFile.String()))
-	}
 
 	return info
 }

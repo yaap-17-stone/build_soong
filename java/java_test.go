@@ -471,6 +471,11 @@ func TestSdkVersionByPartition(t *testing.T) {
 				srcs: ["a.java"],
 				product_specific: true,
 			}
+
+			java_library {
+				name: "framework-minus-internal-res",
+				srcs: ["b.java"],
+			}
 		`
 
 		errorHandler := android.FixtureExpectsNoErrors
@@ -539,7 +544,7 @@ func TestBinary(t *testing.T) {
 	barWrapperDeps := bar.Output("bar").Implicits.Strings()
 
 	libjni := ctx.ModuleForTests(t, "libjni", buildOS+"_x86_64_shared")
-	libjniSO := android.OtherModuleProviderOrDefault(ctx, libjni.Module(), android.InstallFilesProvider).InstallFiles[0].RelativeToTop().String()
+	libjniSO := android.GetInstallFiles(ctx, libjni.Module()).InstallFiles[0].RelativeToTop().String()
 
 	// Test that the install binary wrapper depends on the installed jar file
 	if g, w := barWrapperDeps, barJar; !android.InList(w, g) {
@@ -1357,20 +1362,35 @@ func TestCompilerFlags(t *testing.T) {
 }
 
 // TODO(jungjw): Consider making this more robust by ignoring path order.
-func checkPatchModuleFlag(t *testing.T, ctx *android.TestContext, moduleName string, expected string) {
+func checkPatchModuleFlag(t *testing.T, ctx *android.TestContext, moduleName string, expected []string) {
 	t.Helper()
 	variables := ctx.ModuleForTests(t, moduleName, "android_common").VariablesForTestsRelativeToTop()
-	flags := strings.Split(variables["javacFlags"], " ")
-	got := ""
-	for _, flag := range flags {
-		keyEnd := strings.Index(flag, "=")
-		if keyEnd > -1 && flag[:keyEnd] == "--patch-module" {
-			got = flag[keyEnd+1:]
-			break
+
+	module := ctx.ModuleForTests(t, moduleName, "android_common")
+	patchModulePathsFileRule := module.MaybeOutput("javac/patch_module_paths")
+	if patchModulePathsFileRule.Rule == nil {
+		if expected != nil {
+			t.Errorf("expected no patch_module_paths file, found one")
 		}
+		return
 	}
-	if expected != android.StringPathRelativeToTop(ctx.Config().SoongOutDir(), got) {
-		t.Errorf("Unexpected patch-module flag for module %q - expected %q, but got %q", moduleName, expected, got)
+
+	flags := variables["javacFlags"]
+	wantFlag := "@" + patchModulePathsFileRule.Output.String()
+	if !strings.Contains(flags, wantFlag) {
+		t.Fatalf("expected %q in flags, not found in %q", wantFlag, flags)
+	}
+
+	got := android.ContentFromFileRuleForTests(t, ctx, patchModulePathsFileRule)
+	got = strings.TrimSpace(got)
+	wantPrefix := "--patch-module=java.base="
+	if !strings.HasPrefix(got, wantPrefix) {
+		t.Fatalf("expected patch_module_paths file content to start with %q, found %q", wantPrefix, got)
+	}
+	paths := strings.Split(strings.TrimPrefix(got, wantPrefix), ":")
+	pathsRelativeToTop := android.StringPathsRelativeToTop(ctx.Config().SoongOutDir(), paths)
+	if !slices.Equal(expected, pathsRelativeToTop) {
+		t.Errorf("Unexpected patch-module flag for module %q - expected %q, but got %q", moduleName, expected, pathsRelativeToTop)
 	}
 }
 
@@ -1404,9 +1424,9 @@ func TestPatchModule(t *testing.T) {
 		`
 		ctx, _ := testJava(t, bp)
 
-		checkPatchModuleFlag(t, ctx, "foo", "")
-		checkPatchModuleFlag(t, ctx, "bar", "")
-		checkPatchModuleFlag(t, ctx, "baz", "")
+		checkPatchModuleFlag(t, ctx, "foo", nil)
+		checkPatchModuleFlag(t, ctx, "bar", nil)
+		checkPatchModuleFlag(t, ctx, "baz", nil)
 	})
 
 	t.Run("Java language level 9", func(t *testing.T) {
@@ -1441,11 +1461,12 @@ func TestPatchModule(t *testing.T) {
 		`
 		ctx, _ := testJava(t, bp)
 
-		checkPatchModuleFlag(t, ctx, "foo", "")
-		expected := "java.base=.:out/soong"
+		checkPatchModuleFlag(t, ctx, "foo", nil)
+		expected := []string{"out/soong/.intermediates/bar/android_common", "."}
 		checkPatchModuleFlag(t, ctx, "bar", expected)
-		expected = "java.base=" + strings.Join([]string{
-			".", "out/soong", defaultModuleToPath("ext"), defaultModuleToPath("framework")}, ":")
+		expected = []string{
+			"out/soong/.intermediates/baz/android_common", ".", "dir", "dir2", "nested/dir",
+			defaultModuleToPath("ext"), defaultModuleToPath("framework")}
 		checkPatchModuleFlag(t, ctx, "baz", expected)
 	})
 }
@@ -3186,20 +3207,16 @@ func assertTestOnlyAndTopLevel(t *testing.T, ctx *android.TestResult, expectedTe
 	t.Helper()
 	actualTrueModules := []string{}
 	actualTopLevelTests := []string{}
-	addActuals := func(m blueprint.Module, key blueprint.ProviderKey[android.TestModuleInformation]) {
-		if provider, ok := android.OtherModuleProvider(ctx.TestContext.OtherModuleProviderAdaptor(), m, key); ok {
-			if provider.TestOnly {
+
+	ctx.VisitAllModules(func(m android.Module) {
+		if provider, ok := android.OtherModuleProvider(ctx.TestContext.OtherModuleProviderAdaptor(), m, android.CommonModuleInfoProvider); ok && provider.TestModuleInfo != nil {
+			if provider.TestModuleInfo.TestOnly {
 				actualTrueModules = append(actualTrueModules, m.Name())
 			}
-			if provider.TopLevelTarget {
+			if provider.TestModuleInfo.TopLevelTarget {
 				actualTopLevelTests = append(actualTopLevelTests, m.Name())
 			}
 		}
-	}
-
-	ctx.VisitAllModules(func(m android.Module) {
-		addActuals(m, android.TestOnlyProviderKey)
-
 	})
 
 	notEqual, left, right := android.ListSetDifference(expectedTestOnly, actualTrueModules)

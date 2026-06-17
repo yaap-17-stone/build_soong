@@ -24,7 +24,9 @@ import (
 )
 
 // This flag needs to be in both CFlags and LdFlags to ensure correct symbol ordering
-const afdoFlagsFormat = "-fprofile-sample-use=%s -fprofile-sample-accurate"
+// TODO(yikong): -fsample-profile-use-profi is going to be the default in clang-r584948. Turn on the
+// flag in advance to isolate the performance difference. Remove the flag once updated past r584948.
+const afdoFlagsFormat = "-fprofile-sample-use=%s -fsample-profile-use-profi"
 
 type AfdoProperties struct {
 	// Afdo allows developers self-service enroll for
@@ -60,18 +62,16 @@ func (afdo *afdo) afdoEnabled() bool {
 }
 
 func (afdo *afdo) isAfdoCompile(ctx ModuleContext) bool {
-	fdoProfilePath := getFdoProfilePathFromDep(ctx)
-	return !ctx.Host() && (afdo.Properties.Afdo || afdo.Properties.AfdoDep) && (fdoProfilePath != "")
+	info, ok := getFdoProfileInfoFromDep(ctx)
+	return !ctx.Host() && (afdo.Properties.Afdo || afdo.Properties.AfdoDep) && ok && (info.Path != nil)
 }
 
-func getFdoProfilePathFromDep(ctx ModuleContext) string {
+func getFdoProfileInfoFromDep(ctx ModuleContext) (FdoProfileInfo, bool) {
 	fdoProfileDeps := ctx.GetDirectDepsProxyWithTag(FdoProfileTag)
 	if len(fdoProfileDeps) > 0 {
-		if info, ok := android.OtherModuleProvider(ctx, fdoProfileDeps[0], FdoProfileProvider); ok {
-			return info.Path.String()
-		}
+		return android.OtherModuleProvider(ctx, fdoProfileDeps[0], FdoProfileProvider)
 	}
-	return ""
+	return FdoProfileInfo{}, false
 }
 
 func (afdo *afdo) flags(ctx ModuleContext, flags Flags) Flags {
@@ -105,16 +105,38 @@ func (afdo *afdo) flags(ctx ModuleContext, flags Flags) Flags {
 		flags.Local.LdFlags = append([]string{"-Wl,-O3"}, flags.Local.LdFlags...)
 		flags.Local.LdFlags = append([]string{"-Wl,--lto-O3"}, flags.Local.LdFlags...)
 	}
-	if fdoProfilePath := getFdoProfilePathFromDep(ctx); fdoProfilePath != "" {
+	if fdoProfileInfo, ok := getFdoProfileInfoFromDep(ctx); ok && fdoProfileInfo.Path != nil {
+		fdoProfilePath := fdoProfileInfo.Path.String()
 		// The flags are prepended to allow overriding.
 		profileUseFlag := fmt.Sprintf(afdoFlagsFormat, fdoProfilePath)
+		if !fdoProfileInfo.IncompleteCoverage {
+			profileUseFlag += " -fprofile-sample-accurate"
+		} else {
+			profileUseFlag += " -fno-profile-sample-accurate"
+		}
 		flags.Local.CFlags = append([]string{profileUseFlag}, flags.Local.CFlags...)
 		// Salvage stale profile by fuzzy matching and use the remapped location for sample profile query.
 		flags.Local.CFlags = append([]string{"-mllvm", "--salvage-stale-profile=true"}, flags.Local.CFlags...)
 		flags.Local.CFlags = append([]string{"-mllvm", "--salvage-stale-profile-max-callsites=2000"}, flags.Local.CFlags...)
 		// Salvage stale profile by fuzzy matching renamed functions.
-		flags.Local.CFlags = append([]string{"-mllvm", "--salvage-unused-profile=true"}, flags.Local.CFlags...)
+		// FIXME(yikong): Disabled due to producing non-deterministic output when used along with
+		// --salvage-stale-profile.
+		// flags.Local.CFlags = append([]string{"-mllvm", "--salvage-unused-profile=true"}, flags.Local.CFlags...)
 		flags.Local.LdFlags = append([]string{profileUseFlag, "-Wl,-mllvm,-no-warn-sample-unused=true"}, flags.Local.LdFlags...)
+		// Enable Machine Function Splitting on ARM64.
+		if ctx.Config().GetBuildFlagBool("RELEASE_BUILD_AFDO_ENABLE_MFS") {
+			if ctx.Arch().ArchType == android.Arm64 {
+				flags.Local.CFlags = append([]string{"-fsplit-machine-functions"}, flags.Local.CFlags...)
+				flags.Local.LdFlags = append([]string{"-Wl,-mllvm,-enable-split-machine-functions"}, flags.Local.LdFlags...)
+			}
+		}
+		// Use extended TSP for basic block placement.
+		if ctx.Config().GetBuildFlagBool("RELEASE_BUILD_AFDO_ENABLE_EXT_TSP") {
+			if ctx.Arch().ArchType == android.Arm64 {
+				flags.Local.CFlags = append([]string{"-mllvm", "-enable-ext-tsp-block-placement=1"}, flags.Local.CFlags...)
+				flags.Local.LdFlags = append([]string{"-Wl,-mllvm,-enable-ext-tsp-block-placement=1"}, flags.Local.LdFlags...)
+			}
+		}
 
 		// Update CFlagsDeps and LdFlagsDeps so the module is rebuilt
 		// if profileFile gets updated
@@ -153,6 +175,10 @@ type afdoTransitionMutator struct{}
 
 func (a *afdoTransitionMutator) Split(ctx android.BaseModuleContext) []string {
 	return []string{""}
+}
+
+func (a *afdoTransitionMutator) SplitOnDemand(ctx android.BaseModuleContext) []string {
+	return nil
 }
 
 func (a *afdoTransitionMutator) OutgoingTransition(ctx android.OutgoingTransitionContext, sourceVariation string) string {

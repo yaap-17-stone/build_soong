@@ -30,8 +30,13 @@ func getTestConfigTemplate(ctx android.ModuleContext, prop *string) android.Opti
 	return ctx.ExpandOptionalSource(prop, "test_config_template")
 }
 
-func getTestConfig(ctx android.ModuleContext, prop *string) android.Path {
-	if p := ctx.ExpandOptionalSource(prop, "test_config"); p.Valid() {
+func getTestConfig(ctx android.ModuleContext, prop proptools.Configurable[string]) android.Path {
+	// Convert prop to a string ptr to fit ExpandOptionalSource
+	var propPtr *string
+	if v := prop.GetOrDefault(ctx, ""); v != "" {
+		propPtr = &v
+	}
+	if p := ctx.ExpandOptionalSource(propPtr, "test_config"); p.Valid() {
 		return p.Path()
 	} else if p := android.ExistentPathForSource(ctx, ctx.ModuleDir(), "AndroidTest.xml"); p.Valid() {
 		return p.Path()
@@ -40,11 +45,12 @@ func getTestConfig(ctx android.ModuleContext, prop *string) android.Path {
 }
 
 var autogenTestConfig = pctx.StaticRule("autogenTestConfig", blueprint.RuleParams{
-	Command:     "sed 's&{MODULE}&${name}&g;s&{EXTRA_CONFIGS}&'${extraConfigs}'&g;s&{EXTRA_TEST_RUNNER_CONFIGS}&'${extraTestRunnerConfigs}'&g;s&{OUTPUT_FILENAME}&'${outputFileName}'&g;s&{TEST_INSTALL_BASE}&'${testInstallBase}'&g' $template > $out",
-	CommandDeps: []string{"$template"},
+	Command:         "sed 's&{MODULE}&${name}&g;s&{EXTRA_CONFIGS}&'${extraConfigs}'&g;s&{EXTRA_TEST_RUNNER_CONFIGS}&'${extraTestRunnerConfigs}'&g;s&{OUTPUT_FILENAME}&'${outputFileName}'&g;s&{TEST_INSTALL_BASE}&'${testInstallBase}'&g' $template > $out",
+	CommandDeps:     []string{"$template"},
+	SandboxDisabled: true,
 }, "name", "template", "extraConfigs", "outputFileName", "testInstallBase", "extraTestRunnerConfigs")
 
-func testConfigPath(ctx android.ModuleContext, prop *string, testSuites []string, autoGenConfig *bool, testConfigTemplateProp *string) (path android.Path, autogenPath android.WritablePath) {
+func testConfigPath(ctx android.ModuleContext, prop proptools.Configurable[string], testSuites []string, autoGenConfig *bool, testConfigTemplateProp *string) (path android.Path, autogenPath android.WritablePath) {
 	p := getTestConfig(ctx, prop)
 	if !Bool(autoGenConfig) && p != nil {
 		return p, nil
@@ -148,7 +154,7 @@ func autogenTemplate(ctx android.ModuleContext, name string, output android.Writ
 type AutoGenTestConfigOptions struct {
 	Name                    string
 	OutputFileName          string
-	TestConfigProp          *string
+	TestConfigProp          proptools.Configurable[string]
 	TestConfigTemplateProp  *string
 	TestSuites              []string
 	Config                  []Config
@@ -212,9 +218,10 @@ var autogenInstrumentationTest = pctx.StaticRule("autogenInstrumentationTest", b
 		"${EmptyTestConfig}",
 		"$template",
 	},
+	SandboxDisabled: true,
 }, "name", "template", "extraConfigs", "extraTestRunnerConfigs")
 
-func AutoGenInstrumentationTestConfig(ctx android.ModuleContext, testConfigProp *string,
+func AutoGenInstrumentationTestConfig(ctx android.ModuleContext, testConfigProp proptools.Configurable[string],
 	testConfigTemplateProp *string, manifest android.Path, testSuites []string, autoGenConfig *bool, configs []Config, testRunnerConfigs []Option) android.Path {
 	path, autogenPath := testConfigPath(ctx, testConfigProp, testSuites, autoGenConfig, testConfigTemplateProp)
 	var configStrings []string

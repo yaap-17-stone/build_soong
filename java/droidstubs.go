@@ -29,6 +29,9 @@ import (
 	"android/soong/remoteexec"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
+// @auto-generate: gob
 type StubsInfo struct {
 	ApiVersionsXml android.Path
 	AnnotationsZip android.Path
@@ -36,6 +39,7 @@ type StubsInfo struct {
 	RemovedApiFile android.Path
 }
 
+// @auto-generate: gob
 type DroidStubsInfo struct {
 	CheckedInApiFile        android.Path
 	CheckedInRemovedApiFile android.Path
@@ -47,6 +51,7 @@ type DroidStubsInfo struct {
 
 var DroidStubsInfoProvider = blueprint.NewProvider[DroidStubsInfo]()
 
+// @auto-generate: gob
 type StubsSrcInfo struct {
 	EverythingStubsSrcJar android.Path
 	ExportableStubsSrcJar android.Path
@@ -55,6 +60,7 @@ type StubsSrcInfo struct {
 var StubsSrcInfoProvider = blueprint.NewProvider[StubsSrcInfo]()
 
 // Marker provider that indicates this module has files to update on an `m update-api`.
+// @auto-generate: gob
 type UpdateApiInfo struct {
 	Name                 string
 	SourceApiFile        android.Path
@@ -72,21 +78,17 @@ type StubsType int
 
 const (
 	Everything StubsType = iota
-	Runtime
 	Exportable
-	Unavailable
 )
 
 func (s StubsType) String() string {
 	switch s {
 	case Everything:
 		return "everything"
-	case Runtime:
-		return "runtime"
 	case Exportable:
 		return "exportable"
 	default:
-		return ""
+		panic("Unsupported StubsType for String")
 	}
 }
 
@@ -101,16 +103,16 @@ func (s StubsType) OutputTagPrefix() string {
 	}
 }
 
-func StringToStubsType(s string) StubsType {
+var validStubsType = []StubsType{Everything, Exportable}
+
+func StringToStubsType(s string) (StubsType, error) {
 	switch strings.ToLower(s) {
 	case Everything.String():
-		return Everything
-	case Runtime.String():
-		return Runtime
+		return Everything, nil
 	case Exportable.String():
-		return Exportable
+		return Exportable, nil
 	default:
-		return Unavailable
+		return Everything, fmt.Errorf("%s is not a valid stubs type, must be one of %s", s, validStubsType)
 	}
 }
 
@@ -390,6 +392,21 @@ func (d *Droidstubs) DocZip(stubsType StubsType) (ret android.Path, err error) {
 	return ret, err
 }
 
+func (d *Droidstubs) MetadataZip(stubsType StubsType) (ret android.Path, err error) {
+	switch stubsType {
+	case Everything:
+		ret, err = d.everythingArtifacts.metadataZip, nil
+	case Exportable:
+		ret, err = d.exportableArtifacts.metadataZip, nil
+	default:
+		ret, err = nil, fmt.Errorf("metadata zip not supported for the stub type %s", stubsType.String())
+	}
+	if ret == nil && err == nil {
+		err = fmt.Errorf("metadata zip is null for the stub type %s", stubsType.String())
+	}
+	return ret, err
+}
+
 func (d *Droidstubs) RemovedApiFilePath(stubsType StubsType) (ret android.Path, err error) {
 	switch stubsType {
 	case Everything:
@@ -567,6 +584,16 @@ func (d *Droidstubs) inclusionAnnotationsFlags(ctx android.ModuleContext, cmd *a
 	})
 }
 
+// Magic value that signalas that an api is still in development. Lint
+// understands this value and will not emit NewAPi warnings IFF it sees 10000
+// AND the FlaggedApi linter is enabled. This value is also used as placeholder
+// value when generating documentation. It is first put into the
+// api-versions.xml file and then later on when metalava generates the
+// documentation it is give a map of sdk values and codenames and it
+// creates @apisince tages where the given sdk values are replaced by their
+// codename counterparts.
+const sdk_development = "10000"
+
 func (d *Droidstubs) apiLevelsAnnotationsFlags(ctx android.ModuleContext, cmd *android.RuleBuilderCommand, stubsType StubsType, apiVersionsXml android.WritablePath) {
 	var apiVersions android.Path
 	if proptools.Bool(d.properties.Api_levels_annotations_enabled) {
@@ -589,17 +616,15 @@ func (d *Droidstubs) apiLevelsAnnotationsFlags(ctx android.ModuleContext, cmd *a
 		})
 	}
 	if apiVersions != nil {
-		// We are migrating from a single API level to major.minor
-		// versions and PlatformSdkVersionFull is not yet set in all
-		// release configs. If it is not set, fall back on the single
-		// API level.
-		if fullSdkVersion := ctx.Config().PlatformSdkVersionFull(); len(fullSdkVersion) > 0 {
-			cmd.FlagWithArg("--current-version ", fullSdkVersion)
-		} else {
-			cmd.FlagWithArg("--current-version ", ctx.Config().PlatformSdkVersion().String())
-		}
-		cmd.FlagWithArg("--current-codename ", ctx.Config().PlatformSdkCodename())
 		cmd.FlagWithInput("--apply-api-levels ", apiVersions)
+		if prospectiveFullSdkVersion := ctx.Config().PlatformProspectiveSdkVersionFull(); prospectiveFullSdkVersion == sdk_development {
+			// This tells metalava to replace  <prospectiveFullSdkVersion> with
+			// <PlatformSdkCodename> when generating documentation. This is only done
+			// if prospectiveFullSdkVersion is set to 10_000 which is the magic
+			// constant for non finalized Apis.
+			apiVersionLabel := fmt.Sprintf("%s:%s", prospectiveFullSdkVersion, ctx.Config().PlatformSdkCodename())
+			cmd.FlagWithArg("--api-version-label ", apiVersionLabel)
+		}
 	}
 }
 
@@ -615,6 +640,18 @@ func (d *Droidstubs) apiLevelsGenerationFlags(ctx android.ModuleContext, cmd *an
 	}
 
 	cmd.FlagWithOutput("--generate-api-levels ", apiVersionsXml)
+
+	// This limits the range of versions that metalava uses when computing the historic api.
+	apiVersionRange := fmt.Sprintf("1:%s", ctx.Config().PlatformSdkVersionFull())
+	cmd.FlagWithArg("--api-version-range ", apiVersionRange)
+
+	// If prospectiveFullSdkVersion is set, pass it to metalava to let metava know
+	// that sources should be included and that they should be consdered this api
+	// version. If prospectiveFullSdkVersion is not set metalava will only
+	// consider the historic apis when generating api-versions.xml
+	if prospectiveFullSdkVersion := ctx.Config().PlatformProspectiveSdkVersionFull(); len(prospectiveFullSdkVersion) > 0 {
+		cmd.FlagWithArg("--api-version-for-sources ", prospectiveFullSdkVersion)
+	}
 
 	filename := proptools.StringDefault(d.properties.Api_levels_jar_filename, "android.jar")
 
@@ -749,6 +786,14 @@ func (d *Droidstubs) apiLevelsGenerationFlags(ctx android.ModuleContext, cmd *an
 		info_file := android.PathForModuleSrc(ctx, *d.properties.Extensions_info_file)
 		cmd.Implicit(info_file)
 		cmd.FlagWithArg("--sdk-extensions-info ", info_file.String())
+		// Limit the range of which extensions should be included. There are
+		// scenarios where a releaseconfiguration need to build without "seeing"
+		// the latest extensions.
+		sdkExtensionVersionRange := fmt.Sprintf("1:%d", ctx.Config().PlatformSdkExtensionVersion())
+		cmd.FlagWithArg("--sdk-extension-version-range ", sdkExtensionVersionRange)
+		// Magic constant to use when writing since="XYZ" in api-versions.xml for
+		// apis that only exists in an extension.
+		cmd.FlagWithArg("--api-version-for-sdk-extension ", sdk_development)
 	}
 }
 
@@ -786,6 +831,7 @@ func metalavaCmd(ctx android.ModuleContext, rule *android.RuleBuilder, srcs andr
 
 	cmd := rule.Command()
 	cmd.FlagWithArg("ANDROID_PREFS_ROOT=", homeDir.String())
+	rule.ToolchainPaths(filepath.Dir(config.JavaCmd(ctx).String()))
 
 	if metalavaUseRewrapper(ctx) {
 		rule.Remoteable(android.RemoteRuleSupports{RBE: true})
@@ -809,10 +855,19 @@ func metalavaCmd(ctx android.ModuleContext, rule *android.RuleBuilder, srcs andr
 
 	cmd.BuiltTool("metalava").ImplicitTool(ctx.Config().HostJavaToolPath(ctx, "metalava.jar")).
 		Flag(config.JavacVmFlags).
+		Flag(config.MetalavaVmFlags).
 		Flag(config.MetalavaAddOpens).
 		FlagWithArg("--java-source ", params.javaVersion.String()).
 		FlagWithRspFileInputList("@", android.PathForModuleOut(ctx, fmt.Sprintf("%s.metalava.rsp", params.stubsType.String())), srcs).
 		FlagWithInput("@", srcJarList)
+
+	// If this is for the host then pass the --jdk-home option to Metalava and
+	// make sure the files necessary to access the JDK class files are available.
+	if ctx.Host() {
+		homeDir := ctx.Config().Getenv("ANDROID_JAVA_HOME")
+		cmd.FlagWithArg("--jdk-home ", homeDir)
+		cmd.Implicits(ctx.GlobFilesOutsideModuleDir(filepath.Join(homeDir, "**/*"), nil))
+	}
 
 	// Metalava does not differentiate between bootclasspath and classpath and has not done so for
 	// years, so it is unlikely to change any time soon.
@@ -823,6 +878,9 @@ func metalavaCmd(ctx android.ModuleContext, rule *android.RuleBuilder, srcs andr
 	}
 
 	cmd.Flag(config.MetalavaFlags)
+
+	providerName := ctx.Config().GetenvWithDefault("SOONG_METALAVA_SOURCE_MODEL_PROVIDER", "psi")
+	cmd.FlagWithArg("--source-model-provider ", providerName)
 
 	addMetalavaConfigFilesToCmd(cmd, configFiles)
 
@@ -857,20 +915,27 @@ func addOptionalApiSurfaceToCmd(cmd *android.RuleBuilderCommand, apiSurface *str
 	}
 }
 
-// Pass flagged apis related flags to metalava. When aconfig_declarations property is not
-// defined for a module, simply revert all flagged apis annotations. If aconfig_declarations
-// property is defined, apply transformations and only revert the flagged apis that are not
-// enabled via release configurations and are not specified in aconfig_declarations
-func generateRevertAnnotationArgs(ctx android.ModuleContext, cmd *android.RuleBuilderCommand, stubsType StubsType, aconfigFlagsPaths android.Paths) {
+// Pass aconfig flags to Metalava. Filters the flags in aconfigFlagsPaths for
+// the stubsType and then transforms them into a Metalava config file.
+//
+// If no flags are passed to Metalava then it will assume all flags are kept.
+// This is needed for StubsType.Everything which is used to generate the checked
+// in signature files and the stub libraries against which the platform is
+// built.
+//
+// Any `*/READ_WRITE` flags that are passed to Metalava will keep the API as the
+// API may be available (depending on the state of the flag) at runtime. In that
+// case it is the caller's responsibility to check that the flag is enabled. The
+// associated `@FlaggedApi` annotations are kept as Android Lint will use them
+// to enforce that the caller checks the state of the flag before calling.
+func generateMetalavaFlagConfigArgs(ctx android.ModuleContext, cmd *android.RuleBuilderCommand, stubsType StubsType, aconfigFlagsPaths android.Paths) {
 	var filterArgs string
+	var overrideArgs string
 	switch stubsType {
 	// No flagged apis specific flags need to be passed to metalava when generating
 	// everything stubs
 	case Everything:
-		return
-
-	case Runtime:
-		filterArgs = "--filter='state:ENABLED+permission:READ_ONLY' --filter='permission:READ_WRITE'"
+		overrideArgs = "--override-flag-state=ENABLED --override-flag-permission=READ_WRITE"
 
 	case Exportable:
 		// When the build flag RELEASE_EXPORT_RUNTIME_APIS is set to true, apis marked with
@@ -902,10 +967,13 @@ func generateRevertAnnotationArgs(ctx android.ModuleContext, cmd *android.RuleBu
 	})
 
 	ctx.Build(pctx, android.BuildParams{
-		Rule:        generateMetalavaRevertAnnotationsRule,
+		Rule:        generateMetalavaFlagConfigRule,
 		Input:       releasedFlagsFile,
 		Output:      metalavaFlagsConfigFile,
 		Description: fmt.Sprintf("%s metalava flags config", stubsType),
+		Args: map[string]string{
+			"args": overrideArgs,
+		},
 	})
 
 	cmd.FlagWithInput("--config-file ", metalavaFlagsConfigFile)
@@ -960,16 +1028,17 @@ func (d *Droidstubs) commonMetalavaStubCmd(ctx android.ModuleContext, rule *andr
 		cmd.ImplicitOutput(android.PathForModuleGen(ctx, o))
 	}
 
+	generateMetalavaFlagConfigArgs(ctx, cmd, params.stubConfig.stubsType, params.stubConfig.deps.aconfigProtoFiles)
+
 	return cmd
 }
 
 // Sandbox rule for generating the everything stubs and other artifacts
-func (d *Droidstubs) everythingStubCmd(ctx android.ModuleContext, params stubsCommandConfigParams) {
+func (d *Droidstubs) everythingStubCmd(ctx android.ModuleContext, params stubsCommandConfigParams) *android.RuleBuilderCommand {
 	srcJarDir := android.PathForModuleOut(ctx, Everything.String(), "srcjars")
-	rule := android.NewRuleBuilder(pctx, ctx)
+	rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	rule.Sbox(android.PathForModuleOut(ctx, Everything.String()),
-		android.PathForModuleOut(ctx, "metalava.sbox.textproto")).
-		SandboxInputs()
+		android.PathForModuleOut(ctx, "metalava.sbox.textproto"))
 
 	var stubsDir android.OptionalPath
 	if params.generateStubs {
@@ -1005,10 +1074,17 @@ func (d *Droidstubs) everythingStubCmd(ctx android.ModuleContext, params stubsCo
 
 	cmd := d.commonMetalavaStubCmd(ctx, rule, commonCmdParams)
 
+	// Add the default Metalava format flags used for producing the signature files that are checked
+	// in and the stub files against which Android itself builds.
+	cmd.Flag(config.DefaultMetalavaEverythingFormatFlags)
+
 	d.everythingOptionalCmd(ctx, cmd, params.doApiLint, params.doCheckReleased)
 
+	var everythingStubsCmd *android.RuleBuilderCommand
+
 	if params.generateStubs {
-		rule.Command().
+		everythingStubsCmd = rule.Command()
+		everythingStubsCmd.
 			BuiltTool("soong_zip").
 			Flag("-write_if_changed").
 			Flag("-jar").
@@ -1044,6 +1120,8 @@ func (d *Droidstubs) everythingStubCmd(ctx android.ModuleContext, params stubsCo
 	zipSyncCleanupCmd(rule, srcJarDir)
 
 	rule.Build("metalava", "metalava merged")
+
+	return everythingStubsCmd
 }
 
 // Sandbox rule for generating the everything artifacts that are not run by
@@ -1213,10 +1291,9 @@ func (d *Droidstubs) exportableStubCmd(ctx android.ModuleContext, params stubsCo
 func (d *Droidstubs) optionalStubCmd(ctx android.ModuleContext, params stubsCommandParams) {
 
 	params.srcJarDir = android.PathForModuleOut(ctx, params.stubConfig.stubsType.String(), "srcjars")
-	rule := android.NewRuleBuilder(pctx, ctx)
+	rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	rule.Sbox(android.PathForModuleOut(ctx, params.stubConfig.stubsType.String()),
-		android.PathForModuleOut(ctx, fmt.Sprintf("metalava_%s.sbox.textproto", params.stubConfig.stubsType.String()))).
-		SandboxInputs()
+		android.PathForModuleOut(ctx, fmt.Sprintf("metalava_%s.sbox.textproto", params.stubConfig.stubsType.String())))
 
 	if params.stubConfig.generateStubs {
 		params.stubsDir = android.OptionalPathForPath(android.PathForModuleOut(ctx, params.stubConfig.stubsType.String(), "stubsDir"))
@@ -1224,7 +1301,13 @@ func (d *Droidstubs) optionalStubCmd(ctx android.ModuleContext, params stubsComm
 
 	cmd := d.commonMetalavaStubCmd(ctx, rule, params)
 
-	generateRevertAnnotationArgs(ctx, cmd, params.stubConfig.stubsType, params.stubConfig.deps.aconfigProtoFiles)
+	// Add the Metalava format specifier used for producing the signature files and stubs that are
+	// finalized and end up in the Android SDK and mainline module drops.
+	formatSpecifier := ctx.Config().GetenvWithDefault(
+		"SOONG_SDK_SNAPSHOT_SIGNATURE_FORMAT_SPECIFIER",
+		config.DefaultMetalavaExportableFormatSpecifier,
+	)
+	cmd.FlagWithArg("--format ", formatSpecifier)
 
 	if params.stubConfig.doApiLint {
 		// Pass the lint baseline file as an input to resolve the lint errors.
@@ -1281,6 +1364,9 @@ func (d *Droidstubs) setPhonyRules(ctx android.ModuleContext) {
 	if d.checkCurrentApiTimestamp != nil {
 		ctx.Phony(fmt.Sprintf("%s-check-current-api", d.Name()), d.checkCurrentApiTimestamp)
 		ctx.Phony("checkapi", d.checkCurrentApiTimestamp)
+		if proptools.BoolDefault(d.properties.Check_api.Current.Default_in_droid, false) {
+			ctx.Phony("droidcore", d.checkCurrentApiTimestamp)
+		}
 	}
 	if d.checkLastReleasedApiTimestamp != nil {
 		ctx.Phony(fmt.Sprintf("%s-check-last-released-api", d.Name()), d.checkLastReleasedApiTimestamp)
@@ -1356,7 +1442,7 @@ func (d *Droidstubs) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 			`       and submitting the updated file as part of your change.`,
 			d.everythingArtifacts.nullabilityWarningsFile, checkNullabilityWarningsPath)
 
-		rule := android.NewRuleBuilder(pctx, ctx)
+		rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 
 		rule.Command().
 			Text("(").
@@ -1389,7 +1475,7 @@ func (d *Droidstubs) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 
 		d.checkCurrentApiTimestamp = android.PathForModuleOut(ctx, Everything.String(), "check_current_api.timestamp")
 
-		rule := android.NewRuleBuilder(pctx, ctx)
+		rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 
 		// Diff command line.
 		// -F matches the closest "opening" line, such as "package android {"
@@ -1439,6 +1525,8 @@ func (d *Droidstubs) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 			cmd.Validation(d.checkNullabilityWarningsTimestamp)
 		}
 		rule.Build("metalavaCurrentApiCheck", "check current API")
+
+		ctx.CheckbuildFile(d.checkCurrentApiTimestamp)
 
 		android.SetProvider(ctx, UpdateApiProvider, UpdateApiInfo{
 			Name:                 d.Name(),
@@ -1535,6 +1623,7 @@ func (d *Droidstubs) setOutputFiles(ctx android.ModuleContext) {
 	addOutputFiles(".removed-api.txt", d.RemovedApiFilePath)
 	addOutputFiles(".annotations.zip", d.AnnotationsZip)
 	addOutputFiles(".api_versions.xml", d.ApiVersionsXmlFilePath)
+	addOutputFiles(".metadata.zip", d.MetadataZip)
 }
 
 func (d *Droidstubs) createApiContribution(ctx android.DefaultableHookContext) {
@@ -1635,7 +1724,7 @@ func (p *PrebuiltStubsSources) GenerateAndroidBuildActions(ctx android.ModuleCon
 		// are specified and the module directory must exist in order to get this far.
 		srcDir := android.PathForModuleSrc(ctx).(android.SourcePath).Join(ctx, src)
 
-		rule := android.NewRuleBuilder(pctx, ctx)
+		rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 		rule.Command().
 			BuiltTool("soong_zip").
 			Flag("-write_if_changed").

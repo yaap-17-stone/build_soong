@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"cmp"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -77,6 +78,11 @@ type ReleaseConfig struct {
 
 	// Unmarshalled flag artifacts
 	FlagArtifacts FlagArtifacts
+
+	// Flags with no declaration that have value overrides.
+	// This is used by `build-flag` to indicate that there are flag
+	// values, but they are being ignored.
+	IgnoredFlags map[string]bool
 
 	// Generated release config
 	ReleaseConfigArtifact *rc_proto.ReleaseConfigArtifact
@@ -150,6 +156,7 @@ func ReleaseConfigFactory(name string, index int) (c *ReleaseConfig) {
 	return &ReleaseConfig{
 		Name:             name,
 		DeclarationIndex: index,
+		IgnoredFlags:     make(map[string]bool),
 		PriorStagesMap:   make(map[string]bool),
 		inheritNamesMap:  make(map[string]bool),
 	}
@@ -160,6 +167,8 @@ func (config *ReleaseConfig) InheritConfig(iConfig *ReleaseConfig) error {
 		return fmt.Errorf("Release config %s (type '%s') cannot inherit from %s (type '%s')",
 			config.Name, config.ReleaseConfigType, iConfig.Name, iConfig.ReleaseConfigType)
 	}
+	// If we inherit from a release config which is aconfig_flags_only, then we are aconfig_flags_only.
+	config.AconfigFlagsOnly = config.AconfigFlagsOnly || iConfig.AconfigFlagsOnly
 	for _, fa := range iConfig.FlagArtifacts {
 		name := *fa.FlagDeclaration.Name
 		myFa, ok := config.FlagArtifacts[name]
@@ -187,6 +196,7 @@ func (config *ReleaseConfig) InheritConfig(iConfig *ReleaseConfig) error {
 			myFa.Value = fa.Value
 		}
 	}
+	maps.Copy(config.IgnoredFlags, iConfig.IgnoredFlags)
 	return nil
 }
 
@@ -306,7 +316,9 @@ func (config *ReleaseConfig) GenerateReleaseConfig(configs *ReleaseConfigs) erro
 			name := *value.proto.Name
 			fa, ok := config.FlagArtifacts[name]
 			if !ok {
-				return fmt.Errorf("Setting value for undefined flag %s in %s\n", name, value.path)
+				// b/450252549: Ignore flag values where the flag declaration has been deleted.
+				configs.IgnoredFlags[name] = true
+				continue
 			}
 			// Record that flag declarations from fa.DeclarationIndex were included in this release config.
 			myDirsMap[fa.DeclarationIndex] = true
@@ -321,6 +333,12 @@ func (config *ReleaseConfig) GenerateReleaseConfig(configs *ReleaseConfigs) erro
 				return fmt.Errorf("Setting value for non-MANUAL flag %s is not allowed in %s", name, value.path)
 			}
 			switch *fa.FlagDeclaration.Workflow {
+			case rc_proto.Workflow_MANUAL_BUILD_VARIANT_PLUS:
+				// These can be set in either RELEASE_CONFIG or BUILD_VARIANT release configs.
+				if config.ReleaseConfigType != rc_proto.ReleaseConfigType_BUILD_VARIANT &&
+					config.ReleaseConfigType != rc_proto.ReleaseConfigType_RELEASE_CONFIG {
+					return fmt.Errorf("Setting value for BUILD_VARIANT flag %s is not allowed in %s", name, value.path)
+				}
 			case rc_proto.Workflow_MANUAL_BUILD_VARIANT:
 				// Non-BUILD_VARIANT release configs cannot set MANUAL_BUILD_VARIANT flags.
 				if config.ReleaseConfigType != rc_proto.ReleaseConfigType_BUILD_VARIANT {
@@ -370,7 +388,7 @@ func (config *ReleaseConfig) GenerateReleaseConfig(configs *ReleaseConfigs) erro
 	// Now remove any duplicates from the actual value of RELEASE_ACONFIG_VALUE_SETS
 	myAconfigValueSets := []string{}
 	myAconfigValueSetsMap := map[string]bool{}
-	for _, v := range strings.Split(releaseAconfigValueSets.Value.GetStringValue(), " ") {
+	for _, v := range strings.Fields(releaseAconfigValueSets.Value.GetStringValue()) {
 		if v == "" || myAconfigValueSetsMap[v] {
 			continue
 		}
@@ -409,6 +427,7 @@ func (config *ReleaseConfig) GenerateReleaseConfig(configs *ReleaseConfigs) erro
 
 	// Now build the per-partition artifacts
 	config.PartitionBuildFlags = make(map[string]*rc_proto.FlagArtifacts)
+	redactDeclOnly := config.GetFlag("RELEASE_REDACT_FLAGS_WITHOUT_OVERRIDE") != ""
 	for _, v := range config.FlagArtifacts {
 		artifact, err := v.MarshalWithoutTraces()
 		if err != nil {
@@ -416,6 +435,11 @@ func (config *ReleaseConfig) GenerateReleaseConfig(configs *ReleaseConfigs) erro
 		}
 		// Redacted flags return nil when rendered.
 		if artifact == nil {
+			continue
+		}
+		// If there are no flag overrides, we may redact the flag from the partition
+		// artifacts.
+		if redactDeclOnly && len(v.Traces) == 1 && config.GetFlag(*v.FlagDeclaration.Name) == "" {
 			continue
 		}
 		for _, container := range v.FlagDeclaration.Containers {
@@ -459,6 +483,23 @@ func (config *ReleaseConfig) GenerateReleaseConfig(configs *ReleaseConfigs) erro
 	return nil
 }
 
+// Get the marshalled value of a build flag for this release config.
+//
+// This is intended for build flags that affect how we generate artifacts
+// (after the release config has been compiled).
+func (config *ReleaseConfig) GetFlag(name string) string {
+	if !config.compileInProgress && config.ReleaseConfigArtifact == nil {
+		// Because this is an internal function, just panic rather than
+		// return an error.
+		panic("GetFlag called in invalid location")
+	}
+	if fa, ok := config.FlagArtifacts[name]; ok {
+		return MarshalValue(fa.Value)
+	} else {
+		return ""
+	}
+}
+
 // Write the makefile for this targetRelease.
 func (config *ReleaseConfig) WriteMakefile(outFile, targetRelease string, configs *ReleaseConfigs) error {
 	makeVars := make(map[string]string)
@@ -470,7 +511,7 @@ func (config *ReleaseConfig) WriteMakefile(outFile, targetRelease string, config
 	var extraAconfigReleaseConfigs []string
 	if extraAconfigValueSetsValue, ok := config.FlagArtifacts["RELEASE_ACONFIG_EXTRA_RELEASE_CONFIGS"]; ok {
 		if val := MarshalValue(extraAconfigValueSetsValue.Value); len(val) > 0 {
-			extraAconfigReleaseConfigs = strings.Split(val, " ")
+			extraAconfigReleaseConfigs = strings.Fields(val)
 		}
 	}
 	for _, rcName := range extraAconfigReleaseConfigs {

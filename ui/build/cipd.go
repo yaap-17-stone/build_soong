@@ -45,15 +45,20 @@ func cipdPath(config Config) string {
 	return filepath.Join("prebuilts/cipd", config.HostPrebuiltTag(), "cipd")
 }
 
-func shouldRunCIPDProxy(config Config) bool {
+func shouldRunCIPDProxy(ctx Context, config Config) bool {
 	if runtime.GOOS == "darwin" {
 		// Disable CIPD proxy on Mac until we have it working, see b/425932171.
+		ctx.Verbosef("Disabling CIPD proxy server on Mac for b/425932171")
 		return false
 	}
 
 	cipdPath := cipdPath(config)
 	_, err := os.Stat(cipdPath)
-	return err == nil
+	if err != nil {
+		ctx.Verbosef("cipd binary not found at %v, disabling proxy", cipdPath)
+		return false
+	}
+	return true
 }
 
 func startCIPDProxyServer(ctx Context, config Config) *cipdProxy {
@@ -72,49 +77,53 @@ func startCIPDProxyServer(ctx Context, config Config) *cipdProxy {
 		"-log-level", "warning",
 		"-unix-socket", unixsock,
 	}
-	adcFlagAdded := false
 
-	// Determine RBE authentication mechanism and propagate to CIPD flags.
-	// Some build configurations like ABFS may disable RBE for compilation while
-	// still relying on RBE auth config being present.
-	authType, authValue := config.rbeAuth()
-	switch authType {
-	case "RBE_credential_file":
-		cipdArgs = append(cipdArgs, "-service-account-json", authValue)
-	case "RBE_credentials_helper", "RBE_use_google_prod_creds":
-		helperPath := filepath.Join(config.rbeDir(), "credshelper")
-
-		var credHelperArgsParts []string
-		// RBE_credentials_helper_args contains space-separated arguments for the helper
-		// and need to be formatted as repeated 'args:"..."' for the -credential-helper spec.
-		// e.g. "--f=foo --b=bar" -> 'args:"--f=foo" args:"--b=bar"'.
-		if rbeArgsStr, ok := config.environ.Get("RBE_credentials_helper_args"); ok && rbeArgsStr != "" {
-			argList := strings.Fields(rbeArgsStr)
-			for _, arg := range argList {
-				credHelperArgsParts = append(credHelperArgsParts, fmt.Sprintf("args:%q", arg))
-			}
-		} else {
-			credHelperArgsParts = append(credHelperArgsParts, fmt.Sprintf("args:%q", "--auth_source=automaticAuth"))
-			credHelperArgsParts = append(credHelperArgsParts, fmt.Sprintf("args:%q", "--gcert_refresh_timeout=20"))
+	// RBE instructions for non-corp machines set both RBE_credentials_helper and
+	// RBE_use_application_default_credentials, so check explicitly for the latter.
+	// Even if USE_RBE=false, CIPD can still use ADC.
+	useAdc := false
+	if useAdcStr, ok := config.environ.Get("RBE_use_application_default_credentials"); ok {
+		parsedVal, err := strconv.ParseBool(useAdcStr)
+		if err == nil && parsedVal {
+			useAdc = true
 		}
-		helperSpec := fmt.Sprintf("protocol:RECLIENT exec:'%s' %s", helperPath, strings.Join(credHelperArgsParts, " "))
-		cipdArgs = append(cipdArgs, "-credential-helper", helperSpec)
-	case "RBE_use_application_default_credentials", "RBE_use_gce_credentials":
-		fallthrough
-	default:
-		cipdArgs = append(cipdArgs, "-application-default-credentials=always")
-		adcFlagAdded = true
 	}
 
-	if !adcFlagAdded {
-		// RBE instructions for non-corp machines set both RBE_credentials_helper and
-		// RBE_use_application_default_credentials. Pass that along to CIPD as well.
-		// Even if USE_RBE=false, CIPD can still use ADC.
-		if useAdcStr, ok := config.environ.Get("RBE_use_application_default_credentials"); ok {
-			parsedVal, err := strconv.ParseBool(useAdcStr)
-			if err == nil && parsedVal {
-				cipdArgs = append(cipdArgs, "-application-default-credentials=always")
+	// If ADC is explicitly requested, bypass credshelper entirely for CIPD.
+	// CIPD supports ADC natively, and routing it through credshelper breaks
+	// for users in the mTLS rollout (b/477648382).
+	if useAdc {
+		cipdArgs = append(cipdArgs, "-application-default-credentials=always")
+	} else {
+		// Determine RBE authentication mechanism and propagate to CIPD flags.
+		// Some build configurations like ABFS may disable RBE for compilation while
+		// still relying on RBE auth config being present.
+		authType, authValue := config.rbeAuth()
+		switch authType {
+		case "RBE_credential_file":
+			cipdArgs = append(cipdArgs, "-service-account-json", authValue)
+		case "RBE_credentials_helper", "RBE_use_google_prod_creds":
+			helperPath := filepath.Join(config.rbeDir(), "credshelper")
+
+			var credHelperArgsParts []string
+			// RBE_credentials_helper_args contains space-separated arguments for the helper
+			// and need to be formatted as repeated 'args:"..."' for the -credential-helper spec.
+			// e.g. "--f=foo --b=bar" -> 'args:"--f=foo" args:"--b=bar"'.
+			if rbeArgsStr, ok := config.environ.Get("RBE_credentials_helper_args"); ok && rbeArgsStr != "" {
+				argList := strings.Fields(rbeArgsStr)
+				for _, arg := range argList {
+					credHelperArgsParts = append(credHelperArgsParts, fmt.Sprintf("args:%q", arg))
+				}
+			} else {
+				credHelperArgsParts = append(credHelperArgsParts, fmt.Sprintf("args:%q", "--auth_source=automaticAuth"))
+				credHelperArgsParts = append(credHelperArgsParts, fmt.Sprintf("args:%q", "--gcert_refresh_timeout=20"))
 			}
+			helperSpec := fmt.Sprintf("protocol:RECLIENT exec:'%s' %s", helperPath, strings.Join(credHelperArgsParts, " "))
+			cipdArgs = append(cipdArgs, "-credential-helper", helperSpec)
+		case "RBE_use_application_default_credentials", "RBE_use_gce_credentials":
+			fallthrough
+		default:
+			cipdArgs = append(cipdArgs, "-application-default-credentials=always")
 		}
 	}
 
@@ -175,7 +184,7 @@ func startCIPDProxyServer(ctx Context, config Config) *cipdProxy {
 				log.Fatalf("unexpected unix socket returned by cipd proxy: %s, expected unix://%s", proxyUrl, unixsock)
 			}
 			config.environ.Set(cipdProxyUrlKey, proxyUrl)
-			ctx.Verbosef("Started CIPD proxy listening on", proxyUrl)
+			ctx.Verbosef("Started CIPD proxy listening on %s", proxyUrl)
 			break
 		}
 	}

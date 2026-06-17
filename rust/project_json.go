@@ -31,7 +31,7 @@ import (
 // called.  This singleton is enabled only if SOONG_GEN_RUST_PROJECT is set.
 // For example,
 //
-//   $ SOONG_GEN_RUST_PROJECT=1 SOONG_LINK_RUST_PROJECT_TO=${ANDROID_BUILD_TOP} m nothing
+//   $ SOONG_GEN_RUST_PROJECT=1 m nothing
 
 const (
 	// Environment variables used to control the behavior of this singleton.
@@ -55,6 +55,7 @@ type rustProjectCrate struct {
 	Edition        string                 `json:"edition,omitempty"`
 	Deps           []rustProjectDep       `json:"deps"`
 	Cfg            []string               `json:"cfg"`
+	Target         string                 `json:"target"`
 	Env            map[string]string      `json:"env"`
 	ProcMacro      bool                   `json:"is_proc_macro"`
 	ProcMacroDylib *string                `json:"proc_macro_dylib_path"`
@@ -74,7 +75,6 @@ type rustTargetMappingJson struct {
 	CheckTarget        string `json:"check_target"`
 	SourceDir          string `json:"source_dir"`
 	TargetProduct      string `json:"TARGET_PRODUCT"`
-	TargetRelease      string `json:"TARGET_RELEASE"`
 	TargetBuildVariant string `json:"TARGET_BUILD_VARIANT"`
 }
 
@@ -167,17 +167,26 @@ func (singleton *projectGeneratorSingleton) addCrate(ctx android.SingletonContex
 		procMacroDylib = proptools.StringPtr(procMacro.Dylib.String())
 	}
 
+	var toolchain = config.FindToolchain(commonInfo.Target.Os, commonInfo.Target.Arch)
+
+	var rootmodule = rustInfo.CompilerInfo.CrateRootPath.String()
+	include_dir := []string{ctx.ModuleDir(module)}
+	// Aidl generates rust files so we include those files in the include_dir parameter.
+	if strings.Contains(rootmodule, "aidl") {
+		include_dir = append(include_dir, rootmodule)
+	}
 	crate := rustProjectCrate{
 		DisplayName:    module.Name(),
-		RootModule:     rustInfo.CompilerInfo.CrateRootPath.String(),
+		RootModule:     rootmodule,
 		Edition:        rustInfo.CompilerInfo.Edition,
 		Deps:           make([]rustProjectDep, 0),
 		Cfg:            make([]string, 0),
+		Target:         toolchain.RustTriple(),
 		Env:            make(map[string]string),
 		ProcMacro:      procMacroDylib != nil,
 		ProcMacroDylib: procMacroDylib,
 		Source: rustProjectIncludeDirs{
-			Include_dirs: []string{ctx.ModuleDir(module)},
+			Include_dirs: include_dir,
 			Exclude_dirs: []string{},
 		}, // TODO: What should this value be?
 	}
@@ -185,7 +194,6 @@ func (singleton *projectGeneratorSingleton) addCrate(ctx android.SingletonContex
 	if cargoOutDir := rustInfo.CompilerInfo.CargoOutDir; cargoOutDir.Valid() {
 		crate.Env["OUT_DIR"] = cargoOutDir.String()
 	}
-
 	for _, feature := range rustInfo.CompilerInfo.Features {
 		crate.Cfg = append(crate.Cfg, "feature=\""+feature+"\"")
 	}
@@ -201,37 +209,22 @@ func (singleton *projectGeneratorSingleton) addCrate(ctx android.SingletonContex
 		singleton.project.Crates = append(singleton.project.Crates, crate)
 	}
 	singleton.knownCrates[module.Name()] = crateInfo{Idx: idx, Deps: deps, Device: commonInfo.Target.Os.Class == android.Device}
-	outputfiles := android.OutputFilesForModule(ctx, module, "")
-	// Count the number of output files that should be used for mapping
-	numberValidOutputFiles := 0
-	validOutputIndex := 0
-	for ix, item := range outputfiles {
-		if !(strings.HasSuffix(item.String(), ".rs") || strings.HasSuffix(item.String(), ".c") || strings.HasSuffix(item.String(), ".d")) {
-			validOutputIndex = ix
-			numberValidOutputFiles += 1
+	if rustInfo.CompilerInfo.BuildTarget != nil {
+		buildVariant := "user"
+		if ctx.Config().Eng() {
+			buildVariant = "eng"
+		} else if ctx.Config().Debuggable() {
+			buildVariant = "userdebug"
 		}
-	}
-
-	buildVariant := "user"
-	if ctx.Config().Eng() {
-		buildVariant = "eng"
-	} else if ctx.Config().Debuggable() {
-		buildVariant = "userdebug"
-	}
-	if numberValidOutputFiles == 1 {
-		outputFileName := outputfiles[validOutputIndex].String()
 		mapping := rustTargetMappingJson{
 			Name:               module.Name(),
-			BuildTarget:        outputFileName,
-			CheckTarget:        outputFileName + ".checkJson",
+			BuildTarget:        rustInfo.CompilerInfo.BuildTarget.String(),
+			CheckTarget:        rustInfo.CompilerInfo.CheckTarget.String(),
 			SourceDir:          ctx.ModuleDir(module),
 			TargetProduct:      ctx.Config().DeviceProduct(),
-			TargetRelease:      "trunk_staging",
 			TargetBuildVariant: buildVariant,
 		}
 		singleton.targetMappings = append(singleton.targetMappings, mapping)
-	} else if numberValidOutputFiles > 1 {
-		ctx.ModuleErrorf(module, "%s", "More than one file for an output in the module")
 	}
 	return idx, true
 }
@@ -278,7 +271,7 @@ func (singleton *projectGeneratorSingleton) GenerateBuildActions(ctx android.Sin
 
 	}
 	if ctx.Config().XrefCorpusName() != "" {
-		rule := android.NewRuleBuilder(pctx, ctx)
+		rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 		jsonPath := android.PathForOutput(ctx, "rust-project.json")
 		kzipPath := android.PathForOutput(ctx, "rust-project.kzip")
 		vnames := android.PathForSource(ctx, "build/soong/vnames.json")

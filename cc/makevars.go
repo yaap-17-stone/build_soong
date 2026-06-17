@@ -71,7 +71,6 @@ func (c *notOnHostContext) Host() bool {
 }
 
 func makeVarsProvider(ctx android.MakeVarsContext) {
-	ctx.Strict("LLVM_RELEASE_VERSION", "${config.ClangShortVersion}")
 	ctx.Strict("LLVM_PREBUILTS_VERSION", "${config.ClangVersion}")
 	ctx.Strict("LLVM_PREBUILTS_BASE", "${config.ClangBase}")
 	ctx.Strict("LLVM_PREBUILTS_PATH", "${config.ClangBin}")
@@ -130,7 +129,7 @@ func makeVarsProvider(ctx android.MakeVarsContext) {
 	ctx.Strict("INTEGER_OVERFLOW_EXTRA_CFLAGS", strings.Join(intOverflowCflags, " "))
 
 	ctx.Strict("DEFAULT_C_STD_VERSION", config.CStdVersion)
-	ctx.Strict("DEFAULT_CPP_STD_VERSION", config.CppStdVersion)
+	ctx.Strict("DEFAULT_CPP_STD_VERSION", config.CppStdVersion(ctx))
 	ctx.Strict("EXPERIMENTAL_C_STD_VERSION", config.ExperimentalCStdVersion)
 	ctx.Strict("EXPERIMENTAL_CPP_STD_VERSION", config.ExperimentalCppStdVersion)
 
@@ -141,8 +140,6 @@ func makeVarsProvider(ctx android.MakeVarsContext) {
 
 	ctx.Strict("AIDL_CPP", "${aidlCmd}")
 	ctx.Strict("ALLOWED_MANUAL_INTERFACE_PATHS", strings.Join(allowedManualInterfacePaths, " "))
-
-	ctx.Strict("RS_GLOBAL_INCLUDES", "${config.RsGlobalIncludes}")
 
 	ctx.Strict("SOONG_STRIP_PATH", "${stripPath}")
 	ctx.Strict("XZ", "${xzCmd}")
@@ -175,6 +172,17 @@ func makeVarsProvider(ctx android.MakeVarsContext) {
 	}
 }
 
+type FakeToolchainFlagsContext struct {
+	android.MakeVarsContext
+}
+
+func (f *FakeToolchainFlagsContext) CreateNinjaPhonyOnce(_ string, _ []string) android.Path {
+	// Don't do this. Makevars won't read the deps of the flags so it's not needed.
+	return android.PathForPhony(f, "FakeToolchainFlagsContextPhony")
+}
+
+var _ config.ToolchainFlagsContext = &FakeToolchainFlagsContext{}
+
 func makeVarsToolchain(ctx android.MakeVarsContext, secondPrefix string,
 	target android.Target) {
 	var typePrefix string
@@ -186,7 +194,7 @@ func makeVarsToolchain(ctx android.MakeVarsContext, secondPrefix string,
 	}
 	makePrefix := secondPrefix + typePrefix
 
-	toolchain := config.FindToolchain(target.Os, target.Arch)
+	toolchain := config.FindToolchain(target.Os, target.Arch, false)
 
 	var productExtraCflags string
 	var productExtraLdflags string
@@ -237,10 +245,12 @@ func makeVarsToolchain(ctx android.MakeVarsContext, secondPrefix string,
 		fmt.Sprintf("${config.%sGlobalCppflags}", hod),
 		toolchain.Cppflags(),
 	}, " "))
+	ldFlags := toolchain.Ldflags(&FakeToolchainFlagsContext{ctx})
+	toolchainLdFlags := toolchain.ToolchainLdflags()
 	ctx.Strict(clangPrefix+"GLOBAL_LDFLAGS", strings.Join([]string{
 		fmt.Sprintf("${config.%sGlobalLdflags}", hod),
-		toolchain.Ldflags(),
-		toolchain.ToolchainLdflags(),
+		ldFlags.Flags,
+		toolchainLdFlags.Flags,
 		productExtraLdflags,
 	}, " "))
 

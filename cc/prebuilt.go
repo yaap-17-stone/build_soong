@@ -15,8 +15,6 @@
 package cc
 
 import (
-	"path/filepath"
-
 	"github.com/google/blueprint/depset"
 	"github.com/google/blueprint/proptools"
 
@@ -34,6 +32,7 @@ func RegisterPrebuiltBuildComponents(ctx android.RegistrationContext) {
 	ctx.RegisterModuleType("cc_prebuilt_test_library_shared", PrebuiltSharedTestLibraryFactory)
 	ctx.RegisterModuleType("cc_prebuilt_object", PrebuiltObjectFactory)
 	ctx.RegisterModuleType("cc_prebuilt_binary", PrebuiltBinaryFactory)
+	ctx.RegisterModuleType("cc_prebuilt_test_binary", PrebuiltTestBinaryFactory)
 }
 
 type prebuiltLinkerInterface interface {
@@ -447,36 +446,28 @@ func (p *prebuiltBinaryLinker) link(ctx ModuleContext,
 		outputFile := android.PathForModuleOut(ctx, fileName)
 		p.unstrippedOutputFile = in
 
+		// Don't allow symlinks in srcs, as the later cp rules would only copy the symlink itself,
+		// not the target of the symlink.
+		verifyNotSymlinkStamp := android.PathForModuleOut(ctx, "verify_not_symlink.stamp")
+		ctx.Build(pctx, android.BuildParams{
+			Rule:   android.VerifyNotSymlinkRule,
+			Output: verifyNotSymlinkStamp,
+			Input:  in,
+		})
+
 		if ctx.Host() {
-			// Host binaries are symlinked to their prebuilt source locations. That
-			// way they are executed directly from there so the linker resolves their
-			// shared library dependencies relative to that location (using
-			// $ORIGIN/../lib(64):$ORIGIN/lib(64) as RUNPATH). This way the prebuilt
-			// repository can supply the expected versions of the shared libraries
-			// without interference from what is in the out tree.
-
-			// These shared lib paths may point to copies of the libs in
-			// .intermediates, which isn't where the binary will load them from, but
-			// it's fine for dependency tracking. If a library dependency is updated,
-			// the symlink will get a new timestamp, along with any installed symlinks
-			// handled in make.
-			sharedLibPaths := deps.EarlySharedLibs
-			sharedLibPaths = append(sharedLibPaths, deps.SharedLibs...)
-			sharedLibPaths = append(sharedLibPaths, deps.LateSharedLibs...)
-
-			var fromPath = in.String()
-			if !filepath.IsAbs(fromPath) {
-				fromPath = "$$PWD/" + fromPath
-			}
-
+			// This copy of a prebuilt binary to the out directory could cause the binary
+			// to not run anymore if it used shared libraries with a relative RPATH. However,
+			// we have no usages of that in android other than some cuttlefish tools that
+			// manually install their shared libraries as well, so it's not a problem.
+			// If needed, in the future we could install the shared libraries alongside the
+			// binary.
 			ctx.Build(pctx, android.BuildParams{
-				Rule:      android.Symlink,
-				Output:    outputFile,
-				Input:     in,
-				Implicits: sharedLibPaths,
-				Args: map[string]string{
-					"fromPath": fromPath,
-				},
+				Rule:        android.CpExecutable,
+				Description: "prebuilt",
+				Output:      outputFile,
+				Input:       in,
+				Validation:  verifyNotSymlinkStamp,
 			})
 
 			p.toolPath = android.OptionalPathForPath(outputFile)
@@ -485,6 +476,7 @@ func (p *prebuiltBinaryLinker) link(ctx ModuleContext,
 			if p.shouldCheckElfFile(ctx) {
 				validations = append(validations, p.checkElfFile(ctx, "", deps, in))
 			}
+			validations = append(validations, verifyNotSymlinkStamp)
 
 			if p.stripper.NeedsStrip(ctx) {
 				stripped := android.PathForModuleOut(ctx, "stripped", fileName)
@@ -516,6 +508,12 @@ func (p *prebuiltBinaryLinker) binary() bool {
 // device's directory, for both the host and device
 func PrebuiltBinaryFactory() android.Module {
 	module, _ := NewPrebuiltBinary(android.HostAndDeviceSupported)
+	return module.Init()
+}
+
+func PrebuiltTestBinaryFactory() android.Module {
+	module, binary := NewPrebuiltBinary(android.HostAndDeviceSupported)
+	binary.baseInstaller = NewTestInstaller()
 	return module.Init()
 }
 

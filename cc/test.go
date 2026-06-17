@@ -107,7 +107,7 @@ type TestBinaryProperties struct {
 
 	// the name of the test configuration (for example "AndroidTest.xml") that should be
 	// installed with the module.
-	Test_config *string `android:"path,arch_variant"`
+	Test_config proptools.Configurable[string] `android:"path,arch_variant,replace_instead_of_append"`
 
 	// the name of the test configuration template (for example "AndroidTestTemplate.xml") that
 	// should be installed with the module.
@@ -440,7 +440,7 @@ func (test *testBinary) install(ctx ModuleContext, file android.Path) {
 		packagingSpecsBuilder := depset.NewBuilder[android.PackagingSpec](depset.TOPOLOGICAL)
 
 		ctx.VisitDirectDepsProxy(func(dep android.ModuleProxy) {
-			deps := android.OtherModuleProviderOrDefault(ctx, dep, android.InstallFilesProvider)
+			deps := android.GetInstallFiles(ctx, dep)
 			packagingSpecsBuilder.Transitive(deps.TransitivePackagingSpecs)
 		})
 
@@ -460,7 +460,7 @@ func (test *testBinary) install(ctx ModuleContext, file android.Path) {
 }
 
 func getTestInstallBase(useVendor bool) string {
-	// TODO: (b/167308193) Switch to /data/local/tests/unrestricted as the default install base.
+	// The default test install base is /data/local/tmp for backward compatibility. See b/167308193 for context.
 	testInstallBase := "/data/local/tmp"
 	if useVendor {
 		testInstallBase = "/data/local/tests/vendor"
@@ -624,7 +624,7 @@ type BenchmarkProperties struct {
 
 	// the name of the test configuration (for example "AndroidTest.xml") that should be
 	// installed with the module.
-	Test_config *string `android:"path,arch_variant"`
+	Test_config proptools.Configurable[string] `android:"path,arch_variant,replace_instead_of_append"`
 
 	// the name of the test configuration template (for example "AndroidTestTemplate.xml") that
 	// should be installed with the module.

@@ -15,27 +15,31 @@
 package terminal
 
 import (
+	"android/soong/ui/status"
 	"fmt"
 	"io"
 	"os"
-
-	"android/soong/ui/status"
 )
 
 type simpleStatusOutput struct {
-	writer    io.Writer
-	formatter formatter
-	keepANSI  bool
+	writer             io.Writer
+	formatter          formatter
+	keepANSI           bool
+	skipActionProgress bool
+	suppressOutput     bool
 }
 
 // NewSimpleStatusOutput returns a StatusOutput that represents the
 // current build status similarly to Ninja's built-in terminal
 // output.
-func NewSimpleStatusOutput(w io.Writer, formatter formatter, keepANSI bool) status.StatusOutput {
+func NewSimpleStatusOutput(w io.Writer, formatter formatter, keepANSI bool,
+	skipActionProgress bool, suppressOutput bool) status.StatusOutput {
 	return &simpleStatusOutput{
-		writer:    w,
-		formatter: formatter,
-		keepANSI:  keepANSI,
+		writer:             w,
+		formatter:          formatter,
+		keepANSI:           keepANSI,
+		skipActionProgress: skipActionProgress,
+		suppressOutput:     suppressOutput,
 	}
 }
 
@@ -58,18 +62,21 @@ func (s *simpleStatusOutput) FinishAction(result status.ActionResult, counts sta
 		str = result.Command
 	}
 
-	progress := s.formatter.progress(counts) + str
-	writeProgressFile(counts)
+	progress := ""
+	if !s.skipActionProgress {
+		progress = s.formatter.progress(counts)
+		writeProgressFile(counts)
+	}
 
 	output := s.formatter.result(result)
 	if !s.keepANSI {
 		output = string(stripAnsiEscapes([]byte(output)))
 	}
 
-	if output != "" {
-		fmt.Fprint(s.writer, progress, "\n", output)
-	} else {
-		fmt.Fprintln(s.writer, progress)
+	if output != "" && (!s.suppressOutput || result.Error != nil) {
+		fmt.Fprint(s.writer, progress+str, "\n", output)
+	} else if !s.skipActionProgress {
+		fmt.Fprintln(s.writer, progress+str)
 	}
 }
 
@@ -79,7 +86,7 @@ func writeProgressFile(counts status.Counts) {
 		fmt.Println(err)
 		return
 	}
-	percent := 100*counts.FinishedActions/counts.TotalActions
+	percent := 100 * counts.FinishedActions / counts.TotalActions
 	output := fmt.Sprintf("%d/%d,%d\n", counts.FinishedActions, counts.TotalActions, percent)
 	_, err = f.WriteString(output)
 	if err != nil {

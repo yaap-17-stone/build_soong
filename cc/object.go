@@ -15,7 +15,6 @@
 package cc
 
 import (
-	"fmt"
 	"strings"
 
 	"android/soong/android"
@@ -86,6 +85,7 @@ func newObject(hod android.HostOrDeviceSupported) *Module {
 	module := newBaseModule(hod, android.MultilibBoth)
 	module.sanitize = &sanitize{}
 	module.stl = &stl{}
+	module.lfi = &Lfi{}
 	return module
 }
 
@@ -105,10 +105,6 @@ func ObjectFactory() android.Module {
 	module.sdkMemberTypes = []android.SdkMemberType{ccObjectSdkMemberType}
 
 	return module.Init()
-}
-
-func (object *objectLinker) appendLdflags(flags []string) {
-	panic(fmt.Errorf("appendLdflags on objectLinker not supported"))
 }
 
 func (object *objectLinker) linkerProps() []interface{} {
@@ -135,7 +131,9 @@ func (object *objectLinker) linkerDeps(ctx DepsContext, deps Deps) Deps {
 }
 
 func (object *objectLinker) linkerFlags(ctx ModuleContext, flags Flags) Flags {
-	flags.Global.LdFlags = append(flags.Global.LdFlags, ctx.toolchain().ToolchainLdflags())
+	toolchainLdFlags := ctx.toolchain().ToolchainLdflags()
+	flags.Global.LdFlags = append(flags.Global.LdFlags, toolchainLdFlags.Flags)
+	flags.LdFlagsDeps = append(flags.LdFlagsDeps, toolchainLdFlags.Deps...)
 
 	if lds := android.OptionalPathForModuleSrc(ctx, object.Properties.Linker_script); lds.Valid() {
 		flags.Local.LdFlags = append(flags.Local.LdFlags, "-Wl,-T,"+lds.String())
@@ -176,7 +174,7 @@ func (object *objectLinker) link(ctx ModuleContext,
 				builderFlags, output)
 		} else {
 			ctx.Build(pctx, android.BuildParams{
-				Rule:   android.Cp,
+				Rule:   android.CpRule,
 				Input:  objs.objFiles[0],
 				Output: output,
 			})

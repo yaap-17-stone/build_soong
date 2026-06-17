@@ -183,56 +183,6 @@ var neverallowTests = []struct {
 				}`),
 		},
 	},
-
-	{
-		name: "no enforce_vintf_manifest.cflags",
-		fs: map[string][]byte{
-			"Android.bp": []byte(`
-				cc_library {
-					name: "libexample",
-					product_variables: {
-						enforce_vintf_manifest: {
-							cflags: ["-DSHOULD_NOT_EXIST"],
-						},
-					},
-				}`),
-		},
-		expectedErrors: []string{
-			"manifest enforcement should be independent",
-		},
-	},
-
-	{
-		name: "no treble_linker_namespaces.cflags",
-		fs: map[string][]byte{
-			"Android.bp": []byte(`
-				cc_library {
-					name: "libexample",
-					product_variables: {
-						treble_linker_namespaces: {
-							cflags: ["-DSHOULD_NOT_EXIST"],
-						},
-					},
-				}`),
-		},
-		expectedErrors: []string{
-			"nothing should care if linker namespaces are enabled or not",
-		},
-	},
-	{
-		name: "libc_bionic_ndk treble_linker_namespaces.cflags",
-		fs: map[string][]byte{
-			"Android.bp": []byte(`
-				cc_library {
-					name: "libc_bionic_ndk",
-					product_variables: {
-						treble_linker_namespaces: {
-							cflags: ["-DSHOULD_NOT_EXIST"],
-						},
-					},
-				}`),
-		},
-	},
 	{
 		name: "java_device_for_host",
 		fs: map[string][]byte{
@@ -412,6 +362,19 @@ var neverallowTests = []struct {
 			`module type not allowed to be defined in bp file`,
 		},
 	},
+	{
+		name: "unchecked module not allowed",
+		fs: map[string][]byte{
+			"my/dir/Android.bp": []byte(`
+				cc_library {
+					name: "foo",
+					unchecked_module: true,
+				}`),
+		},
+		expectedErrors: []string{
+			regexp.QuoteMeta("module \"foo\": violates neverallow requirements. Not allowed:\n\tproperties matching: \"Unchecked_module\" matches: .is-set"),
+		},
+	},
 }
 
 var prepareForNeverAllowTest = GroupFixturePreparers(
@@ -454,13 +417,6 @@ type mockCcLibraryProperties struct {
 	}
 
 	Product_variables struct {
-		Enforce_vintf_manifest struct {
-			Cflags []string
-		}
-
-		Treble_linker_namespaces struct {
-			Cflags []string
-		}
 	}
 
 	Platform struct {

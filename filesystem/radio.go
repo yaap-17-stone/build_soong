@@ -21,6 +21,8 @@ import (
 	"android/soong/android"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 type prebuiltRadioImg struct {
 	android.ModuleBase
 	properties PrebuiltRadioImgProperties
@@ -37,6 +39,7 @@ type PrebuiltRadioImgProperties struct {
 	Unpack_tool *string `android:"path"`
 }
 
+// @auto-generate: gob
 type radioInfo struct {
 	image android.Path
 }
@@ -75,7 +78,7 @@ func (p *prebuiltRadioImg) partitionFiles(ctx android.ModuleContext) android.Pat
 	}
 	var radioFiles android.Paths
 	unpackedDir := android.PathForModuleOut(ctx, "unpack_radio")
-	builder := android.NewRuleBuilder(pctx, ctx).Sbox(
+	builder := android.NewRuleBuilder(pctx, ctx).SandboxDisabled().Sbox(
 		unpackedDir,
 		android.PathForModuleOut(ctx, "unpack_radio.textproto"),
 	)

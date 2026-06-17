@@ -130,6 +130,7 @@ var cmakeSnapshotSourcesProvider = blueprint.NewProvider[android.Paths]()
 
 type CmakeSnapshot struct {
 	android.ModuleBase
+	blueprint.ModuleUsesIncrementalWalkDeps
 
 	Properties CmakeSnapshotProperties
 
@@ -458,7 +459,7 @@ func (m *CmakeSnapshot) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	android.WriteFileRuleVerbatim(ctx, extPath, cmakeExtAddAidlLibrary)
 
 	// Generating the final zip file
-	zipRule := android.NewRuleBuilder(pctx, ctx)
+	zipRule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	zipCmd := zipRule.Command().
 		BuiltTool("soong_zip").
 		FlagWithOutput("-o ", m.zipPath)
@@ -486,8 +487,8 @@ func (m *CmakeSnapshot) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 		var prebuiltsList android.Paths
 
 		ctx.VisitDirectDepsProxyWithTag(cmakeSnapshotPrebuiltTag, func(dep android.ModuleProxy) {
-			for _, file := range android.OtherModuleProviderOrDefault(
-				ctx, dep, android.InstallFilesProvider).InstallFiles {
+			for _, file := range android.GetInstallFiles(
+				ctx, dep).InstallFiles {
 				prebuiltsList = append(prebuiltsList, file)
 			}
 		})

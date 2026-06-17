@@ -66,6 +66,7 @@ func testForDanglingRules(ctx Context, config Config) {
 	outDir := config.OutDir()
 	modulePathsDir := filepath.Join(outDir, ".module_paths")
 	rawFilesDir := filepath.Join(outDir, "soong", "raw")
+	pathInterposerDir := filepath.Join(outDir, ".path")
 	variablesFilePath := config.SoongVarsFile()
 	extraVariablesFilePath := config.SoongExtraVarsFile()
 
@@ -81,14 +82,19 @@ func testForDanglingRules(ctx Context, config Config) {
 	buildHostnameFilePath := filepath.Join(outDir, "soong", "build_hostname.txt")
 	buildNumberFilePath := filepath.Join(outDir, "soong", "build_number.txt")
 
+	partialCompileSource := config.DeviceUsePartialCompile()
+
 	// release-config files are generated from the initial lunch or Kati phase
 	// before running soong and ninja.
 	releaseConfigDir := filepath.Join(outDir, "soong", "release-config")
 
-	// out/target/product/<xxxxx>/build_fingerprint.txt is a source file created in sysprop.mk
-	// ^out/target/product/[^/]+/build_fingerprint.txt$
+	// out/target/product/<xxxxx>/build_fingerprint.txt is a source file created in config.mk
+	// ^out/target/product/[^/]+/build_(system_)?fingerprint-[^-/]*.txt$
 
-	buildFingerprintFilePattern := regexp.MustCompile("^" + filepath.Join(outDir, "target", "product") + "/[^/]+/build_(fingerprint|thumbprint)-[^-/]*\\.txt$")
+	buildFingerprintFilePattern := regexp.MustCompile("^" + filepath.Join(outDir, "target", "product") + "/[^/]+/build_((system_)?fingerprint|thumbprint)-[^-/]*\\.txt$")
+
+	// out/soong/soong_api/<product>/soong_api.zip is generate at the analysis phase.
+	soongApiZipPattern := regexp.MustCompile("^" + filepath.Join(outDir, "soong", "soong_api") + "/[^/]+/soong_api\\.zip$")
 
 	danglingRules := make(map[string]bool)
 
@@ -101,14 +107,18 @@ func testForDanglingRules(ctx Context, config Config) {
 		}
 		if strings.HasPrefix(line, modulePathsDir) ||
 			strings.HasPrefix(line, rawFilesDir) ||
+			strings.HasPrefix(line, pathInterposerDir) ||
 			line == variablesFilePath ||
 			line == extraVariablesFilePath ||
 			line == dexpreoptConfigFilePath ||
 			line == buildDatetimeFilePath ||
 			line == buildHostnameFilePath ||
 			line == buildNumberFilePath ||
+			line == partialCompileSource ||
+			line == config.BuildUUIDFile() ||
 			strings.HasPrefix(line, releaseConfigDir) ||
-			buildFingerprintFilePattern.MatchString(line) {
+			buildFingerprintFilePattern.MatchString(line) ||
+			soongApiZipPattern.MatchString(line) {
 			// Leaf node is in one of Soong's bootstrap directories, which do not have
 			// full build rules in the primary build.ninja file.
 			continue

@@ -65,7 +65,7 @@ func (l *StringList) ReadFromFile(fileName string) error {
 	for line := range strings.SplitSeq(strings.TrimSpace(string(data)), "\n") {
 		// Allow # comments on lines in the file.
 		line = strings.SplitN(line, "#", 2)[0]
-		for m := range strings.SplitSeq(strings.TrimSpace(line), " ") {
+		for _, m := range strings.Fields(line) {
 			l.Set(m)
 		}
 	}
@@ -217,6 +217,12 @@ func LoadMessage(path string, message proto.Message) error {
 
 // Call Func for any textproto files found in {root}/{subdir}.
 func WalkTextprotoFiles(root string, subdir string, Func fs.WalkDirFunc) error {
+	return walkTextprotoFiles(root, subdir, Func, false)
+}
+func WalkTextprotoFilesCheckName(root string, subdir string, Func fs.WalkDirFunc) error {
+	return walkTextprotoFiles(root, subdir, Func, true)
+}
+func walkTextprotoFiles(root string, subdir string, Func fs.WalkDirFunc, checkname bool) error {
 	path := filepath.Join(root, subdir)
 	if _, err := os.Stat(path); err != nil {
 		// Missing subdirs are not an error.
@@ -226,8 +232,12 @@ func WalkTextprotoFiles(root string, subdir string, Func fs.WalkDirFunc) error {
 		if err != nil {
 			return err
 		}
-		if strings.HasSuffix(d.Name(), ".textproto") && d.Type().IsRegular() {
-			return Func(path, d, err)
+		if d.Type().IsRegular() {
+			if strings.HasSuffix(d.Name(), ".textproto") {
+				return Func(path, d, err)
+			} else if checkname && strings.HasPrefix(d.Name(), "RELEASE_") {
+				return fmt.Errorf("%s lacks .textproto suffix", path)
+			}
 		}
 		return nil
 	})
@@ -339,7 +349,7 @@ func GetDefaultMapPaths(queryMaps bool) (defaultMapPaths StringList, err error) 
 	prodMaps = strings.TrimSpace(prodMaps)
 	productReleaseConfigMaps = &prodMaps
 	if len(prodMaps) > 0 {
-		defaultMapPaths = append(defaultMapPaths, strings.Split(prodMaps, " ")...)
+		defaultMapPaths = append(defaultMapPaths, strings.Fields(prodMaps)...)
 	}
 	return
 }

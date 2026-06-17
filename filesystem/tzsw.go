@@ -43,7 +43,7 @@ func (p *prebuiltTzsw) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	}
 	src := android.PathForModuleSrc(ctx, proptools.String(p.properties.Src))
 	srcWithAvb := p.avbAddHash(ctx, src)
-	ctx.SetOutputFiles([]android.Path{src, srcWithAvb}, "")
+	ctx.SetOutputFiles([]android.Path{src, srcWithAvb}, "bootloader_partitions")
 	android.SetProvider(ctx, vbmetaPartitionProvider, vbmetaPartitionInfo{
 		Name:   "tzsw",
 		Output: srcWithAvb,
@@ -52,7 +52,7 @@ func (p *prebuiltTzsw) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 
 func (p *prebuiltTzsw) avbAddHash(ctx android.ModuleContext, src android.Path) android.Path {
 	vbmetaIntermediates := android.PathForModuleOut(ctx, "vbmeta")
-	builder := android.NewRuleBuilder(pctx, ctx).Sbox(
+	builder := android.NewRuleBuilder(pctx, ctx).SandboxDisabled().Sbox(
 		vbmetaIntermediates,
 		android.PathForModuleOut(ctx, "vbmeta.textproto"),
 	)

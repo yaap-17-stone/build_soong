@@ -22,6 +22,8 @@ import (
 	"github.com/google/blueprint/proptools"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 func modulesOutputDirs(ctx BuilderContext, modules ...ModuleProxy) []string {
 	dirs := make([]string, 0, len(modules))
 	for _, module := range modules {
@@ -51,7 +53,7 @@ func modulesLicenseMetadata(ctx OtherModuleProviderContext, modules ...ModulePro
 		if isMctx && EqualModules(mctx.Module(), module) {
 			mf = mctx.LicenseMetadataFile()
 		} else {
-			mf = OtherModuleProviderOrDefault(ctx, module, InstallFilesProvider).LicenseMetadataFile
+			mf = GetInstallFiles(ctx, module).LicenseMetadataFile
 		}
 		if mf != nil {
 			result = append(result, mf)
@@ -62,12 +64,14 @@ func modulesLicenseMetadata(ctx OtherModuleProviderContext, modules ...ModulePro
 
 // All the information we need from a particular module to build its notice file entry.
 // Can be passed through providers, unlike the module itself.
+// @auto-generate: gob
 type NoticeModuleInfo struct {
 	Name                string
 	OutputDirs          []string
 	LicenseMetadataFile Path
 }
 
+// @auto-generate: gob
 type NoticeModuleInfos []NoticeModuleInfo
 
 func (i *NoticeModuleInfos) OutputDirs() []string {
@@ -122,7 +126,7 @@ func buildNoticeOutputFromLicenseMetadata(
 	if libraryName == "" {
 		libraryName = modules[0].Name
 	}
-	rule := NewRuleBuilder(pctx, ctx)
+	rule := NewRuleBuilder(pctx, ctx).SandboxDisabled()
 
 	// Arguments that will go into the response file.
 	var rspArgs []string

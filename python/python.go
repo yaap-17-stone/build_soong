@@ -32,38 +32,19 @@ import (
 	"android/soong/android"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
+// @auto-generate: gob
 type PythonLibraryInfo struct {
-	SrcsPathMappings   []pathMapping
-	DataPathMappings   []pathMapping
-	SrcsZip            android.Path
-	PrecompiledSrcsZip android.Path
+	SrcsPathMappings   depset.DepSet[pathMapping]
+	DataPathMappings   depset.DepSet[pathMapping]
+	SrcsZip            depset.DepSet[android.Path]
+	PrecompiledSrcsZip depset.DepSet[android.Path]
 	PkgPath            string
-	BundleSharedLibs   android.Paths
+	BundleSharedLibs   depset.DepSet[android.Path]
 }
 
 var PythonLibraryInfoProvider = blueprint.NewProvider[PythonLibraryInfo]()
-
-// the version-specific properties that apply to python modules.
-type VersionProperties struct {
-	// whether the module is required to be built with this version.
-	// Defaults to true for Python 3, and false otherwise.
-	Enabled *bool
-
-	// list of source files specific to this Python version.
-	// Using the syntax ":module", srcs may reference the outputs of other modules that produce source files,
-	// e.g. genrule or filegroup.
-	Srcs []string `android:"path,arch_variant"`
-
-	// list of source files that should not be used to build the Python module for this version.
-	// This is most useful to remove files that are not common to all Python versions.
-	Exclude_srcs []string `android:"path,arch_variant"`
-
-	// list of the Python libraries used only for this Python version.
-	Libs []string `android:"arch_variant"`
-
-	// whether the binary is required to be built with embedded launcher for this version, defaults to true.
-	Embedded_launcher *bool // TODO(b/174041232): Remove this property
-}
 
 // properties that apply to all python modules
 type BaseProperties struct {
@@ -111,20 +92,6 @@ type BaseProperties struct {
 	// list of shared libraries that should be packaged with the python code for this module.
 	Shared_libs []string `android:"arch_variant"`
 
-	Version struct {
-		// Python2-specific properties, including whether Python2 is supported for this module
-		// and version-specific sources, exclusions and dependencies.
-		Py2 VersionProperties `android:"arch_variant"`
-
-		// Python3-specific properties, including whether Python3 is supported for this module
-		// and version-specific sources, exclusions and dependencies.
-		Py3 VersionProperties `android:"arch_variant"`
-	} `android:"arch_variant"`
-
-	// This enabled property is to accept the collapsed enabled property from the VersionProperties.
-	// It is unused now, as all builds should be python3.
-	Enabled *bool `blueprint:"mutated"`
-
 	// whether the binary is required to be built with an embedded python interpreter, defaults to
 	// true. This allows taking the resulting binary outside of the build and running it on machines
 	// that don't have python installed or may have an older version of python.
@@ -132,9 +99,11 @@ type BaseProperties struct {
 }
 
 // Used to store files of current module after expanding dependencies
+// @auto-generate: gob
 type pathMapping struct {
-	dest string
-	src  android.Path
+	module string
+	dest   string
+	src    android.Path
 }
 
 type PythonLibraryModule struct {
@@ -168,6 +137,8 @@ type PythonLibraryModule struct {
 	// The shared libraries that should be bundled with the python code for
 	// any standalone python binaries that depend on this module.
 	bundleSharedLibs android.Paths
+
+	libraryInfo PythonLibraryInfo
 }
 
 // newModule generates new Python base module
@@ -176,39 +147,6 @@ func newModule(hod android.HostOrDeviceSupported, multilib android.Multilib) *Py
 		hod:      hod,
 		multilib: multilib,
 	}
-}
-
-// getSrcsPathMappings gets this module's path mapping of src source path : runfiles destination
-func (p *PythonLibraryModule) getSrcsPathMappings() []pathMapping {
-	return p.srcsPathMappings
-}
-
-// getSrcsPathMappings gets this module's path mapping of data source path : runfiles destination
-func (p *PythonLibraryModule) getDataPathMappings() []pathMapping {
-	return p.dataPathMappings
-}
-
-// getSrcsZip returns the filepath where the current module's source/data files are zipped.
-func (p *PythonLibraryModule) getSrcsZip() android.Path {
-	return p.srcsZip
-}
-
-// getSrcsZip returns the filepath where the current module's source/data files are zipped.
-func (p *PythonLibraryModule) getPrecompiledSrcsZip() android.Path {
-	return p.precompiledSrcsZip
-}
-
-// getPkgPath returns the pkg_path value
-func (p *PythonLibraryModule) getPkgPath() string {
-	return String(p.properties.Pkg_path)
-}
-
-func (p *PythonLibraryModule) getBaseProperties() *BaseProperties {
-	return &p.properties
-}
-
-func (p *PythonLibraryModule) getBundleSharedLibs() android.Paths {
-	return p.bundleSharedLibs
 }
 
 func (p *PythonLibraryModule) init() android.Module {
@@ -254,10 +192,6 @@ var (
 	internalPath             = "internal"
 )
 
-type basePropertiesProvider interface {
-	getBaseProperties() *BaseProperties
-}
-
 func anyHasExt(paths []string, ext string) bool {
 	for _, p := range paths {
 		if filepath.Ext(p) == ext {
@@ -277,17 +211,6 @@ func (p *PythonLibraryModule) anySrcHasExt(ctx android.BottomUpMutatorContext, e
 //   - if required, specifies launcher and adds launcher dependencies,
 //   - applies python version mutations to Python dependencies
 func (p *PythonLibraryModule) DepsMutator(ctx android.BottomUpMutatorContext) {
-	// Flatten the version.py3 props down into the main property struct. Leftover from when
-	// there was both python2 and 3 in the build, and properties could be different between them.
-	if base, ok := ctx.Module().(basePropertiesProvider); ok {
-		props := base.getBaseProperties()
-
-		err := proptools.AppendMatchingProperties([]interface{}{props}, &props.Version.Py3, nil)
-		if err != nil {
-			panic(err)
-		}
-	}
-
 	android.ProtoDeps(ctx, &p.protoProperties)
 
 	// If sources contain a proto file, add dependency on libprotobuf-python
@@ -310,6 +233,8 @@ func (p *PythonLibraryModule) DepsMutator(ctx android.BottomUpMutatorContext) {
 	}
 
 	p.AddDepsOnPythonLauncherAndStdlib(ctx, hostStdLibTag, hostLauncherTag, hostlauncherSharedLibTag, false, ctx.Config().BuildOSTarget)
+
+	ctx.AddHostToolDependencies("aprotoc", "soong_zip")
 }
 
 // AddDepsOnPythonLauncherAndStdlib will make the current module depend on the python stdlib,
@@ -378,12 +303,9 @@ func (p *PythonLibraryModule) AddDepsOnPythonLauncherAndStdlib(ctx android.Botto
 
 // GenerateAndroidBuildActions performs build actions common to all Python modules
 func (p *PythonLibraryModule) GenerateAndroidBuildActions(ctx android.ModuleContext) {
-	if proptools.BoolDefault(p.properties.Version.Py2.Enabled, false) {
-		ctx.PropertyErrorf("version.py2.enabled", "Python 2 is no longer supported, please convert to python 3.")
-	}
 	expandedSrcs := android.PathsForModuleSrcExcludes(ctx, p.properties.Srcs, p.properties.Exclude_srcs)
 	// Keep before any early returns.
-	android.SetProvider(ctx, android.TestOnlyProviderKey, android.TestModuleInformation{
+	ctx.SetTestModuleInfo(&android.TestModuleInformation{
 		TestOnly:       Bool(p.sourceProperties.Test_only),
 		TopLevelTarget: p.sourceProperties.Top_level_test_target,
 	})
@@ -400,6 +322,7 @@ func (p *PythonLibraryModule) GenerateAndroidBuildActions(ctx android.ModuleCont
 
 	var directImplementationDeps android.Paths
 	var transitiveImplementationDeps []depset.DepSet[android.Path]
+	// we only collect dependencies tagged as python library deps
 	ctx.VisitDirectDepsProxyWithTag(sharedLibTag, func(dep android.ModuleProxy) {
 		sharedLibInfo, _ := android.OtherModuleProvider(ctx, dep, cc.SharedLibraryInfoProvider)
 		if sharedLibInfo.SharedLibrary != nil {
@@ -442,14 +365,35 @@ func (p *PythonLibraryModule) GenerateAndroidBuildActions(ctx android.ModuleCont
 	p.srcsZip = p.createSrcsZip(ctx, pkgPath)
 	p.precompiledSrcsZip = p.precompileSrcs(ctx)
 
-	android.SetProvider(ctx, PythonLibraryInfoProvider, PythonLibraryInfo{
-		SrcsPathMappings:   p.getSrcsPathMappings(),
-		DataPathMappings:   p.getDataPathMappings(),
-		SrcsZip:            p.getSrcsZip(),
-		PkgPath:            p.getPkgPath(),
-		PrecompiledSrcsZip: p.getPrecompiledSrcsZip(),
-		BundleSharedLibs:   p.getBundleSharedLibs(),
+	srcsPathMappingsDepSetBuilder := depset.NewBuilder[pathMapping](depset.PREORDER).Direct(p.srcsPathMappings...)
+	dataPathMappingsDepSetBuilder := depset.NewBuilder[pathMapping](depset.PREORDER).Direct(p.dataPathMappings...)
+	srcsZipDepSetBuilder := depset.NewBuilder[android.Path](depset.PREORDER).Direct(p.srcsZip)
+	precompiledSrcsZipDepSetBuilder := depset.NewBuilder[android.Path](depset.PREORDER).Direct(p.precompiledSrcsZip)
+	bundledSharedLibsDepSetBuilder := depset.NewBuilder[android.Path](depset.PREORDER).Direct(p.bundleSharedLibs...)
+	ctx.VisitDirectDepsProxyWithTag(pythonLibTag, func(dep android.ModuleProxy) {
+		library, isLibrary := android.OtherModuleProvider(ctx, dep, PythonLibraryInfoProvider)
+		_, isBinary := android.OtherModuleProvider(ctx, dep, PythonBinaryInfoProvider)
+		if !isLibrary || isBinary {
+			ctx.PropertyErrorf("libs", "the dependency %q is not Python library!", ctx.OtherModuleName(dep))
+			return
+		}
+
+		srcsPathMappingsDepSetBuilder.Transitive(library.SrcsPathMappings)
+		dataPathMappingsDepSetBuilder.Transitive(library.DataPathMappings)
+		srcsZipDepSetBuilder.Transitive(library.SrcsZip)
+		precompiledSrcsZipDepSetBuilder.Transitive(library.PrecompiledSrcsZip)
+		bundledSharedLibsDepSetBuilder.Transitive(library.BundleSharedLibs)
 	})
+
+	p.libraryInfo = PythonLibraryInfo{
+		SrcsPathMappings:   srcsPathMappingsDepSetBuilder.Build(),
+		DataPathMappings:   dataPathMappingsDepSetBuilder.Build(),
+		SrcsZip:            srcsZipDepSetBuilder.Build(),
+		PkgPath:            String(p.properties.Pkg_path),
+		PrecompiledSrcsZip: precompiledSrcsZipDepSetBuilder.Build(),
+		BundleSharedLibs:   bundledSharedLibsDepSetBuilder.Build(),
+	}
+	android.SetProvider(ctx, PythonLibraryInfoProvider, p.libraryInfo)
 }
 
 func isValidPythonPath(path string) error {
@@ -472,8 +416,8 @@ func (p *PythonLibraryModule) genModulePathMappings(ctx android.ModuleContext, p
 	expandedSrcs, expandedData android.Paths) {
 	// fetch <runfiles_path, source_path> pairs from "src" and "data" properties to
 	// check current module duplicates.
-	destToPySrcs := make(map[string]string)
-	destToPyData := make(map[string]string)
+	destToPySrcs := make(map[string]pathMapping)
+	destToPyData := make(map[string]pathMapping)
 
 	// Disable path checks for the stdlib, as it includes a "." in the version string
 	isInternal := proptools.BoolDefault(p.properties.Is_internal, false)
@@ -489,8 +433,9 @@ func (p *PythonLibraryModule) genModulePathMappings(ctx android.ModuleContext, p
 				ctx.PropertyErrorf("srcs", err.Error())
 			}
 		}
-		if !checkForDuplicateOutputPath(ctx, destToPySrcs, runfilesPath, s.String(), p.Name(), p.Name()) {
-			p.srcsPathMappings = append(p.srcsPathMappings, pathMapping{dest: runfilesPath, src: s})
+		path := pathMapping{module: ctx.ModuleName(), dest: runfilesPath, src: s}
+		if !checkForDuplicateOutputPath(ctx, destToPySrcs, path) {
+			p.srcsPathMappings = append(p.srcsPathMappings, path)
 		}
 	}
 
@@ -500,9 +445,9 @@ func (p *PythonLibraryModule) genModulePathMappings(ctx android.ModuleContext, p
 			continue
 		}
 		runfilesPath := filepath.Join(pkgPath, d.Rel())
-		if !checkForDuplicateOutputPath(ctx, destToPyData, runfilesPath, d.String(), p.Name(), p.Name()) {
-			p.dataPathMappings = append(p.dataPathMappings,
-				pathMapping{dest: runfilesPath, src: d})
+		path := pathMapping{module: ctx.ModuleName(), dest: runfilesPath, src: d}
+		if !checkForDuplicateOutputPath(ctx, destToPyData, path) {
+			p.dataPathMappings = append(p.dataPathMappings, path)
 		}
 	}
 }
@@ -541,12 +486,15 @@ func (p *PythonLibraryModule) createSrcsZip(ctx android.ModuleContext, pkgPath s
 			var stagedProtoSrcs android.Paths
 			for _, srcFile := range protoSrcs {
 				stagedProtoSrc := pkgPathStagingDir.Join(ctx, pkgPath, srcFile.Rel())
-				rule.Command().Text("cp -f").Input(srcFile).Output(stagedProtoSrc)
+				rule.Command().BuiltTool("cp").Flag("-f").Input(srcFile).Output(stagedProtoSrc)
 				stagedProtoSrcs = append(stagedProtoSrcs, stagedProtoSrc)
 			}
 			rule.Build("stage_protos_for_pkg_path", "Stage protos for pkg_path")
 			protoSrcs = stagedProtoSrcs
 		}
+
+		// Srcs are compiled independently, and may depend on each other.
+		protoFlags.Deps = append(protoFlags.Deps, protoSrcs...)
 
 		for _, srcFile := range protoSrcs {
 			zip := genProto(ctx, srcFile, protoFlags)
@@ -613,11 +561,18 @@ func (p *PythonLibraryModule) precompileSrcs(ctx android.ModuleContext) android.
 	var launcher android.Path
 	if proptools.BoolDefault(p.properties.Is_internal, false) {
 		stdLib = p.srcsZip
-		stdLibPkg = p.getPkgPath()
+		stdLibPkg = String(p.properties.Pkg_path)
 	} else {
 		ctx.VisitDirectDepsProxyWithTag(hostStdLibTag, func(module android.ModuleProxy) {
 			if dep, ok := android.OtherModuleProvider(ctx, module, PythonLibraryInfoProvider); ok {
-				stdLib = dep.PrecompiledSrcsZip
+				stdlibPrecompiledSrcsZip := dep.PrecompiledSrcsZip.ToList()
+				if len(stdlibPrecompiledSrcsZip) == 1 {
+					stdLib = stdlibPrecompiledSrcsZip[0]
+				} else {
+					ctx.ModuleErrorf("expected one source zip from stdlib dependency %s, got %d",
+						ctx.OtherModuleName(module), len(stdlibPrecompiledSrcsZip))
+					stdLib = android.PathForModuleOut(ctx, "missing_stdlib")
+				}
 				stdLibPkg = dep.PkgPath
 			}
 		})
@@ -665,87 +620,21 @@ func (p *PythonLibraryModule) precompileSrcs(ctx android.ModuleContext) android.
 	return out
 }
 
-// collectPathsFromTransitiveDeps checks for source/data files for duplicate paths
+// checkDuplicatePaths checks for source/data files for duplicate paths
 // for module and its transitive dependencies and collects list of data/source file
 // zips for transitive dependencies.
-func (p *PythonLibraryModule) collectPathsFromTransitiveDeps(ctx android.ModuleContext, precompiled bool) android.Paths {
+func (p *PythonLibraryModule) checkDuplicatePaths(ctx android.ModuleContext) {
 	// fetch <runfiles_path, source_path> pairs from "src" and "data" properties to
 	// check duplicates.
-	destToPySrcs := make(map[string]string)
-	destToPyData := make(map[string]string)
-	for _, path := range p.srcsPathMappings {
-		destToPySrcs[path.dest] = path.src.String()
+	destToPySrcs := make(map[string]pathMapping)
+	destToPyData := make(map[string]pathMapping)
+
+	for _, path := range p.libraryInfo.SrcsPathMappings.ToList() {
+		checkForDuplicateOutputPath(ctx, destToPySrcs, path)
 	}
-	for _, path := range p.dataPathMappings {
-		destToPyData[path.dest] = path.src.String()
+	for _, path := range p.libraryInfo.DataPathMappings.ToList() {
+		checkForDuplicateOutputPath(ctx, destToPyData, path)
 	}
-
-	seen := make(map[android.ModuleProxy]bool)
-
-	var result android.Paths
-
-	// visit all its dependencies in depth first.
-	ctx.WalkDepsProxy(func(child, _ android.ModuleProxy) bool {
-		// we only collect dependencies tagged as python library deps
-		if ctx.OtherModuleDependencyTag(child) != pythonLibTag {
-			return false
-		}
-		if seen[child] {
-			return false
-		}
-		seen[child] = true
-		// Python modules only can depend on Python libraries.
-		dep, isLibrary := android.OtherModuleProvider(ctx, child, PythonLibraryInfoProvider)
-		_, isBinary := android.OtherModuleProvider(ctx, child, PythonBinaryInfoProvider)
-		if !isLibrary || isBinary {
-			ctx.PropertyErrorf("libs",
-				"the dependency %q of module %q is not Python library!",
-				ctx.OtherModuleName(child), ctx.ModuleName())
-		}
-		// collect source and data paths, checking that there are no duplicate output file conflicts
-		if isLibrary {
-			srcs := dep.SrcsPathMappings
-			for _, path := range srcs {
-				checkForDuplicateOutputPath(ctx, destToPySrcs,
-					path.dest, path.src.String(), ctx.ModuleName(), ctx.OtherModuleName(child))
-			}
-			data := dep.DataPathMappings
-			for _, path := range data {
-				checkForDuplicateOutputPath(ctx, destToPyData,
-					path.dest, path.src.String(), ctx.ModuleName(), ctx.OtherModuleName(child))
-			}
-			if precompiled {
-				result = append(result, dep.PrecompiledSrcsZip)
-			} else {
-				result = append(result, dep.SrcsZip)
-			}
-		}
-		return true
-	})
-	return result
-}
-
-func (p *PythonLibraryModule) collectSharedLibDeps(ctx android.ModuleContext) android.Paths {
-	seen := make(map[android.ModuleProxy]bool)
-
-	var result android.Paths
-
-	ctx.WalkDepsProxy(func(child, _ android.ModuleProxy) bool {
-		// we only collect dependencies tagged as python library deps
-		if ctx.OtherModuleDependencyTag(child) != pythonLibTag {
-			return false
-		}
-		if seen[child] {
-			return false
-		}
-		seen[child] = true
-		dep, isLibrary := android.OtherModuleProvider(ctx, child, PythonLibraryInfoProvider)
-		if isLibrary {
-			result = append(result, dep.BundleSharedLibs...)
-		}
-		return true
-	})
-	return result
 }
 
 func (p *PythonLibraryModule) zipSharedLibs(ctx android.ModuleContext, bundleSharedLibs android.Paths) android.Path {
@@ -779,15 +668,15 @@ func (p *PythonLibraryModule) zipSharedLibs(ctx android.ModuleContext, bundleSha
 // would result in two files being placed in the same location.
 // If there is a duplicate path, an error is thrown and true is returned
 // Otherwise, outputPath: srcPath is added to m and returns false
-func checkForDuplicateOutputPath(ctx android.ModuleContext, m map[string]string, outputPath, srcPath, curModule, otherModule string) bool {
-	if oldSrcPath, found := m[outputPath]; found {
+func checkForDuplicateOutputPath(ctx android.ModuleContext, m map[string]pathMapping, path pathMapping) bool {
+	if oldPathMapping, found := m[path.dest]; found {
 		ctx.ModuleErrorf("found two files to be placed at the same location within zip %q."+
 			" First file: in module %s at path %q."+
 			" Second file: in module %s at path %q.",
-			outputPath, curModule, oldSrcPath, otherModule, srcPath)
+			path.dest, oldPathMapping.module, oldPathMapping.src, path.module, path.src)
 		return true
 	}
-	m[outputPath] = srcPath
+	m[path.dest] = path
 
 	return false
 }

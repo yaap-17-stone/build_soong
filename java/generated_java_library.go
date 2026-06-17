@@ -35,6 +35,9 @@ type GeneratedJavaLibraryCallbacks interface {
 	// Called from inside GenerateAndroidBuildActions. Add the build rules to
 	// make the srcjar, and return the path to it.
 	GenerateSourceJarBuildActions(module *GeneratedJavaLibraryModule, ctx android.ModuleContext) (android.Path, android.Path)
+
+	// Called from inside IDEInfo. Allows the callback to add information to the IdeInfo struct.
+	IDEInfo(module *GeneratedJavaLibraryModule, ctx android.BaseModuleContext, dpInfo *android.IdeInfo)
 }
 
 // GeneratedJavaLibraryModuleFactory provides a utility for modules that are generated
@@ -62,12 +65,26 @@ func GeneratedJavaLibraryModuleFactory(moduleName string, callbacks GeneratedJav
 	return module
 }
 
+// IDEInfo Populates the IdeInfo struct with information from the module.
+func (module *GeneratedJavaLibraryModule) IDEInfo(ctx android.BaseModuleContext, dpInfo *android.IdeInfo) {
+	module.Library.IDEInfo(ctx, dpInfo)
+	module.callbacks.IDEInfo(module, ctx, dpInfo)
+}
+
 // Add a java shared library as a dependency, as if they had said `libs: [ "name" ]`
 func (module *GeneratedJavaLibraryModule) AddSharedLibrary(name string) {
 	if module.depsMutatorDone {
 		panic("GeneratedJavaLibraryModule.AddLibrary called after DepsMutator")
 	}
-	module.Library.properties.Libs = append(module.Library.properties.Libs, name)
+	module.Library.properties.Libs.AppendSimpleValue([]string{name})
+}
+
+// Add a java static library as a dependency, as if they had said `static_libs: [ "name" ]`
+func (module *GeneratedJavaLibraryModule) AddStaticLibrary(name string) {
+	if module.depsMutatorDone {
+		panic("GeneratedJavaLibraryModule.AddStaticLibrary called after DepsMutator")
+	}
+	module.Library.properties.Static_libs.AppendSimpleValue([]string{name})
 }
 
 func (module *GeneratedJavaLibraryModule) DepsMutator(ctx android.BottomUpMutatorContext) {
@@ -87,7 +104,7 @@ func (module *GeneratedJavaLibraryModule) GenerateAndroidBuildActions(ctx androi
 	// No additional sources
 	checkPropertyEmpty(ctx, module, "srcs", module.Library.properties.Srcs.GetOrDefault(ctx, nil))
 	checkPropertyEmpty(ctx, module, "common_srcs", module.Library.properties.Common_srcs)
-	checkPropertyEmpty(ctx, module, "exclude_srcs", module.Library.properties.Exclude_srcs)
+	checkPropertyEmpty(ctx, module, "exclude_srcs", module.Library.properties.Exclude_srcs.GetOrDefault(ctx, nil))
 	checkPropertyEmpty(ctx, module, "java_resource_dirs", module.Library.properties.Java_resource_dirs)
 	checkPropertyEmpty(ctx, module, "exclude_java_resource_dirs", module.Library.properties.Exclude_java_resource_dirs)
 	// Restrict these for no good reason other than to limit the surface area. If there's a

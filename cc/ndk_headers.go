@@ -22,11 +22,14 @@ import (
 	"github.com/google/blueprint"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 var (
 	preprocessNdkHeader = pctx.AndroidStaticRule("preprocessNdkHeader",
 		blueprint.RuleParams{
-			Command:     "$preprocessor -o $out $in",
-			CommandDeps: []string{"$preprocessor"},
+			Command:         "$preprocessor -o $out $in",
+			CommandDeps:     []string{"$preprocessor"},
+			SandboxDisabled: true,
 		},
 		"preprocessor")
 )
@@ -80,6 +83,7 @@ type headerModule struct {
 	licensePath  android.Path
 }
 
+// @auto-generate: gob
 type NdkHeaderInfo struct {
 	SrcPaths     android.Paths
 	InstallPaths android.Paths
@@ -139,7 +143,7 @@ func (m *headerModule) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 			String(m.properties.To))
 		installPath := installDir.Join(ctx, header.Base())
 		ctx.Build(pctx, android.BuildParams{
-			Rule:   android.Cp,
+			Rule:   android.CpRule,
 			Input:  header,
 			Output: installPath,
 		})

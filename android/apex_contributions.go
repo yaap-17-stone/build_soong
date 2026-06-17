@@ -19,6 +19,8 @@ import (
 	"github.com/google/blueprint/proptools"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 func init() {
 	RegisterApexContributionsBuildComponents(InitRegistrationContext)
 }
@@ -29,6 +31,7 @@ func RegisterApexContributionsBuildComponents(ctx RegistrationContext) {
 	ctx.RegisterModuleType("all_apex_contributions", allApexContributionsFactory)
 }
 
+// @auto-generate: gob
 type apexContributionsInfo struct {
 	Name      string
 	Contents  []string
@@ -139,7 +142,7 @@ func (a *allApexContributions) SetPrebuiltSelectionInfoProvider(ctx BottomUpMuta
 	if !proptools.Bool(ctx.Config().BuildIgnoreApexContributionContents()) {
 		deps := ctx.AddDependency(ctx.Module(), AcDepTag, ctx.Config().AllApexContributions()...)
 		for _, child := range deps {
-			if child == nil {
+			if child.IsNil() {
 				continue
 			}
 			if m, ok := OtherModuleProvider(ctx, child, apexContributionsInfoProvider); ok {
@@ -158,6 +161,7 @@ var PrebuiltSelectionInfoProvider = blueprint.NewMutatorProvider[PrebuiltSelecti
 
 // Map of selected module names to a metadata object
 // The metadata contains information about the api_domain of the selected module
+// @auto-generate: gob
 type PrebuiltSelectionInfoMap map[string]PrebuiltSelectionInfo
 
 // Add a new entry to the map with some validations
@@ -168,6 +172,7 @@ func (pm *PrebuiltSelectionInfoMap) Add(ctx BaseModuleContext, p *PrebuiltSelect
 	(*pm)[p.selectedModuleName] = *p
 }
 
+// @auto-generate: gob
 type PrebuiltSelectionInfo struct {
 	// e.g. (libc|prebuilt_libc)
 	selectedModuleName string

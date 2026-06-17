@@ -16,7 +16,7 @@ package android
 
 import "github.com/google/blueprint"
 
-//go:generate go run ../../blueprint/gobtools/codegen/gob_gen.go
+//go:generate go run ../../blueprint/gobtools/codegen
 
 func init() {
 	RegisterTeamBuildComponents(InitRegistrationContext)
@@ -30,10 +30,12 @@ var PrepareForTestWithTeamBuildComponents = GroupFixturePreparers(
 	FixtureRegisterWithContext(RegisterTeamBuildComponents),
 )
 
+// @auto-generate: gob
 type teamProperties struct {
 	Trendy_team_id *string `json:"trendy_team_id"`
 }
 
+// @auto-generate: gob
 type TeamInfo struct {
 	Properties teamProperties
 }
@@ -52,8 +54,6 @@ type TestModuleInformation struct {
 	TestOnly       bool
 	TopLevelTarget bool
 }
-
-var TestOnlyProviderKey = blueprint.NewProvider[TestModuleInformation]()
 
 // Real work is done for the module that depends on us.
 // If needed, the team can serialize the config to json/proto file as well.

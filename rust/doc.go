@@ -31,7 +31,7 @@ type rustdocSingleton struct{}
 func (n *rustdocSingleton) GenerateBuildActions(ctx android.SingletonContext) {
 	docDir := android.PathForOutput(ctx, "rustdoc")
 	docZip := android.PathForOutput(ctx, "rustdoc.zip")
-	rule := android.NewRuleBuilder(pctx, ctx)
+	rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	zipCmd := rule.Command().BuiltTool("soong_zip").
 		FlagWithOutput("-o ", docZip).
 		FlagWithArg("-C ", docDir.String()).
@@ -43,7 +43,7 @@ func (n *rustdocSingleton) GenerateBuildActions(ctx android.SingletonContext) {
 		}
 
 		if m, ok := android.OtherModuleProvider(ctx, module, RustInfoProvider); ok {
-			if m.DocTimestampFile.Valid() {
+			if m.CollectDoc && m.DocTimestampFile.Valid() {
 				zipCmd.Implicit(m.DocTimestampFile.Path())
 			}
 		}

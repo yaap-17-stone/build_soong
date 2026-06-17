@@ -17,6 +17,7 @@ package build
 import (
 	"context"
 	"io"
+	"os"
 
 	"android/soong/ui/execution_metrics"
 	"android/soong/ui/logger"
@@ -44,13 +45,23 @@ type ContextImpl struct {
 	Tracer tracer.Tracer
 
 	CriticalPath *status.CriticalPath
+
+	SigNumFunc func() os.Signal
+
+	RBEProxyCmd *Cmd
+
+	FinalStdout []string
+}
+
+func (c *ContextImpl) PrintFinal(s string) {
+	c.FinalStdout = append(c.FinalStdout, s)
 }
 
 // BeginTrace starts a new Duration Event.  Call End on the returned TraceEvent
 // to end the Event.
-func (c ContextImpl) BeginTrace(name, desc string) *TraceEvent {
+func (c *ContextImpl) BeginTrace(name, desc string) *TraceEvent {
 	e := &TraceEvent{
-		c: &c,
+		c: c,
 	}
 	if c.Tracer != nil {
 		c.Tracer.Begin(desc, c.Thread)
@@ -76,7 +87,7 @@ func (e *TraceEvent) End() {
 }
 
 // CompleteTrace writes a trace with a beginning and end times.
-func (c ContextImpl) CompleteTrace(name, desc string, begin, end uint64) {
+func (c *ContextImpl) CompleteTrace(name, desc string, begin, end uint64) {
 	if c.Tracer != nil {
 		c.Tracer.Complete(desc, c.Thread, begin, end)
 	}

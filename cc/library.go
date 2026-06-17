@@ -61,7 +61,14 @@ type LibraryProperties struct {
 		Platform *bool
 	} `blueprint:"mutated"`
 
+	// Static_ndk_lib is true if the static variant of the library is intended for NDK use.
 	Static_ndk_lib *bool
+
+	// Force_rust_staticlib will force generation of the Rust staticlib with all Rust
+	// dependencies and whole-archive it into the staticlib. This should only be set
+	// for static libraries that are intended for use outside of Soong and should not
+	// be set on static libraries used within Soong.
+	Force_rust_staticlib *bool
 
 	// Generate stubs to make this library accessible to APEXes.
 	Stubs StubsProperties `android:"arch_variant"`
@@ -461,6 +468,8 @@ type libraryDecorator struct {
 	// Forces production of the generated Rust staticlib for cc_library_static.
 	// Intended to be used to provide these generated staticlibs for Make.
 	wideStaticlibForMake bool
+
+	lfiInfo lfiInfo
 }
 
 // linkerProps returns the list of properties structs relevant for this library. (For example, if
@@ -712,7 +721,7 @@ type ApiStubsParams struct {
 }
 
 // GetApiStubsFlags calculates the genstubFlags string to pass to ParseNativeAbiDefinition
-func GetApiStubsFlags(api ApiStubsParams) string {
+func GetApiStubsFlags(ctx android.ModuleContext, api ApiStubsParams) string {
 	var flag string
 
 	// b/239274367 --apex and --systemapi filters symbols tagged with # apex and #
@@ -739,12 +748,19 @@ func GetApiStubsFlags(api ApiStubsParams) string {
 	}
 
 	// TODO(b/361303067): Remove this special case if bionic/ projects are added to ART development branches.
-	if isBionic(api.BaseModuleName) {
+	if !ctx.Config().GetBuildFlagBool("RELEASE_DEPRECATE_RUNTIME_APEX") && isBionic(api.BaseModuleName) {
 		// set the flags explicitly for bionic libs.
 		// this is necessary for development in minimal branches which does not contain bionic/*.
 		// In such minimal branches, e.g. on the prebuilt libc stubs
 		// 1. IsNdk will return false (since the ndk_library definition for libc does not exist)
 		// 2. NotInPlatform will return true (since the source com.android.runtime does not exist)
+		flag = "--apex"
+	}
+
+	// TODO(b/369944471) Fix mapfile.py so that libclang_rt.hwasan's mapfile
+	// exports symbols with "# systemapi".
+	if ctx.Config().GetBuildFlagBool("RELEASE_DEPRECATE_RUNTIME_APEX") &&
+		strings.HasPrefix(api.BaseModuleName, "libclang_rt.hwasan") {
 		flag = "--apex"
 	}
 
@@ -768,10 +784,15 @@ func (library *libraryDecorator) compileModuleLibApiStubs(ctx ModuleContext, fla
 		BaseModuleName: ctx.baseModuleName(),
 		ModuleName:     ctx.ModuleName(),
 	}
-	flag := GetApiStubsFlags(apiParams)
+	flag := GetApiStubsFlags(ctx, apiParams)
 
-	nativeAbiResult := ParseNativeAbiDefinition(ctx, symbolFile,
-		android.ApiLevelOrPanic(ctx, library.MutatedProperties.StubsVersion), flag)
+	nativeAbiResult := ParseNativeAbiDefinition(ctx,
+		symbolFile,
+		// Raise the version to at least the minimum API level for the device architecture.
+		// This might mean that some old API level stubs contain the symbols from minimum API level.
+		nativeClampedApiLevel(ctx, android.ApiLevelOrPanic(ctx, library.MutatedProperties.StubsVersion)),
+		flag,
+	)
 	objs := CompileStubLibrary(ctx, flags, nativeAbiResult.StubSrc, ctx.getSharedFlags())
 
 	library.versionScriptPath = android.OptionalPathForPath(
@@ -1088,17 +1109,16 @@ func (library *libraryDecorator) linkStatic(ctx ModuleContext,
 	library.objects = library.objects.Append(objs)
 	library.wholeStaticLibsFromPrebuilts = android.CopyOfPaths(deps.WholeStaticLibsFromPrebuilts)
 
-	if library.wideStaticlibForMake {
+	if library.wideStaticlibForMake || Bool(library.Properties.Force_rust_staticlib) {
 		if generatedLib := GenerateRustStaticlib(ctx, deps.RustRlibDeps); generatedLib != nil {
 			// WholeStaticLibsFromPrebuilts are .a files that get included whole into the resulting staticlib
 			// so reuse that here for our Rust staticlibs because we don't have individual object files for
 			// these.
 			deps.WholeStaticLibsFromPrebuilts = append(deps.WholeStaticLibsFromPrebuilts, generatedLib)
 		}
-
 	}
 
-	fileName := ctx.ModuleName() + staticLibraryExtension
+	fileName := library.getLibName(ctx) + staticLibraryExtension
 	outputFile := android.PathForModuleOut(ctx, fileName)
 	builderFlags := flagsToBuilderFlags(flags)
 
@@ -1288,6 +1308,12 @@ func (library *libraryDecorator) linkShared(ctx ModuleContext,
 		}
 	}
 
+	if ctx.isLFIVariation() || ctx.isLFIEnabled() {
+		// Technically it could be, but the android security team has decided we only want it
+		// on static libraries.
+		ctx.ModuleErrorf("LFI cannot be enabled on a shared library")
+	}
+
 	objs.sAbiDumpFiles = append(objs.sAbiDumpFiles, deps.StaticLibObjs.sAbiDumpFiles...)
 	objs.sAbiDumpFiles = append(objs.sAbiDumpFiles, deps.WholeStaticLibObjs.sAbiDumpFiles...)
 	library.linkSAbiDumpFiles(ctx, deps, objs, fileName, finalOutputFile)
@@ -1341,12 +1367,14 @@ func AddStubDependencyProviders(ctx android.BaseModuleContext) []SharedStubLibra
 			if !ok {
 				continue
 			}
-			flagInfo, _ := android.OtherModuleProvider(ctx, stub, FlagExporterInfoProvider)
-			if _, ok = android.OtherModuleProvider(ctx, stub, CcInfoProvider); !ok {
-				panic(fmt.Errorf("stub is not a cc module %s", stub))
+			linkable, ok := android.OtherModuleProvider(ctx, stub, LinkableInfoProvider)
+			if !ok {
+				panic(fmt.Errorf("stub is not a linkable module %s", stub))
 			}
+			flagInfo, _ := android.OtherModuleProvider(ctx, stub, FlagExporterInfoProvider)
+
 			stubsInfo = append(stubsInfo, SharedStubLibrary{
-				Version:           android.OtherModuleProviderOrDefault(ctx, stub, LinkableInfoProvider).StubsVersion,
+				Version:           linkable.StubsVersion,
 				SharedLibraryInfo: stubInfo,
 				FlagExporterInfo:  flagInfo,
 			})
@@ -1430,7 +1458,7 @@ func (library *libraryDecorator) linkLlndkSAbiDumpFiles(ctx ModuleContext,
 		library.llndkIncludeDirsForAbiCheck(ctx, deps),
 		android.OptionalPathForModuleSrc(ctx, library.Properties.Llndk.Symbol_file),
 		append([]string{"*_PLATFORM", "*_PRIVATE"}, excludeSymbolVersions...),
-		append([]string{"platform-only"}, excludeSymbolTags...),
+		append([]string{"platform-only", "draft"}, excludeSymbolTags...),
 		[]string{"llndk"}, sdkVersionForVendorApiLevel, false /* commonGlobalIncludes */)
 }
 
@@ -1443,7 +1471,7 @@ func (library *libraryDecorator) linkApexSAbiDumpFiles(ctx ModuleContext,
 		library.exportedIncludeDirsForAbiCheck(ctx),
 		android.OptionalPathForModuleSrc(ctx, library.Properties.Stubs.Symbol_file),
 		append([]string{"*_PLATFORM", "*_PRIVATE"}, excludeSymbolVersions...),
-		append([]string{"platform-only"}, excludeSymbolTags...),
+		append([]string{"platform-only", "draft"}, excludeSymbolTags...),
 		[]string{"apex", "systemapi"}, sdkVersion, requiresGlobalIncludes(ctx))
 }
 
@@ -1779,6 +1807,18 @@ func (library *libraryDecorator) link(ctx ModuleContext,
 	library.reexportDeps(deps.ReexportedDeps...)
 	library.addExportedGeneratedHeaders(deps.ReexportedGeneratedHeaders...)
 
+	for _, lfiDep := range ctx.GetDirectDepsProxyWithTag(LFIDepTag) {
+		lfiInfo, ok := android.OtherModuleProvider(ctx, lfiDep, lfiInfoProvider)
+		if !ok {
+			ctx.ModuleErrorf("Expected lfi dep %s(%s) to provide lfi info", ctx.OtherModuleName(lfiDep), ctx.OtherModuleSubDir(lfiDep))
+			continue
+		}
+		if lfiInfo.includeDir != nil {
+			library.reexportDirs(lfiInfo.includeDir)
+			library.reexportDeps(lfiInfo.header)
+		}
+	}
+
 	if library.static() && len(deps.ReexportedRustRlibDeps) > 0 {
 		library.reexportRustStaticDeps(deps.ReexportedRustRlibDeps...)
 	}
@@ -1928,7 +1968,7 @@ func (library *libraryDecorator) install(ctx ModuleContext, file android.Path) {
 		installPath := getUnversionedLibraryInstallPath(ctx).Join(ctx, file.Base())
 
 		ctx.Build(pctx, android.BuildParams{
-			Rule:        android.Cp,
+			Rule:        android.CpRule,
 			Description: "install " + installPath.Base(),
 			Output:      installPath,
 			Input:       file,
@@ -2248,7 +2288,7 @@ func reuseStaticLibrary(ctx android.BottomUpMutatorContext, shared *Module) {
 // on whether the module can be built as a static library or a shared library.
 type linkageTransitionMutator struct{}
 
-func (linkageTransitionMutator) Split(ctx android.BaseModuleContext) []string {
+func (linkageTransitionMutator) split(ctx android.BaseModuleContext) []string {
 	ccPrebuilt := false
 	if m, ok := ctx.Module().(*Module); ok && m.linker != nil {
 		_, ccPrebuilt = m.linker.(prebuiltLibraryInterface)
@@ -2295,6 +2335,63 @@ func (linkageTransitionMutator) Split(ctx android.BaseModuleContext) []string {
 	return []string{""}
 }
 
+var denylist = []string{
+	"libsqlite", // TODO (b/448182248): This seems to cause a circular dependency. Fix and remove this.
+}
+
+func prebuiltOrSourceWithPrebuilt(ctx android.BaseModuleContext) bool {
+	if p := android.GetEmbeddedPrebuilt(ctx.Module()); p != nil {
+		return true
+	}
+	sourceWithPrebuilt := false
+	// Source with prebuilt (TODO b/448182248): Handle source modules with prebuilts
+	ctx.VisitDirectDepsProxyWithTag(android.PrebuiltDepTag, func(m android.ModuleProxy) {
+		sourceWithPrebuilt = true
+	})
+	return sourceWithPrebuilt
+}
+
+func (l linkageTransitionMutator) splitAll(ctx android.BaseModuleContext) bool {
+	if _, isLinkable := ctx.Module().(LinkableInterface); !isLinkable {
+		return true
+	}
+	// Prebuilt (TODO: b/448182248) Handle prebuilts
+	if prebuiltOrSourceWithPrebuilt(ctx) {
+		return true
+	}
+	if android.InList(ctx.ModuleName(), denylist) {
+		return true
+	}
+	if c, ok := ctx.Module().(*Module); ok && c.HasStubsVariants() {
+		return true
+	}
+	// Soong benchmark builds
+	if ctx.Config().IsEnvTrue("SOONG_SPLIT_OPT_IN_VARIANTS_ON_DEMAND") {
+		return false
+	}
+	// Otherwise use build flags
+	return !ctx.Config().GetBuildFlagBool("RELEASE_SOONG_LINK_VARIANT_ON_DEMAND")
+}
+
+func (l linkageTransitionMutator) Split(ctx android.BaseModuleContext) []string {
+	allSplits := l.split(ctx)
+	if !l.splitAll(ctx) {
+		return allSplits[0:1]
+	} else {
+		return allSplits
+	}
+	return nil
+}
+
+func (l linkageTransitionMutator) SplitOnDemand(ctx android.BaseModuleContext) []string {
+	allSplits := l.split(ctx)
+	if len(allSplits) <= 1 || l.splitAll(ctx) {
+		return nil
+	} else {
+		return allSplits[1:]
+	}
+}
+
 func (linkageTransitionMutator) OutgoingTransition(ctx android.OutgoingTransitionContext, sourceVariation string) string {
 	if ctx.DepTag() == android.PrebuiltDepTag {
 		return sourceVariation
@@ -2320,9 +2417,7 @@ func (linkageTransitionMutator) IncomingTransition(ctx android.IncomingTransitio
 		return ""
 	} else if library, ok := ctx.Module().(LinkableInterface); ok && library.CcLibraryInterface() {
 		isLLNDK := false
-		if m, ok := ctx.Module().(*Module); ok {
-			isLLNDK = m.IsLlndk()
-		}
+		isLLNDK = library.IsLlndk()
 		buildStatic := library.BuildStaticVariant() && !isLLNDK
 		buildShared := library.BuildSharedVariant()
 		if library.BuildRlibVariant() && !buildStatic && (incomingVariation == "static" || incomingVariation == "") {
@@ -2457,20 +2552,64 @@ func setStubsVersions(mctx android.BaseModuleContext, module VersionedLinkableIn
 // (which is unnamed) and zero or more stubs variants.
 type versionTransitionMutator struct{}
 
-func (versionTransitionMutator) Split(ctx android.BaseModuleContext) []string {
-	if ctx.Os() != android.Android {
+func (v versionTransitionMutator) split(ctx android.BaseModuleContext) []string {
+	if ctx.Os() != android.Android || ctx.Target().LFI {
 		return []string{""}
 	}
 	if m, ok := ctx.Module().(VersionedLinkableInterface); ok {
 		if m.CcLibraryInterface() && canBeVersionVariant(m) {
 			setStubsVersions(ctx, m)
-			return append(slices.Clone(m.VersionedInterface().AllStubsVersions()), "")
+			if v.splitAll(ctx) {
+				// The empty impl variant appears last to support inter-variant deps.
+				return append(slices.Clone(m.VersionedInterface().AllStubsVersions()), "")
+			} else {
+				// The empty impl variant is the primary variant.
+				// The version variants will be created on demand.
+				return append([]string{""}, slices.Clone(m.VersionedInterface().AllStubsVersions())...)
+			}
 		} else if m.SplitPerApiLevel() && m.IsSdkVariant() {
 			return perApiVersionVariations(ctx, m.MinSdkVersion(ctx))
 		}
 	}
 
 	return []string{""}
+}
+
+func (v versionTransitionMutator) splitAll(ctx android.BaseModuleContext) bool {
+	// Prebuilt (TODO: b/448182248) Handle prebuilts
+	if prebuiltOrSourceWithPrebuilt(ctx) {
+		return true
+	}
+	if ctx.Module().SplitAllVariants() ||
+		ctx.Config().AllowMissingDependencies() ||
+		ctx.Config().KatiEnabled() ||
+		ctx.Config().IsEnvTrue("SOONG_SPLIT_ALL_VARIANTS") ||
+		ctx.Config().IsEnvTrue("RUN_BUILD_TESTS") {
+		// blueprint's transition.go keeps the frontloaded variant creation when ctx.SplitAllVariants is true.
+		// soong's android/transition.go also concatenates the SplitOnDemand values to Split values when
+		// android.Module's split_all_variants is true.
+		// (TODO: b/448182248): Dedupe this.
+		return true
+	}
+	return !ctx.Config().GetBuildFlagBool("RELEASE_SOONG_VERSION_VARIANT_ON_DEMAND")
+}
+
+func (v versionTransitionMutator) Split(ctx android.BaseModuleContext) []string {
+	allSplits := v.split(ctx)
+	if !v.splitAll(ctx) {
+		return allSplits[0:1]
+	} else {
+		return allSplits
+	}
+}
+
+func (v versionTransitionMutator) SplitOnDemand(ctx android.BaseModuleContext) []string {
+	allSplits := v.split(ctx)
+	if len(allSplits) <= 1 || v.splitAll(ctx) {
+		return nil
+	} else {
+		return allSplits[1:]
+	}
 }
 
 func (versionTransitionMutator) OutgoingTransition(ctx android.OutgoingTransitionContext, sourceVariation string) string {
@@ -2481,7 +2620,7 @@ func (versionTransitionMutator) OutgoingTransition(ctx android.OutgoingTransitio
 }
 
 func (versionTransitionMutator) IncomingTransition(ctx android.IncomingTransitionContext, incomingVariation string) string {
-	if ctx.Os() != android.Android {
+	if ctx.Os() != android.Android || ctx.Target().LFI {
 		return ""
 	}
 	m, ok := ctx.Module().(VersionedLinkableInterface)
@@ -2509,7 +2648,7 @@ func (versionTransitionMutator) IncomingTransition(ctx android.IncomingTransitio
 
 func (versionTransitionMutator) Mutate(ctx android.BottomUpMutatorContext, variation string) {
 	// Optimization: return early if this module can't be affected.
-	if ctx.Os() != android.Android {
+	if ctx.Os() != android.Android || ctx.Target().LFI {
 		return
 	}
 
@@ -2571,7 +2710,7 @@ func maybeInjectBoringSSLHash(ctx android.ModuleContext, outputFile android.Modu
 		hashedOutputfile := outputFile
 		outputFile = android.PathForModuleOut(ctx, "unhashed", fileName)
 
-		rule := android.NewRuleBuilder(pctx, ctx)
+		rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 		rule.Command().
 			BuiltTool("bssl_inject_hash").
 			FlagWithInput("-in-object ", outputFile).

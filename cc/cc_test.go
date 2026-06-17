@@ -55,6 +55,10 @@ func (t *testApexTransitionMutator) Split(ctx android.BaseModuleContext) []strin
 	return []string{apexVariationName}
 }
 
+func (t *testApexTransitionMutator) SplitOnDemand(ctx android.BaseModuleContext) []string {
+	return nil
+}
+
 func (t *testApexTransitionMutator) OutgoingTransition(ctx android.OutgoingTransitionContext, sourceVariation string) string {
 	return sourceVariation
 }
@@ -155,6 +159,7 @@ func TestVendorSrc(t *testing.T) {
 					srcs: ["bar.c"],
 				},
 			},
+			split_all_variants: true,
 		}
 	`)
 
@@ -213,48 +218,58 @@ func TestInstallPartition(t *testing.T) {
 	ctx := prepareForCcTest.RunTestWithBp(t, `
 		cc_library {
 			name: "libsystem",
+			split_all_variants: true,
 		}
 		cc_library {
 			name: "libsystem_ext",
 			system_ext_specific: true,
+			split_all_variants: true,
 		}
 		cc_library {
 			name: "libproduct",
 			product_specific: true,
+			split_all_variants: true,
 		}
 		cc_library {
 			name: "libvendor",
 			vendor: true,
+			split_all_variants: true,
 		}
 		cc_library {
 			name: "libodm",
 			device_specific: true,
+			split_all_variants: true,
 		}
 		cc_library {
 			name: "liball_available",
 			vendor_available: true,
 			product_available: true,
+			split_all_variants: true,
 		}
 		cc_library {
 			name: "libsystem_ext_all_available",
 			system_ext_specific: true,
 			vendor_available: true,
 			product_available: true,
+			split_all_variants: true,
 		}
 		cc_library {
 			name: "liball_available_odm",
 			odm_available: true,
 			product_available: true,
+			split_all_variants: true,
 		}
 		cc_library {
 			name: "libproduct_vendoravailable",
 			product_specific: true,
 			vendor_available: true,
+			split_all_variants: true,
 		}
 		cc_library {
 			name: "libproduct_odmavailable",
 			product_specific: true,
 			odm_available: true,
+			split_all_variants: true,
 		}
 	`).TestContext
 
@@ -438,6 +453,7 @@ func TestTestLibraryTestSuites(t *testing.T) {
 				"suite_2",
 			],
 			gtest: false,
+			split_all_variants: true,
 		}
 	`
 
@@ -944,6 +960,7 @@ func TestLlndkLibrary(t *testing.T) {
 			symbol_file: "libllndk.map.txt",
 		},
 		export_include_dirs: ["include"],
+		split_all_variants: true,
 	}
 
 	cc_prebuilt_library_shared {
@@ -963,6 +980,7 @@ func TestLlndkLibrary(t *testing.T) {
 		},
 		header_libs: ["libexternal_headers"],
 		export_header_lib_headers: ["libexternal_headers"],
+		split_all_variants: true,
 	}
 	cc_library_headers {
 		name: "libexternal_headers",
@@ -988,6 +1006,7 @@ func TestLlndkLibrary(t *testing.T) {
 			override_export_include_dirs: ["include_llndk"],
 		},
 		export_include_dirs: ["include"],
+		split_all_variants: true,
 	}
 
 	cc_library {
@@ -999,6 +1018,7 @@ func TestLlndkLibrary(t *testing.T) {
 		},
 		export_include_dirs: ["include"],
 		export_system_include_dirs: ["include_system"],
+		split_all_variants: true,
 	}
 	`)
 	actual := result.ModuleVariantsForTests("libllndk")
@@ -1123,6 +1143,7 @@ const runtimeLibAndroidBp = `
 		no_libcrt : true,
 		nocrt : true,
 		system_shared_libs : [],
+		split_all_variants: true,
 	}
 	cc_library {
 		name: "libvendor_available2",
@@ -1136,6 +1157,7 @@ const runtimeLibAndroidBp = `
 		no_libcrt : true,
 		nocrt : true,
 		system_shared_libs : [],
+		split_all_variants: true,
 	}
 	cc_library {
 		name: "libproduct_vendor",
@@ -1151,6 +1173,7 @@ const runtimeLibAndroidBp = `
 		no_libcrt : true,
 		nocrt : true,
 		system_shared_libs : [],
+		split_all_variants: true,
 	}
 	cc_library {
 		name: "libvendor1",
@@ -1166,6 +1189,7 @@ const runtimeLibAndroidBp = `
 		no_libcrt : true,
 		nocrt : true,
 		system_shared_libs : [],
+		split_all_variants: true,
 	}
 	cc_library {
 		name: "libproduct_available1",
@@ -1174,6 +1198,7 @@ const runtimeLibAndroidBp = `
 		no_libcrt : true,
 		nocrt : true,
 		system_shared_libs : [],
+		split_all_variants: true,
 	}
 	cc_library {
 		name: "libproduct1",
@@ -1189,6 +1214,7 @@ const runtimeLibAndroidBp = `
 		no_libcrt : true,
 		nocrt : true,
 		system_shared_libs : [],
+		split_all_variants: true,
 	}
 `
 
@@ -1262,6 +1288,7 @@ const staticLibAndroidBp = `
 	cc_library {
 		name: "lib2",
 		static_libs: ["lib1"],
+		split_all_variants: true,
 	}
 `
 
@@ -1383,6 +1410,7 @@ func TestRecovery(t *testing.T) {
 			name: "libHalInRecovery",
 			recovery_available: true,
 			vendor: true,
+			split_all_variants: true,
 		}
 	`)
 
@@ -1903,6 +1931,7 @@ func TestDefaults(t *testing.T) {
 		cc_library {
 			name: "libboth",
 			defaults: ["defaults"],
+			split_all_variants: true,
 		}
 
 		cc_binary {
@@ -2255,6 +2284,7 @@ func TestAidlFlagsWithMinSdkVersion(t *testing.T) {
 					name: "libfoo",
 					stl: "none",
 					srcs: ["a/Foo.aidl"],
+					split_all_variants: true,
 					`+tc.sdkVersion+`
 				}
 			`)
@@ -2452,6 +2482,7 @@ func TestIncludeDirsExporting(t *testing.T) {
 			export_system_include_dirs: ["bar/system"],
 			generated_headers: ["genrule_bar"],
 			export_generated_headers: ["genrule_bar"],
+			split_all_variants: true,
 		}
 		`)
 		foo := ctx.ModuleForTests(t, "libfoo", "android_arm64_armv8-a_shared").Module()
@@ -2486,6 +2517,7 @@ func TestIncludeDirsExporting(t *testing.T) {
 			export_system_include_dirs: ["foo/system"],
 			generated_headers: ["genrule_foo"],
 			export_generated_headers: ["genrule_foo"],
+			split_all_variants: true,
 		}
 
 		cc_library {
@@ -2496,6 +2528,7 @@ func TestIncludeDirsExporting(t *testing.T) {
 			export_system_include_dirs: ["bar/system"],
 			generated_headers: ["genrule_bar"],
 			export_generated_headers: ["genrule_bar"],
+			split_all_variants: true,
 		}
 		`)
 		foo := ctx.ModuleForTests(t, "libfoo", "android_arm64_armv8-a_shared").Module()
@@ -2845,6 +2878,7 @@ func TestIncludeDirectoryOrdering(t *testing.T) {
 			},
 			stl: "libc++",
 			sdk_version: "minimum",
+			split_all_variants: true,
 		}
 
 		cc_library_headers {
@@ -3127,7 +3161,8 @@ func TestImageVariants(t *testing.T) {
 		srcs: ["binfoo.cc"],
 		vendor_available: true,
 		product_available: true,
-		shared_libs: ["libbar"]
+		shared_libs: ["libbar"],
+		split_all_variants: true,
 	}
 	cc_library {
 		name: "libbar",
@@ -3164,6 +3199,7 @@ func TestVendorOrProductVariantUsesPlatformSdkVersionAsDefault(t *testing.T) {
 			srcs: ["libfoo.cc"],
 			vendor_available: true,
 			product_available: true,
+			split_all_variants: true,
 		}
 
 		cc_library {
@@ -3172,6 +3208,7 @@ func TestVendorOrProductVariantUsesPlatformSdkVersionAsDefault(t *testing.T) {
 			vendor_available: true,
 			product_available: true,
 			min_sdk_version: "29",
+			split_all_variants: true,
 		}
 	`
 
@@ -3195,12 +3232,14 @@ func TestClangVerify(t *testing.T) {
 		cc_library {
 			name: "lib_no_clang_verify",
 			srcs: ["libnocv.cc"],
+			split_all_variants: true,
 		}
 
 		cc_library {
 			name: "lib_clang_verify",
 			srcs: ["libcv.cc"],
 			clang_verify: true,
+			split_all_variants: true,
 		}
 	`)
 

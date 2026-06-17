@@ -30,6 +30,7 @@ func TestRustProtobuf3(t *testing.T) {
 			source_stem: "buf",
 			shared_libs: ["libfoo_shared"],
 			static_libs: ["libfoo_static"],
+			split_all_variants: true,
 		}
 		cc_library_shared {
 			name: "libfoo_shared",
@@ -49,7 +50,7 @@ func TestRustProtobuf3(t *testing.T) {
 	// Make sure the correct plugin is being used.
 	librust_proto_out := ctx.ModuleForTests(t, "librust_proto", "android_arm64_armv8-a_source").Output("buf.rs")
 	cmd := librust_proto_out.RuleParams.Command
-	if w := "protoc-gen-rust"; !strings.Contains(cmd, w) {
+	if w := "protoc-gen-rs"; !strings.Contains(cmd, w) {
 		t.Errorf("expected %q in %q", w, cmd)
 	}
 
@@ -127,6 +128,7 @@ func TestRustGrpc(t *testing.T) {
 			grpc_protos: ["foo.proto", "proto.proto"],
 			crate_name: "rust_grpcio",
 			source_stem: "buf",
+			split_all_variants: true,
 		}
 	`)
 

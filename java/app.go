@@ -33,19 +33,31 @@ import (
 	"android/soong/tradefed"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 func init() {
 	RegisterAppBuildComponents(android.InitRegistrationContext)
 	pctx.HostBinToolVariable("ModifyAllowlistCmd", "modify_permissions_allowlist")
+	pctx.HostBinToolVariable("ModifyPreinstallAllowlistCmd", "modify_preinstall_allowlist")
 }
 
 var (
 	modifyAllowlist = pctx.AndroidStaticRule("modifyAllowlist",
 		blueprint.RuleParams{
-			Command:     "${ModifyAllowlistCmd} $in $packageName $out",
-			CommandDeps: []string{"${ModifyAllowlistCmd}"},
+			Command:         "${ModifyAllowlistCmd} $in $packageName $out",
+			CommandDeps:     []string{"${ModifyAllowlistCmd}"},
+			SandboxDisabled: true,
+		}, "packageName")
+
+	modifyPreinstallAllowlist = pctx.AndroidStaticRule("modifyPreinstallAllowlist",
+		blueprint.RuleParams{
+			Command:         "${ModifyPreinstallAllowlistCmd} $in $packageName $out",
+			CommandDeps:     []string{"${ModifyPreinstallAllowlistCmd}"},
+			SandboxDisabled: true,
 		}, "packageName")
 )
 
+// @auto-generate: gob
 type FlagsPackages struct {
 	// Paths to the aconfig dump output text files that are consumed by aapt2
 	AconfigTextFiles android.Paths
@@ -62,6 +74,7 @@ func RegisterAppBuildComponents(ctx android.RegistrationContext) {
 	ctx.RegisterModuleType("override_android_test", OverrideAndroidTestModuleFactory)
 }
 
+// @auto-generate: gob
 type AppInfo struct {
 	// Updatable is set to the value of the updatable property
 	Updatable bool
@@ -82,6 +95,7 @@ type AppInfo struct {
 	JacocoInfo                    JacocoInfo
 	Certificate                   Certificate
 	PrivAppAllowlist              android.OptionalPath
+	PreinstallAllowlist           android.OptionalPath
 	OverriddenManifestPackageName *string
 	ApkCertsFile                  android.Path
 	JniLibs                       []jniLib
@@ -103,6 +117,11 @@ type appProperties struct {
 	// If set, create package-export.apk, which other packages can
 	// use to get PRODUCT-agnostic resource data like IDs and type definitions.
 	Export_package_resources *bool
+
+	// If set, aapt2 will emit a file containing a list of resource type names and their ID
+	// mappings, which can be used by `--stable-ids` flag in `aapt2 link` command to assign
+	// fixed IDs for resources. The output file will be named res-ids.txt.
+	Emit_res_ids *bool
 
 	// Specifies that this app should be installed to the priv-app directory,
 	// where the system will grant it additional privileges not available to
@@ -163,6 +182,9 @@ type appProperties struct {
 
 	// Specifies the file that contains the allowlist for this app.
 	Privapp_allowlist *string `android:"path"`
+
+	// Specifies the file that contains the preinstall allowlist for this app. To be used by apps in apexes.
+	Preinstall_allowlist *string `android:"path"`
 
 	// If set, create an RRO package which contains only resources having PRODUCT_CHARACTERISTICS
 	// and install the RRO package to /product partition, instead of passing --product argument
@@ -235,9 +257,9 @@ type AndroidApp struct {
 
 	android.ApexBundleDepsInfo
 
-	javaApiUsedByOutputFile android.ModuleOutPath
-
 	privAppAllowlist android.OptionalPath
+
+	preinstallAllowlist android.OptionalPath
 
 	requiredModuleNames []string
 }
@@ -246,7 +268,7 @@ func (a *AndroidApp) IsInstallable() bool {
 	return Bool(a.properties.Installable)
 }
 
-func (a *AndroidApp) ResourcesNodeDepSet() depset.DepSet[*resourcesNode] {
+func (a *AndroidApp) ResourcesNodeDepSet() depset.DepSet[resourcesNode] {
 	return a.aapt.resourcesNodesDepSet
 }
 
@@ -266,8 +288,13 @@ func (a *AndroidApp) PrivAppAllowlist() android.OptionalPath {
 	return a.privAppAllowlist
 }
 
+func (a *AndroidApp) PreinstallAllowlist() android.OptionalPath {
+	return a.preinstallAllowlist
+}
+
 var _ AndroidLibraryDependency = (*AndroidApp)(nil)
 
+// @auto-generate: gob
 type Certificate struct {
 	Pem, Key  android.Path
 	presigned bool
@@ -344,12 +371,24 @@ func (a *AndroidApp) DepsMutator(ctx android.BottomUpMutatorContext) {
 	for _, aconfig_declaration := range a.aaptProperties.Flags_packages {
 		ctx.AddDependency(ctx.Module(), aconfigDeclarationTag, aconfig_declaration)
 	}
+
+	// Only require APEX symbol tools if we are doing a full tree build,
+	// or if this app is explicitly requested in an unbundled build.
+	if !ctx.Config().UnbundledBuild() || slices.Contains(ctx.Config().UnbundledBuildApps(), a.Name()) {
+		ctx.AddHostToolDependencies("gen_apex_symbols", "dexdeps")
+	}
 }
 
 func (a *AndroidApp) OverridablePropertiesDepsMutator(ctx android.BottomUpMutatorContext) {
 	cert := android.SrcIsModule(a.getCertString(ctx))
 	if cert != "" {
 		ctx.AddDependency(ctx.Module(), certificateTag, cert)
+	}
+
+	if preinstallAllowlist := a.appProperties.Preinstall_allowlist; preinstallAllowlist != nil {
+		if moduleName := android.SrcIsModule(*preinstallAllowlist); moduleName != "" {
+			ctx.AddDependency(ctx.Module(), nil, moduleName)
+		}
 	}
 
 	if a.appProperties.Privapp_allowlist != nil && !Bool(a.appProperties.Privileged) {
@@ -410,8 +449,15 @@ func (a *AndroidTestHelperApp) GenerateAndroidBuildActions(ctx android.ModuleCon
 		}
 		a.aapt.manifestValues.applicationId = *applicationId
 	}
+
+	if Bool(a.appTestHelperAppProperties.Enable_static_aconfig_pb) {
+		addStaticAconfigProto(ctx, &a.extraResources)
+	}
 	a.generateAndroidBuildActions(ctx)
-	android.SetProvider(ctx, android.TestOnlyProviderKey, android.TestModuleInformation{
+	if ctx.Failed() {
+		return
+	}
+	ctx.SetTestModuleInfo(&android.TestModuleInformation{
 		TestOnly: true,
 	})
 	appInfo := &AppInfo{
@@ -477,6 +523,9 @@ func (a *AndroidApp) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	a.checkAppSdkVersions(ctx)
 	a.checkEmbedJnis(ctx)
 	a.generateAndroidBuildActions(ctx)
+	if ctx.Failed() {
+		return
+	}
 	a.generateJavaUsedByApex(ctx)
 
 	var embeddedJniLibs []android.Path
@@ -506,13 +555,13 @@ func (a *AndroidApp) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	a.requiredModuleNames = a.getRequiredModuleNames(ctx)
 
 	if a.dexer.proguardDictionary.Valid() {
-		android.SetProvider(ctx, ProguardProvider, ProguardInfo{
+		android.SetProvider(ctx, ProguardProvider, ProguardInfos{{
 			ModuleName:         android.ModuleNameWithPossibleOverride(ctx),
 			Class:              "APPS",
 			ProguardDictionary: a.dexer.proguardDictionary.Path(),
 			ProguardUsageZip:   a.dexer.proguardUsageZip.Path(),
 			ClassesJar:         a.implementationAndResourcesJar,
-		})
+		}})
 	}
 }
 
@@ -739,7 +788,7 @@ func (a *AndroidApp) aaptBuildActions(ctx android.ModuleContext) {
 	}
 
 	// Use non final ids if we are doing optimized shrinking and are using R8.
-	nonFinalIds := a.dexProperties.optimizedResourceShrinkingEnabled(ctx) && a.dexer.effectiveOptimizeEnabled(ctx)
+	nonFinalIds := a.dexer.optimizedResourceShrinkingEnabled(ctx) && a.dexer.effectiveOptimizeEnabled(ctx)
 
 	aconfigTextFilePaths := getAconfigFilePaths(ctx)
 
@@ -750,6 +799,7 @@ func (a *AndroidApp) aaptBuildActions(ctx android.ModuleContext) {
 			excludedLibs:                   a.usesLibraryProperties.Exclude_uses_libs,
 			enforceDefaultTargetSdkVersion: a.enforceDefaultTargetSdkVersion(),
 			forceNonFinalResourceIDs:       nonFinalIds,
+			emitResIds:                     Bool(a.appProperties.Emit_res_ids),
 			extraLinkFlags:                 aaptLinkFlags,
 			aconfigTextFiles:               aconfigTextFilePaths,
 			usesLibrary:                    &a.usesLibrary,
@@ -757,7 +807,7 @@ func (a *AndroidApp) aaptBuildActions(ctx android.ModuleContext) {
 	)
 
 	// apps manifests are handled by aapt, don't let Module see them
-	a.properties.Manifest = nil
+	a.properties.Manifest = proptools.Configurable[string]{}
 
 	android.SetProvider(ctx, FlagsPackagesProvider, FlagsPackages{
 		AconfigTextFiles: aconfigTextFilePaths,
@@ -766,18 +816,23 @@ func (a *AndroidApp) aaptBuildActions(ctx android.ModuleContext) {
 
 func (a *AndroidApp) proguardBuildActions(ctx android.ModuleContext) {
 	var staticLibProguardFlagFiles android.Paths
+	var includedStaticLibProguardFlagFiles android.Paths
 	ctx.VisitDirectDepsProxy(func(m android.ModuleProxy) {
 		depProguardInfo, _ := android.OtherModuleProvider(ctx, m, ProguardSpecInfoProvider)
 		staticLibProguardFlagFiles = append(staticLibProguardFlagFiles, depProguardInfo.UnconditionallyExportedProguardFlags.ToList()...)
+		includedStaticLibProguardFlagFiles = append(includedStaticLibProguardFlagFiles, depProguardInfo.IncludedUnconditionallyExportedProguardFlags.ToList()...)
 		if ctx.OtherModuleDependencyTag(m) == staticLibTag {
 			staticLibProguardFlagFiles = append(staticLibProguardFlagFiles, depProguardInfo.ProguardFlagsFiles.ToList()...)
+			includedStaticLibProguardFlagFiles = append(includedStaticLibProguardFlagFiles, depProguardInfo.IncludedProguardFlagsFiles.ToList()...)
 		}
 	})
 
 	staticLibProguardFlagFiles = android.FirstUniquePaths(staticLibProguardFlagFiles)
+	includedStaticLibProguardFlagFiles = android.FirstUniquePaths(includedStaticLibProguardFlagFiles)
 
 	a.Module.extraProguardFlagsFiles = append(a.Module.extraProguardFlagsFiles, staticLibProguardFlagFiles...)
-	if !(a.dexProperties.optimizedResourceShrinkingEnabled(ctx)) {
+	a.Module.extraIncludedProguardFlagsFiles = append(a.Module.extraIncludedProguardFlagsFiles, includedStaticLibProguardFlagFiles...)
+	if !(a.dexer.optimizedResourceShrinkingEnabled(ctx)) {
 		// When using the optimized shrinking the R8 enqueuer will traverse the xml files that become
 		// live for code references and (transitively) mark these as live.
 		// In this case we explicitly don't wan't the aapt2 generated keep files (which would keep the now
@@ -816,7 +871,7 @@ func (a *AndroidApp) dexBuildActions(ctx android.ModuleContext) (android.Path, a
 
 	javaInfo := &JavaInfo{}
 	if ctx.ModuleName() != "framework-res" {
-		if a.dexProperties.resourceShrinkingEnabled(ctx) {
+		if a.dexer.resourceShrinkingEnabled(ctx) {
 			protoFile := android.PathForModuleOut(ctx, packageResources.Base()+".proto.apk")
 			aapt2Convert(ctx, protoFile, packageResources, "proto")
 			a.dexer.resourcesInput = android.OptionalPathForPath(protoFile)
@@ -836,7 +891,7 @@ func (a *AndroidApp) dexBuildActions(ctx android.ModuleContext) (android.Path, a
 		}
 
 		javaInfo = a.Module.compile(ctx)
-		if a.dexProperties.resourceShrinkingEnabled(ctx) {
+		if a.dexer.resourceShrinkingEnabled(ctx) {
 			binaryResources := android.PathForModuleOut(ctx, packageResources.Base()+".binary.out.apk")
 			aapt2Convert(ctx, binaryResources, a.dexer.resourcesOutput.Path(), "binary")
 			packageResources = binaryResources
@@ -976,6 +1031,36 @@ func (a *AndroidApp) createPrivappAllowlist(ctx android.ModuleContext) android.P
 	return outPath
 }
 
+func (a *AndroidApp) createPreinstallAllowlist(ctx android.ModuleContext) android.Path {
+	if a.appProperties.Preinstall_allowlist == nil {
+		return nil
+	}
+
+	isOverrideApp := a.GetOverriddenBy() != ""
+	if !isOverrideApp {
+		// if this is not an override, we don't need to rewrite the existing preinstall allowlist
+		return android.PathForModuleSrc(ctx, *a.appProperties.Preinstall_allowlist)
+	}
+
+	packageNameProp := a.overridableAppProperties.Package_name.Get(ctx)
+	if packageNameProp.IsEmpty() {
+		ctx.PropertyErrorf("preinstall_allowlist", "package_name must be set to use preinstall_allowlist")
+	}
+
+	packageName := packageNameProp.Get()
+	fileName := "preinstall_allowlist_" + packageName + ".xml"
+	outPath := android.PathForModuleOut(ctx, fileName)
+	ctx.Build(pctx, android.BuildParams{
+		Rule:   modifyPreinstallAllowlist,
+		Input:  android.PathForModuleSrc(ctx, *a.appProperties.Preinstall_allowlist),
+		Output: outPath,
+		Args: map[string]string{
+			"packageName": packageName,
+		},
+	})
+	return outPath
+}
+
 func (a *AndroidApp) generateAndroidBuildActions(ctx android.ModuleContext) {
 	a.jacocoInfo.Class = "APPS"
 
@@ -1078,7 +1163,8 @@ func (a *AndroidApp) generateAndroidBuildActions(ctx android.ModuleContext) {
 	}
 	rotationMinSdkVersion := String(a.overridableAppProperties.RotationMinSdkVersion)
 
-	CreateAndSignAppPackage(ctx, packageFile, packageResources, jniJarFile, dexJarFile, certificates, apkDeps, v4SignatureFile, lineageFile, rotationMinSdkVersion)
+	CreateAndSignAppPackage(ctx, packageFile, packageResources, jniJarFile, dexJarFile, certificates, apkDeps,
+		v4SignatureFile, lineageFile, rotationMinSdkVersion, a.MinSdkVersion(ctx))
 	a.outputFile = packageFile
 	if v4SigningRequested {
 		a.extraOutputFiles = append(a.extraOutputFiles, v4SignatureFile)
@@ -1098,7 +1184,7 @@ func (a *AndroidApp) generateAndroidBuildActions(ctx android.ModuleContext) {
 			},
 			ctx.ModuleProxy(),
 		)
-		builder := android.NewRuleBuilder(pctx, ctx)
+		builder := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 		builder.Command().Text("cp").
 			Input(noticeFile).
 			Output(noticeAssetPath)
@@ -1111,7 +1197,8 @@ func (a *AndroidApp) generateAndroidBuildActions(ctx android.ModuleContext) {
 		if v4SigningRequested {
 			v4SignatureFile = android.PathForModuleOut(ctx, a.installApkName+"_"+split.suffix+".apk.idsig")
 		}
-		CreateAndSignAppPackage(ctx, packageFile, split.path, nil, nil, certificates, apkDeps, v4SignatureFile, lineageFile, rotationMinSdkVersion)
+		CreateAndSignAppPackage(ctx, packageFile, split.path, nil, nil, certificates, apkDeps,
+			v4SignatureFile, lineageFile, rotationMinSdkVersion, a.MinSdkVersion(ctx))
 		a.extraOutputFiles = append(a.extraOutputFiles, packageFile)
 		if v4SigningRequested {
 			a.extraOutputFiles = append(a.extraOutputFiles, v4SignatureFile)
@@ -1131,6 +1218,12 @@ func (a *AndroidApp) generateAndroidBuildActions(ctx android.ModuleContext) {
 		complianceMetadataInfo.AddBuiltFiles(a.privAppAllowlist.Path().String())
 	}
 
+	preinstallAllowlist := a.createPreinstallAllowlist(ctx)
+	if preinstallAllowlist != nil {
+		a.preinstallAllowlist = android.OptionalPathForPath(preinstallAllowlist)
+		complianceMetadataInfo.AddBuiltFiles(a.preinstallAllowlist.Path().String())
+	}
+
 	// Install the app package.
 	shouldInstallAppPackage := (Bool(a.Module.properties.Installable) || ctx.Host()) && apexInfo.IsForPlatform()
 	if shouldInstallAppPackage {
@@ -1138,6 +1231,11 @@ func (a *AndroidApp) generateAndroidBuildActions(ctx android.ModuleContext) {
 			allowlistInstallPath := android.PathForModuleInstall(ctx, "etc", "permissions")
 			allowlistInstallFilename := a.installApkName + ".xml"
 			ctx.InstallFile(allowlistInstallPath, allowlistInstallFilename, a.privAppAllowlist.Path())
+		}
+		if a.preinstallAllowlist.Valid() {
+			allowlistInstallPath := android.PathForModuleInstall(ctx, "etc", "sysconfig")
+			allowlistInstallFilename := a.installApkName + "_preinstall_allowlist.xml"
+			ctx.InstallFile(allowlistInstallPath, allowlistInstallFilename, a.preinstallAllowlist.Path())
 		}
 
 		var extraInstalledPaths android.InstallPaths
@@ -1181,11 +1279,6 @@ func (a *AndroidApp) generateAndroidBuildActions(ctx android.ModuleContext) {
 		android.SetProvider(ctx, JavaInfoProvider, javaInfo)
 	}
 
-	android.SetProvider(ctx, android.ApexBundleDepsDataProvider, android.ApexBundleDepsData{
-		FlatListPath: a.FlatListPath(),
-		Updatable:    a.Updatable(),
-	})
-
 	moduleInfoJSON := ctx.ModuleInfoJSON()
 	moduleInfoJSON.Class = []string{"APPS"}
 	if !a.embeddedJniLibs {
@@ -1220,10 +1313,13 @@ func (a *AndroidApp) setOutputFiles(ctx android.ModuleContext) {
 	if a.rJar != nil {
 		ctx.SetOutputFiles([]android.Path{a.rJar}, ".aapt.jar")
 	}
+	if a.aapt.resIdsFile.Valid() {
+		ctx.SetOutputFiles([]android.Path{a.aapt.resIdsFile.Path()}, ".res-ids.txt")
+	}
 	ctx.SetOutputFiles([]android.Path{a.outputFile}, ".apk")
 	ctx.SetOutputFiles([]android.Path{a.exportPackage}, ".export-package.apk")
 	ctx.SetOutputFiles([]android.Path{a.aapt.manifestPath}, ".manifest.xml")
-	setOutputFiles(ctx, a.Library.Module)
+	setOutputFiles(ctx, &a.Library.Module)
 }
 
 type appDepsInterface interface {
@@ -1332,7 +1428,7 @@ func collectJniDeps(ctx android.ModuleContext,
 						coverageFile:   dep.CoverageOutputFile,
 						unstrippedFile: dep.UnstrippedOutputFile,
 						partition:      dep.Partition,
-						installPaths:   android.OtherModuleProviderOrDefault(ctx, module, android.InstallFilesProvider).InstallFiles,
+						installPaths:   android.GetInstallFilesCommon(commonInfo).InstallFiles,
 					})
 				} else if ctx.Config().AllowMissingDependencies() {
 					ctx.AddMissingDependencies([]string{otherName})
@@ -1433,6 +1529,7 @@ func (m *AndroidApp) GetDepInSameApexChecker() android.DepInSameApexChecker {
 	return AppDepInSameApexChecker{}
 }
 
+// @auto-generate: gob
 type AppDepInSameApexChecker struct {
 	android.BaseDepInSameApexChecker
 }
@@ -1472,8 +1569,7 @@ func AndroidAppFactory() android.Module {
 	module := &AndroidApp{}
 
 	module.Module.dexProperties.Optimize.EnabledByDefault = true
-	module.Module.dexProperties.Optimize.Shrink = proptools.NewSimpleConfigurable(true)
-	module.Module.dexProperties.Optimize.Proguard_compatibility = proptools.BoolPtr(false)
+	module.Module.dexProperties.Optimize.ShrinkByDefault = true
 
 	module.Module.properties.Instrument = true
 	module.Module.properties.Supports_static_instrumentation = true
@@ -1495,6 +1591,12 @@ func AndroidAppFactory() android.Module {
 
 	android.AddLoadHook(module, func(ctx android.LoadHookContext) {
 		a := ctx.Module().(*AndroidApp)
+
+		// Normally this would be set alongisde other `Optimize` properties in the outer factory
+		// init, but we require a context to fetch the build flag value. It could also go in
+		// GenerateAndroidBuildActions, but that is shared with other app variants (e.g., test apps)
+		// where we don't necessarily want this default applied.
+		a.dexProperties.Optimize.OptimizeByDefault = ctx.Config().EnableAppOptimizationByDefault()
 
 		characteristics := ctx.Config().ProductAAPTCharacteristics()
 		if characteristics == "default" || characteristics == "" {
@@ -1705,7 +1807,15 @@ func (a *AndroidTest) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 		}
 		a.aapt.manifestValues.applicationId = *applicationId
 	}
+
+	if Bool(a.testProperties.Enable_static_aconfig_pb) {
+		addStaticAconfigProto(ctx, &a.extraResources)
+	}
+
 	a.generateAndroidBuildActions(ctx)
+	if ctx.Failed() {
+		return
+	}
 
 	android.SetProvider(ctx, ApkCertInfoProvider, ApkCertInfo{
 		Certificate: a.Certificate(),
@@ -1725,7 +1835,7 @@ func (a *AndroidTest) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 		a.testProperties.Auto_gen_config, configs, a.testProperties.Test_options.Test_runner_options)
 	a.testConfig = a.FixTestConfig(ctx, testConfig)
 	a.extraTestConfigs = android.PathsForModuleSrc(ctx, a.testProperties.Test_options.Extra_test_configs)
-	a.data = android.PathsForModuleSrc(ctx, a.testProperties.Data)
+	a.data = android.PathsForModuleSrc(ctx, a.testProperties.Data.GetOrDefault(ctx, nil))
 	a.data = append(a.data, android.PathsForModuleSrc(ctx, a.testProperties.Device_common_data)...)
 	a.data = append(a.data, android.PathsForModuleSrc(ctx, a.testProperties.Device_first_data)...)
 	a.data = append(a.data, android.PathsForModuleSrc(ctx, a.testProperties.Device_first_prefer32_data)...)
@@ -1769,7 +1879,7 @@ func (a *AndroidTest) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 		MkInclude:               "$(BUILD_SYSTEM)/soong_app_prebuilt.mk",
 		MkAppClass:              "APPS",
 	})
-	android.SetProvider(ctx, android.TestOnlyProviderKey, android.TestModuleInformation{
+	ctx.SetTestModuleInfo(&android.TestModuleInformation{
 		TestOnly:       true,
 		TopLevelTarget: true,
 	})
@@ -1806,7 +1916,7 @@ func (a *AndroidTest) FixTestConfig(ctx android.ModuleContext, testConfig androi
 	}
 
 	fixedConfig := android.PathForModuleOut(ctx, "test_config_fixer", "AndroidTest.xml")
-	rule := android.NewRuleBuilder(pctx, ctx)
+	rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	command := rule.Command().BuiltTool("test_config_fixer").Input(testConfig).Output(fixedConfig)
 	fixNeeded := false
 
@@ -1909,6 +2019,10 @@ type appTestHelperAppProperties struct {
 	Per_testcase_directory *bool
 
 	Manifest_values Manifest_values
+
+	// Whether to include a static aconfig pb as a test resource. If the pb is included and a
+	// flag is read-only, tests read the flag value from the static pb.
+	Enable_static_aconfig_pb *bool
 }
 
 type AndroidTestHelperApp struct {
@@ -1930,7 +2044,6 @@ func AndroidTestHelperAppFactory() android.Module {
 	// TODO(b/192032291): Disable by default after auditing downstream usage.
 	module.Module.dexProperties.Optimize.EnabledByDefault = true
 	module.Module.dexProperties.Optimize.Ignore_library_extends_program = proptools.BoolPtr(true)
-	module.Module.dexProperties.Optimize.Proguard_compatibility = proptools.BoolPtr(false)
 
 	module.Module.properties.Installable = proptools.BoolPtr(true)
 	module.appProperties.Use_embedded_native_libs = proptools.BoolPtr(true)
@@ -1963,6 +2076,7 @@ type AndroidAppCertificateProperties struct {
 	Certificate *string
 }
 
+// @auto-generate: gob
 type AndroidAppCertificateInfo struct {
 	Certificate Certificate
 }
@@ -2026,7 +2140,7 @@ type OverrideAndroidTest struct {
 func (i *OverrideAndroidTest) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	// All the overrides happen in the base module.
 	// TODO(jungjw): Check the base module type.
-	android.SetProvider(ctx, android.TestOnlyProviderKey, android.TestModuleInformation{
+	ctx.SetTestModuleInfo(&android.TestModuleInformation{
 		TestOnly:       true,
 		TopLevelTarget: true,
 	})
@@ -2119,11 +2233,11 @@ func (u *usesLibrary) deps(ctx android.BottomUpMutatorContext, addCompatDeps boo
 	}
 }
 
-func (u *usesLibrary) depsFromLibs(ctx android.BottomUpMutatorContext, libDeps []android.Module) {
+func (u *usesLibrary) depsFromLibs(ctx android.BottomUpMutatorContext, libDeps []android.ModuleProxy) {
 	// For library dependencies that are component libraries (like stubs), add the implementation
 	// as a dependency (dexpreopt needs to be against the implementation library, not stubs).
 	for _, dep := range libDeps {
-		if dep != nil {
+		if !dep.IsNil() {
 			if component, ok := android.OtherModuleProvider(ctx, dep, SdkLibraryComponentDependencyInfoProvider); ok {
 				if lib := component.OptionalSdkLibraryImplementation; lib != nil {
 					// Add library as optional if it's one of the optional compatibility libs or it's
@@ -2238,7 +2352,7 @@ func (u *usesLibrary) verifyUsesLibraries(ctx android.ModuleContext, inputFile a
 		return inputFile
 	}
 
-	rule := android.NewRuleBuilder(pctx, ctx)
+	rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	cmd := rule.Command().BuiltTool("manifest_check").
 		Flag("--enforce-uses-libraries").
 		Input(inputFile).
@@ -2303,6 +2417,7 @@ type androidApp interface {
 	Certificate() Certificate
 	BaseModuleName() string
 	PrivAppAllowlist() android.OptionalPath
+	PreinstallAllowlist() android.OptionalPath
 }
 
 var _ androidApp = (*AndroidApp)(nil)
@@ -2316,8 +2431,10 @@ func setCommonAppInfo(appInfo *AppInfo, m androidApp) {
 	appInfo.JacocoInfo = m.JacocoInfo()
 	appInfo.Certificate = m.Certificate()
 	appInfo.PrivAppAllowlist = m.PrivAppAllowlist()
+	appInfo.PreinstallAllowlist = m.PreinstallAllowlist()
 }
 
+// @auto-generate: gob
 type BundleInfo struct {
 	Bundle android.Path
 }

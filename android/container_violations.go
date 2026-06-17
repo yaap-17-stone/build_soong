@@ -824,6 +824,10 @@ var ContainerDependencyViolationAllowlist = map[string][]string{
 		"framework", // cts -> unstable
 	},
 
+	"CtsTelephonySatelliteTestCases": {
+		"framework", // cts -> unstable
+	},
+
 	"CtsTelephonyTestCases": {
 		"framework", // cts -> unstable
 	},
@@ -1136,6 +1140,10 @@ var ContainerDependencyViolationAllowlist = map[string][]string{
 		"framework", // cts -> unstable
 	},
 
+	"MockPointingUiApp": {
+		"framework", // cts -> unstable
+	},
+
 	"MockSatelliteGatewayServiceApp": {
 		"framework", // cts -> unstable
 	},
@@ -1176,6 +1184,7 @@ var ContainerDependencyViolationAllowlist = map[string][]string{
 		"net-utils-device-common-struct-base", // apex [com.android.tethering] -> system
 	},
 
+	// TODO(b/468297164): Delete once tot_cronet_NetHttpCoverageTests is hooked on presubmit.
 	"NetHttpCoverageTests": {
 		"framework", // cts -> unstable
 	},
@@ -1462,6 +1471,10 @@ var ContainerDependencyViolationAllowlist = map[string][]string{
 	},
 
 	"ThreadNetworkTrelDisabledTests": {
+		"framework", // cts -> unstable
+	},
+
+	"tot_cronet_NetHttpCoverageTests": {
 		"framework", // cts -> unstable
 	},
 

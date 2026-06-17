@@ -23,6 +23,9 @@ import (
 	"github.com/google/blueprint"
 )
 
+//go:generate go run ../../../blueprint/gobtools/codegen
+
+// @auto-generate: gob
 type ReleaseConfigContributionsProviderData struct {
 	ContributionDir   android.SourcePath
 	ContributionPaths android.Paths
@@ -97,6 +100,7 @@ func ReleaseConfigFactory() android.Module {
 	return module
 }
 
+// @auto-generate: gob
 type ReleaseConfigProviderData struct {
 	BuildFlagsProductJson   android.Path
 	BuildFlagsSystemJson    android.Path
@@ -121,7 +125,7 @@ func (c *cpData) AddCopy(ctx android.ModuleContext, product, prefix, suffix stri
 	c.inFiles = append(c.inFiles, i)
 	c.outFiles = append(c.outFiles, o)
 	ctx.Build(pctx, android.BuildParams{
-		Rule:   android.CpIfChanged,
+		Rule:   android.CpIfChangedRule,
 		Input:  i,
 		Output: o,
 	})
@@ -194,6 +198,7 @@ func AllReleaseConfigsFactory() android.Module {
 	return module
 }
 
+// @auto-generate: gob
 type AllReleaseConfigsProviderData struct {
 	AllReleaseConfigsDb        android.Path
 	AllReleaseConfigsTextproto android.Path

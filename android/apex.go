@@ -24,6 +24,8 @@ import (
 	"github.com/google/blueprint"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 var (
 	// This is the sdk version when APEX was first introduced
 	SdkVersion_Android10 = UncheckedFinalApiLevel(29)
@@ -34,6 +36,7 @@ var (
 // when multiple apex variants are merged for deduping (see mergeApexVariations), this holds the
 // information about the apexBundles that are merged together.
 // Accessible via `ctx.Provider(android.ApexInfoProvider).(android.ApexInfo)`
+// @auto-generate: gob
 type ApexInfo struct {
 	// Name of the apex variation that this module (i.e. the apex variant of the module) is
 	// mutated into, or "" for a platform (i.e. non-APEX) variant.
@@ -103,6 +106,7 @@ func (a ApexInfo) Minimize() ApexInfo {
 	return info
 }
 
+// @auto-generate: gob
 type ApexAvailableInfo struct {
 	// Returns the apex names that this module is available for
 	ApexAvailableFor []string
@@ -142,6 +146,7 @@ func (i ApexInfo) Equal(other any) bool {
 }
 
 // ApexBundleInfo contains information about the dependencies of an apex
+// @auto-generate: gob
 type ApexBundleInfo struct {
 }
 
@@ -149,6 +154,7 @@ var ApexBundleInfoProvider = blueprint.NewMutatorProvider[ApexBundleInfo]("apex_
 
 var PlatformAvailabilityInfoProvider = blueprint.NewMutatorProvider[PlatformAvailabilityInfo]("mark_platform_availability")
 
+// @auto-generate: gob
 type PlatformAvailabilityInfo struct {
 	NotAvailableToPlatform bool
 }
@@ -180,6 +186,7 @@ type DepInSameApexChecker interface {
 // DepInSameApexInfo is a provider that wraps around a DepInSameApexChecker that can be
 // used to check if a dependency belongs to the same apex as the module when walking
 // through the dependencies of a module.
+// @auto-generate: gob
 type DepInSameApexInfo struct {
 	Checker DepInSameApexChecker
 }
@@ -291,6 +298,7 @@ type ApexProperties struct {
 	// "//apex_available:anyapex" is a pseudo APEX name that matches to any APEX.
 	// "//apex_available:platform" refers to non-APEX partitions like "system.img".
 	// Prefix pattern (com.foo.*) can be used to match with any APEX name with the prefix(com.foo.).
+	// Wildcard ? can be used to match exactly one path segment (e.g. com.?.foo matches com.bar.foo). This may be combined with prefix pattern for complex routing (e.g., com.?.foo.*).
 	// Default is ["//apex_available:platform"].
 	Apex_available []string
 
@@ -350,6 +358,11 @@ func (m *ApexModuleBase) ApexTransitionMutatorIncoming(ctx IncomingTransitionCon
 	}
 
 	if info.ApexVariationName == "" {
+		return ApexInfo{}
+	}
+
+	// Required modules should be installed regardless of whether it belongs to the apex or not.
+	if ctx.DepTag() == RequiredDepTag {
 		return ApexInfo{}
 	}
 
@@ -468,6 +481,7 @@ func (m *ApexModuleBase) GetDepInSameApexChecker() DepInSameApexChecker {
 	return BaseDepInSameApexChecker{}
 }
 
+// @auto-generate: gob
 type BaseDepInSameApexChecker struct{}
 
 func (m BaseDepInSameApexChecker) OutgoingDepIsInSameApex(tag blueprint.DependencyTag) bool {
@@ -508,12 +522,36 @@ func CheckAvailableForApex(what string, apex_available []string) bool {
 		if apex_name == AvailableToAnyApex && what != AvailableToPlatform {
 			return true
 		}
-		// prefix match.
-		if strings.HasSuffix(apex_name, ".*") && strings.HasPrefix(what, strings.TrimSuffix(apex_name, "*")) {
+		// wildcards match.
+		if strings.ContainsAny(apex_name, "*?") && MatchApex(apex_name, what) {
 			return true
 		}
 	}
 	return false
+}
+
+// Checks if the name matches the pattern.
+// The pattern can contain '?' which matches any single segment,
+// and '*' at the end which matches any suffix.
+func MatchApex(pattern, name string) bool {
+	patternParts := strings.Split(pattern, ".")
+	nameParts := strings.Split(name, ".")
+
+	if len(nameParts) < len(patternParts) {
+		return false
+	}
+
+	for i, part := range patternParts {
+		if part == "*" {
+			return true
+		}
+		if part == "?" || part == nameParts[i] {
+			continue
+		}
+		return false
+	}
+
+	return len(patternParts) == len(nameParts)
 }
 
 // Implements ApexModule
@@ -532,6 +570,15 @@ func (m *ApexModuleBase) checkApexAvailableProperty(mctx BaseModuleContext) {
 		if n == AvailableToPlatform || n == AvailableToAnyApex {
 			continue
 		}
+		// Optional segment should always have ? surrounded by dots(.) if in the middle.
+		if start := strings.IndexByte(n, '?'); start != -1 {
+			for i := start; i < len(n); i++ {
+				if n[i] == '?' && (i > 0 && n[i-1] != '.' || i < len(n)-1 && n[i+1] != '.') {
+					mctx.PropertyErrorf("apex_available", "Wildcard '?' should be surrounded by dot.")
+					break
+				}
+			}
+		}
 		// Prefix pattern should end with .* and has at least two components.
 		if strings.Contains(n, "*") {
 			if !strings.HasSuffix(n, ".*") {
@@ -541,31 +588,14 @@ func (m *ApexModuleBase) checkApexAvailableProperty(mctx BaseModuleContext) {
 				mctx.PropertyErrorf("apex_available", "Wildcard requires two or more components like com.foo.*")
 			}
 			if strings.Count(n, "*") != 1 {
-				mctx.PropertyErrorf("apex_available", "Wildcard is not allowed in the middle.")
+				mctx.PropertyErrorf("apex_available", "Wildcard '*' is not allowed in the middle.")
 			}
 			continue
 		}
-		if !mctx.OtherModuleExists(n) && !mctx.Config().AllowMissingDependencies() {
+		if !strings.Contains(n, "?") && !mctx.OtherModuleExists(n) && !mctx.Config().AllowMissingDependencies() {
 			mctx.PropertyErrorf("apex_available", "%q is not a valid module name", n)
 		}
 	}
-}
-
-// AvailableToSameApexes returns true if the two modules are apex_available to
-// exactly the same set of APEXes (and platform), i.e. if their apex_available
-// properties have the same elements.
-func AvailableToSameApexes(mod1, mod2 ApexModule) bool {
-	mod1ApexAvail := SortedUniqueStrings(mod1.apexModuleBase().ApexProperties.Apex_available)
-	mod2ApexAvail := SortedUniqueStrings(mod2.apexModuleBase().ApexProperties.Apex_available)
-	if len(mod1ApexAvail) != len(mod2ApexAvail) {
-		return false
-	}
-	for i, v := range mod1ApexAvail {
-		if v != mod2ApexAvail[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // UpdateUniqueApexVariationsForDeps sets UniqueApexVariationsForDeps if any dependencies that are
@@ -609,6 +639,7 @@ type ApexModuleDepInfo struct {
 // A map of a dependency name to its ApexModuleDepInfo
 type DepNameToDepInfoMap map[string]ApexModuleDepInfo
 
+// @auto-generate: gob
 type ApexBundleDepsInfo struct {
 	flatListPath Path
 	fullListPath Path
@@ -620,14 +651,8 @@ type ApexBundleDepsInfoIntf interface {
 	FullListPath() Path
 }
 
-type ApexBundleDepsData struct {
-	Updatable    bool
-	FlatListPath Path
-}
-
-var ApexBundleDepsDataProvider = blueprint.NewProvider[ApexBundleDepsData]()
-
 // ApexBundleTypeInfo is used to identify the module is a apexBundle module.
+// @auto-generate: gob
 type ApexBundleTypeInfo struct {
 	Pem Path
 	Key Path
@@ -777,6 +802,7 @@ func MinSdkVersionFromValue(ctx MinSdkVersionFromValueContext, value string) Api
 var ApexExportsInfoProvider = blueprint.NewProvider[ApexExportsInfo]()
 
 // ApexExportsInfo contains information about the artifacts provided by apexes to dexpreopt and hiddenapi
+// @auto-generate: gob
 type ApexExportsInfo struct {
 	// Canonical name of this APEX. Used to determine the path to the activated APEX on
 	// device (/apex/<apex_name>)
@@ -792,6 +818,7 @@ type ApexExportsInfo struct {
 var PrebuiltJsonInfoProvider = blueprint.NewProvider[PrebuiltJsonInfo]()
 
 // contents of prebuilt_info.json
+// @auto-generate: gob
 type PrebuiltJsonInfo struct {
 	// Name of the apex, without the prebuilt_ prefix
 	Name string

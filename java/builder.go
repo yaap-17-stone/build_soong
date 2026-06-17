@@ -34,13 +34,19 @@ import (
 var (
 	pctx = android.NewPackageContext("android/soong/java")
 
+	mergeZips       = android.MergeZips
+	zipSync         = android.ZipSync
+	rm              = android.Rm
+	mkdir           = android.Mkdir
+	touch           = android.Touch
+	splitZips       = pctx.HostTool("split_zips")
+	extractApks     = pctx.HostTool("extract_apks")
+	packageCheckCmd = pctx.HostTool("package_check")
+
 	// Splits jars into a number of jars, with equal files in each output jar.
 	splitSrcJars = pctx.AndroidStaticRule("javac-split-srcJars",
 		blueprint.RuleParams{
-			Command: `${config.SplitZipCmd} -i "$rspFile" -f "*.java" $out`,
-			CommandDeps: []string{
-				"${config.SplitZipCmd}",
-			},
+			Command2:       blueprint.NewCommand(splitZips, ` -i "$rspFile" -f "*.java" $out`),
 			Restat:         true,
 			Rspfile:        "$rspFile",
 			RspfileContent: "$in",
@@ -50,17 +56,19 @@ var (
 	// Unzips java src files from supplied jars into a directory provided.
 	extractSrcJars = pctx.AndroidStaticRule("javac-extract-srcJars",
 		blueprint.RuleParams{
-			Command: `rm -rf "$extractDir" && mkdir -p "$extractDir" && ${config.ZipSyncCmd} -d "$extractDir" -l "$out" -f "*.java" $jars`,
-			CommandDeps: []string{
-				"${config.ZipSyncCmd}",
-			},
+			Command2: blueprint.NewCommand(
+				rm, ` -rf "$extractDir" && `,
+				mkdir, ` -p "$extractDir" && `,
+				zipSync, ` -d "$extractDir" -l "$out" -f "*.java" $jars`),
 		}, "extractDir", "jars",
 	)
 
 	// Removes all outputs of inc-javac rule
 	javacIncClean = pctx.AndroidStaticRule("javac-inc-partialcompileclean",
 		blueprint.RuleParams{
-			Command: `rm -rf "${srcJarDir}" "${outDir}" "${annoDir}" "${annoSrcJar}" "${builtOut}"`,
+			Command2: blueprint.NewCommand(
+				android.Rm, ` -rf "${srcJarDir}" "${outDir}" "${annoDir}" "${annoSrcJar}" "${builtOut}"`,
+			),
 		}, "srcJarDir", "outDir", "annoDir", "annoSrcJar", "builtOut",
 	)
 
@@ -81,16 +89,18 @@ var (
 				`cat $srcJarList >> $out.rsp && ` +
 				`if [ -s $genAnnoSrcJarList ] ; then ` +
 				`echo >> $out.rsp && cat $genAnnoSrcJarList >> $out.rsp; fi && ` +
+				`. ${config.UsePartialCompileFile} && ` +
 				`${config.IncrementalJavacInputCmd} ` +
-				`--srcs $out.rsp --classDir $outDir --deps $javacDeps --javacTarget $out --srcDepsProto $out.proto --localHeaderJars $localHeaderJars --crossModuleJarList $crossModuleJars && ` +
+				`--srcs $out.rsp --classDir $outDir --deps $javacDeps --javacTarget $out --srcDepsProto $out.proto ` +
+				`--localHeaderJars $localHeaderJars --crossModuleJarList $crossModuleJars --tool ${config.DependencyMapperJavacCmd} && ` +
 				`mkdir -p "$outDir" && ` +
+				`cat $out.rem.rsp | xargs rm -f && ` +
 				`(if [ -s $out.inc.rsp ] ; then ` +
 				`${config.SoongJavacWrapper} $javaTemplate${config.JavacCmd} ` +
 				`${config.JavacHeapFlags} ${config.JavacVmFlags} ${config.CommonJdkFlags} ` +
 				`$processorpath $processor $javacFlags $bootClasspath $classpath ` +
 				`-source $javaVersion -target $javaVersion ` +
 				`-d $outDir -s $annoDir @$out.inc.rsp ; fi ) && ` +
-				`cat $out.rem.rsp | xargs rm -f && ` +
 				`$annoSrcJarTemplate${config.SoongZipCmd} -jar -o $annoSrcJar.tmp -C $annoDir -D $annoDir && ` +
 				`$zipTemplate${config.SoongZipCmd} -jar -o $out.tmp -C $outDir -D $outDir && ` +
 				`if ! cmp -s "$out.tmp" "$out"; then mv "$out.tmp" "$out"; fi && ` +
@@ -115,6 +125,7 @@ var (
 			Restat:           true,
 			Rspfile:          "$out.rsp",
 			RspfileContent:   "$in",
+			SandboxDisabled:  true,
 		}, map[string]*remoteexec.REParams{
 			"$javaTemplate": &remoteexec.REParams{
 				Labels:       map[string]string{"type": "compile", "lang": "java", "compiler": "javac"},
@@ -173,6 +184,7 @@ var (
 			Restat:           true,
 			Rspfile:          "$out.rsp",
 			RspfileContent:   "$in",
+			SandboxDisabled:  true,
 		}, map[string]*remoteexec.REParams{
 			"$javaTemplate": &remoteexec.REParams{
 				Labels:       map[string]string{"type": "compile", "lang": "java", "compiler": "javac"},
@@ -232,7 +244,7 @@ var (
 				`--add-exports=jdk.internal.opt/jdk.internal.opt=ALL-UNNAMED ` +
 				`-jar ${config.JavaKytheExtractorJar} ` +
 				`${config.JavacHeapFlags} ${config.CommonJdkFlags} ` +
-				`$processorpath $processor $javacFlags $bootClasspath $classpath ` +
+				`$processorpath $processor $javacFlags $bootClasspath ` +
 				`-source $javaVersion -target $javaVersion ` +
 				`-d $outDir -s $annoDir @$out.rsp @$srcJarDir/list)`,
 			CommandDeps: []string{
@@ -243,7 +255,8 @@ var (
 			},
 			CommandOrderOnly: []string{"${config.SoongJavacWrapper}"},
 			Rspfile:          "$out.rsp",
-			RspfileContent:   "$in",
+			RspfileContent:   "$classpath $in",
+			SandboxDisabled:  true,
 		},
 		"javacFlags", "bootClasspath", "classpath", "processorpath", "processor", "srcJars", "srcJarDir",
 		"outDir", "annoDir", "javaVersion")
@@ -251,13 +264,13 @@ var (
 	extractMatchingApks = pctx.StaticRule(
 		"extractMatchingApks",
 		blueprint.RuleParams{
-			Command: `rm -rf "$out" && ` +
-				`${config.ExtractApksCmd} -o "${out}" -zip "${zip}" -allow-prereleased=${allow-prereleased} ` +
-				`-sdk-version=${sdk-version} -skip-sdk-check=${skip-sdk-check} -abis=${abis} ` +
-				`--screen-densities=${screen-densities} --stem=${stem} ` +
-				`-apkcerts=${apkcerts} -partition=${partition} ` +
-				`${in}`,
-			CommandDeps: []string{"${config.ExtractApksCmd}"},
+			Command2: blueprint.NewCommand(
+				rm, ` -rf "$out" && `,
+				extractApks, ` -o "${out}" -zip "${zip}" -allow-prereleased=${allow-prereleased} `,
+				`-sdk-version=${sdk-version} -skip-sdk-check=${skip-sdk-check} -abis=${abis} `,
+				`--screen-densities=${screen-densities} --stem=${stem} `,
+				`-apkcerts=${apkcerts} -partition=${partition} `,
+				`${in}`),
 		},
 		"abis", "allow-prereleased", "screen-densities", "sdk-version", "skip-sdk-check", "stem", "apkcerts", "partition", "zip")
 
@@ -272,9 +285,10 @@ var (
 				"${config.TurbineJar}",
 				"${config.JavaCmd}",
 			},
-			Rspfile:        "$out.rsp",
-			RspfileContent: "$in_newline",
-			Restat:         true,
+			Rspfile:         "$out.rsp",
+			RspfileContent:  "$in_newline",
+			Restat:          true,
+			SandboxDisabled: true,
 		},
 		&remoteexec.REParams{Labels: map[string]string{"type": "tool", "name": "turbine"},
 			ExecStrategy:    "${config.RETurbineExecStrategy}",
@@ -288,25 +302,27 @@ var (
 
 	jar, jarRE = pctx.RemoteStaticRules("jar",
 		blueprint.RuleParams{
-			Command:        `$reTemplate${config.SoongZipCmd} -jar -o $out @$out.rsp`,
-			CommandDeps:    []string{"${config.SoongZipCmd}"},
-			Rspfile:        "$out.rsp",
-			RspfileContent: "$jarArgs",
+			Command:         `$reTemplate${config.SoongZipCmd} -jar -o $out @$out.rsp`,
+			CommandDeps:     []string{"${config.SoongZipCmd}"},
+			Rspfile:         "$out.rsp",
+			RspfileContent:  "$jarArgs",
+			SandboxDisabled: true,
 		},
 		&remoteexec.REParams{
 			ExecStrategy: "${config.REJarExecStrategy}",
 			Inputs:       []string{"${config.SoongZipCmd}", "${out}.rsp"},
-			RSPFiles:     []string{"${out}.rsp"},
+			RSPFiles:     []string{"$rspFiles"},
 			OutputFiles:  []string{"$out"},
 			Platform:     map[string]string{remoteexec.PoolKey: "${config.REJavaPool}"},
-		}, []string{"jarArgs"}, nil)
+		}, []string{"jarArgs"}, []string{"rspFiles"})
 
 	zip, zipRE = pctx.RemoteStaticRules("zip",
 		blueprint.RuleParams{
-			Command:        `${config.SoongZipCmd} -o $out @$out.rsp`,
-			CommandDeps:    []string{"${config.SoongZipCmd}"},
-			Rspfile:        "$out.rsp",
-			RspfileContent: "$jarArgs",
+			Command:         `${config.SoongZipCmd} -o $out @$out.rsp`,
+			CommandDeps:     []string{"${config.SoongZipCmd}"},
+			Rspfile:         "$out.rsp",
+			RspfileContent:  "$jarArgs",
+			SandboxDisabled: true,
 		},
 		&remoteexec.REParams{
 			ExecStrategy: "${config.REZipExecStrategy}",
@@ -318,14 +334,13 @@ var (
 
 	combineJar = pctx.AndroidStaticRule("combineJar",
 		blueprint.RuleParams{
-			Command:     `${config.MergeZipsCmd} --ignore-duplicates -j $jarArgs $out $in`,
-			CommandDeps: []string{"${config.MergeZipsCmd}"},
+			Command2: blueprint.NewCommand(mergeZips, ` --ignore-duplicates -j $jarArgs $out $in`),
 		},
 		"jarArgs")
 	combineJarRsp = pctx.AndroidStaticRule("combineJarRsp",
 		blueprint.RuleParams{
-			Command:        `${config.MergeZipsCmd} --ignore-duplicates -j $jarArgs $out @$out.rsp`,
-			CommandDeps:    []string{"${config.MergeZipsCmd}"},
+			Command2: blueprint.NewCommand(
+				mergeZips, ` --ignore-duplicates -j $jarArgs $out @$out.rsp`),
 			Rspfile:        "$out.rsp",
 			RspfileContent: "$in",
 		},
@@ -333,8 +348,9 @@ var (
 
 	extractR8Rules = pctx.AndroidStaticRule("extractR8Rules",
 		blueprint.RuleParams{
-			Command:     `${config.ExtractR8RulesCmd} --rules-output $out --include-origin-comments $in`,
-			CommandDeps: []string{"${config.ExtractR8RulesCmd}"},
+			Command:         `${config.ExtractR8RulesCmd} --rules-output $out --include-origin-comments $in`,
+			CommandDeps:     []string{"${config.ExtractR8RulesCmd}"},
+			SandboxDisabled: true,
 		})
 
 	jarjar = pctx.AndroidStaticRule("jarjar",
@@ -352,37 +368,42 @@ var (
 				" -jar ${config.JarjarCmd} process $rulesFile $in $out $total_shards $shard_index && " +
 				// Turn a missing output file into a ninja error
 				`[ -e ${out} ] || (echo "Missing output file"; exit 1)`,
-			CommandDeps: []string{"${config.JavaCmd}", "${config.JarjarCmd}", "$rulesFile"},
+			CommandDeps:     []string{"${config.JavaCmd}", "${config.JarjarCmd}", "$rulesFile"},
+			SandboxDisabled: true,
 		},
 		"rulesFile", "total_shards", "shard_index")
 
 	packageCheck = pctx.AndroidStaticRule("packageCheck",
 		blueprint.RuleParams{
-			Command: "rm -f $out && " +
-				"${config.PackageCheckCmd} $in $packages && " +
-				"touch $out",
-			CommandDeps: []string{"${config.PackageCheckCmd}"},
+			Command2: blueprint.NewCommand(
+				rm, " -f $out && ",
+				packageCheckCmd, " $in $packages && ",
+				touch, " $out",
+			),
 		},
 		"packages")
 
 	jetifier = pctx.AndroidStaticRule("jetifier",
 		blueprint.RuleParams{
-			Command:     "${config.JavaCmd}  ${config.JavaVmFlags} -jar ${config.JetifierJar} -l error -o $out -i $in -t epoch",
-			CommandDeps: []string{"${config.JavaCmd}", "${config.JetifierJar}"},
+			Command:         "${config.JavaCmd}  ${config.JavaVmFlags} -jar ${config.JetifierJar} -l error -o $out -i $in -t epoch",
+			CommandDeps:     []string{"${config.JavaCmd}", "${config.JetifierJar}"},
+			SandboxDisabled: true,
 		},
 	)
 
 	ravenizer = pctx.AndroidStaticRule("ravenizer",
 		blueprint.RuleParams{
-			Command:     "rm -f $out && ${ravenizer} --in-jar $in --out-jar $out $ravenizerArgs",
-			CommandDeps: []string{"${ravenizer}"},
+			Command:         "rm -f $out && ${ravenizer} --in-jar $in --out-jar $out $ravenizerArgs",
+			CommandDeps:     []string{"${ravenizer}"},
+			SandboxDisabled: true,
 		},
 		"ravenizerArgs")
 
 	apimapper = pctx.AndroidStaticRule("apimapper",
 		blueprint.RuleParams{
-			Command:     "${apimapper} --in-jar $in --out-jar $out",
-			CommandDeps: []string{"${apimapper}"},
+			Command:         "${apimapper} --in-jar $in --out-jar $out",
+			CommandDeps:     []string{"${apimapper}"},
+			SandboxDisabled: true,
 		},
 	)
 
@@ -393,24 +414,28 @@ var (
 				"else " +
 				"cp -f $in $out; " +
 				"fi",
-			CommandDeps: []string{"${config.ZipAlign}"},
+			CommandDeps:     []string{"${config.ZipAlign}"},
+			SandboxDisabled: true,
 		},
 	)
 
 	convertImplementationJarToHeaderJarRule = pctx.AndroidStaticRule("convertImplementationJarToHeaderJar",
 		blueprint.RuleParams{
-			Command:     `${config.Zip2ZipCmd} -i ${in} -o ${out} -x 'META-INF/services/**/*'`,
-			CommandDeps: []string{"${config.Zip2ZipCmd}"},
+			Command:         `${config.Zip2ZipCmd} -i ${in} -o ${out} -x 'META-INF/services/**/*'`,
+			CommandDeps:     []string{"${config.Zip2ZipCmd}"},
+			SandboxDisabled: true,
 		})
 
 	writeCombinedProguardFlagsFileRule = pctx.AndroidStaticRule("writeCombinedProguardFlagsFileRule",
 		blueprint.RuleParams{
-			Command: `rm -f $out && ` +
-				`for f in $in; do ` +
-				` echo  && ` +
-				` echo "# including $$f" && ` +
-				` cat $$f; ` +
+			Command2: blueprint.NewCommand(
+				android.Rm, ` -f $out && `,
+				`for f in $in; do `,
+				android.Echo, ` && `,
+				android.Echo, ` "# including $$f" && `,
+				android.Cat, ` $$f; `,
 				`done > $out`,
+			),
 		})
 
 	gatherReleasedFlaggedApisRule = pctx.AndroidStaticRule("gatherReleasedFlaggedApisRule",
@@ -419,23 +444,26 @@ var (
 				`--out ${out} ` +
 				`@$out.rsp ` +
 				`${filter_args} `,
-			CommandDeps:    []string{"${aconfig}"},
-			Description:    "aconfig_bool",
-			Rspfile:        "$out.rsp",
-			RspfileContent: "${flags_path}",
+			CommandDeps:     []string{"${aconfig}"},
+			Description:     "aconfig_bool",
+			Rspfile:         "$out.rsp",
+			RspfileContent:  "${flags_path}",
+			SandboxDisabled: true,
 		}, "flags_path", "filter_args")
 
-	generateMetalavaRevertAnnotationsRule = pctx.AndroidStaticRule("generateMetalavaRevertAnnotationsRule",
+	generateMetalavaFlagConfigRule = pctx.AndroidStaticRule("generateMetalavaFlagConfigRule",
 		blueprint.RuleParams{
-			Command:     `${aconfig-to-metalava-flags} ${in} > ${out}`,
-			CommandDeps: []string{"${aconfig-to-metalava-flags}"},
-		})
+			Command:         `${aconfig-to-metalava-flags} ${args} ${in} > ${out}`,
+			CommandDeps:     []string{"${aconfig-to-metalava-flags}"},
+			SandboxDisabled: true,
+		}, "args")
 
 	generateApiXMLRule = pctx.AndroidStaticRule("generateApiXMLRule",
 		blueprint.RuleParams{
-			Command:     `${config.JavaCmd} ${config.JavaVmFlags} -Xmx4g -jar ${config.MetalavaJar} jar-to-jdiff ${in} ${out}`,
-			CommandDeps: []string{"${config.JavaCmd}", "${config.MetalavaJar}"},
-			Description: "Converting API file to XML",
+			Command:         `${config.JavaCmd} ${config.JavaVmFlags} -Xmx4g -jar ${config.MetalavaJar} jar-to-jdiff ${in} ${out}`,
+			CommandDeps:     []string{"${config.JavaCmd}", "${config.MetalavaJar}"},
+			Description:     "Converting API file to XML",
+			SandboxDisabled: true,
 		})
 )
 
@@ -450,7 +478,8 @@ func init() {
 }
 
 type javaBuilderFlags struct {
-	javacFlags string
+	javacFlags     string
+	javacFlagsDeps android.Paths
 
 	// bootClasspath is the list of jars that form the boot classpath (generally the java.* and
 	// android.* classes) for tools that still use it.  javac targeting 1.9 or higher uses
@@ -460,6 +489,9 @@ type javaBuilderFlags struct {
 	// classpath is the list of jars that form the classpath for javac and kotlinc rules.  It
 	// contains header jars for all static and non-static dependencies.
 	classpath classpath
+
+	// directClasspath contains just the direct dependencies (header jars) for strict deps verification.
+	directClasspath classpath
 
 	// dexClasspath is the list of jars that form the classpath for d8 and r8 rules.  It contains
 	// header jars for all non-static dependencies.  Static dependencies have already been
@@ -471,15 +503,18 @@ type javaBuilderFlags struct {
 	// are provided by systemModules.
 	java9Classpath classpath
 
-	processorPath classpath
-	processors    []string
-	systemModules *systemModules
-	aidlFlags     string
-	aidlDeps      android.Paths
-	javaVersion   javaVersion
+	processorPath   classpath
+	processors      []string
+	systemModules   *systemModules
+	aidlFlags       string
+	strictDepsLevel string
+	aidlDeps        android.Paths
+	javaVersion     javaVersion
 
-	errorProneExtraJavacFlags string
-	errorProneProcessorPath   classpath
+	errorProneExtraJavacFlags  string
+	errorProneProcessorPath    classpath
+	javaStrictDepsPluginJars   android.Paths
+	kotlinStrictDepsPluginJars android.Paths
 
 	kotlincFlags                string
 	kotlincPluginFlags          string
@@ -557,6 +592,7 @@ func emitXrefRule(ctx android.ModuleContext, xrefFile android.WritablePath, idx 
 
 	deps = append(deps, classpath...)
 	deps = append(deps, flags.processorPath...)
+	deps = append(deps, flags.javacFlagsDeps...)
 
 	processor := "-proc:none"
 	if len(flags.processors) > 0 {
@@ -568,6 +604,8 @@ func emitXrefRule(ctx android.ModuleContext, xrefFile android.WritablePath, idx 
 		intermediatesDir += strconv.Itoa(idx)
 	}
 
+	classpathArg := classpath.FormJavaClassPath("-classpath")
+
 	ctx.Build(pctx,
 		android.BuildParams{
 			Rule:        kytheExtract,
@@ -578,7 +616,7 @@ func emitXrefRule(ctx android.ModuleContext, xrefFile android.WritablePath, idx 
 			Args: map[string]string{
 				"annoDir":       android.PathForModuleOut(ctx, intermediatesDir, "anno").String(),
 				"bootClasspath": bootClasspath,
-				"classpath":     classpath.FormJavaClassPath("-classpath"),
+				"classpath":     classpathArg,
 				"javacFlags":    flags.javacFlags,
 				"javaVersion":   flags.javaVersion.String(),
 				"outDir":        android.PathForModuleOut(ctx, "javac", "classes.xref").String(),
@@ -643,6 +681,8 @@ func turbineFlags(ctx android.ModuleContext, flags javaBuilderFlags, dir string,
 	} else {
 		rbeInputs = append(rbeInputs, classpath...)
 	}
+
+	implicits = append(implicits, flags.javacFlagsDeps...)
 
 	turbineFlags := "--source_jars " + srcJarArgs + " " + bootClasspathFlags + " --classpath " + classpathFlags
 
@@ -716,6 +756,20 @@ func TurbineApt(ctx android.ModuleContext, outputSrcJar, outputResJar android.Wr
 		Implicits:       implicits,
 		Args:            args,
 	})
+}
+
+func injectStrictDepsFlags(ctx android.ModuleContext, flags javaBuilderFlags, deps android.Paths, rspFile android.WritablePath) (javaBuilderFlags, android.Paths) {
+	// Inject the strict deps plugin into the javac execution
+	flags.processorPath = append(flags.processorPath, flags.javaStrictDepsPluginJars...)
+	deps = append(deps, flags.javaStrictDepsPluginJars...)
+
+	android.WriteFileRule(ctx, rspFile, strings.Join(flags.directClasspath.Strings(), "\n"))
+	deps = append(deps, rspFile)
+	flags.javacFlags += " -Xplugin:\"JavaStrictDeps " + rspFile.String() + " " + flags.strictDepsLevel + "\""
+	flags.javacFlags += " -J--add-exports=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED"
+	flags.javacFlags += " -J--add-exports=jdk.compiler/com.sun.tools.javac.tree=ALL-UNNAMED"
+	flags.javacFlags += " -J--add-exports=jdk.compiler/com.sun.tools.javac.code=ALL-UNNAMED"
+	return flags, deps
 }
 
 // Similar to transformJavaToClasses, with additional tweaks to make java
@@ -835,6 +889,13 @@ func transformJavaToClassesInc(ctx android.ModuleContext, outputFile android.Wri
 		},
 	})
 
+	deps = append(deps, flags.javacFlagsDeps...)
+
+	if flags.strictDepsLevel == "warn" || flags.strictDepsLevel == "error" {
+		rspFile := outputFile.ReplaceExtension(ctx, "strict_deps.rsp")
+		flags, deps = injectStrictDepsFlags(ctx, flags, deps, rspFile)
+	}
+
 	rule := javacInc
 	ctx.Build(pctx, android.BuildParams{
 		Rule:           rule,
@@ -842,7 +903,7 @@ func transformJavaToClassesInc(ctx android.ModuleContext, outputFile android.Wri
 		Output:         outputFile,
 		ImplicitOutput: annoSrcJar,
 		Inputs:         srcFiles,
-		Implicits:      deps,
+		Implicits:      append(deps, ctx.Config().UsePartialCompileFile(ctx)),
 		Args: map[string]string{
 			"javacFlags":        flags.javacFlags,
 			"bootClasspath":     bootClasspath,
@@ -935,6 +996,17 @@ func transformJavaToClasses(ctx android.ModuleContext, outputFile android.Writab
 	deps = append(deps, javacClasspath...)
 	deps = append(deps, flags.processorPath...)
 	deps = append(deps, genAnnoSrcJars...)
+	deps = append(deps, flags.javacFlagsDeps...)
+
+	if flags.strictDepsLevel == "warn" || flags.strictDepsLevel == "error" {
+		var rspFile android.WritablePath
+		if shardIdx >= 0 {
+			rspFile = android.PathForModuleOut(ctx, intermediatesDir, "shard"+strconv.Itoa(shardIdx), "strict_deps.rsp")
+		} else {
+			rspFile = android.PathForModuleOut(ctx, intermediatesDir, "strict_deps.rsp")
+		}
+		flags, deps = injectStrictDepsFlags(ctx, flags, deps, rspFile)
+	}
 
 	processor := "-proc:none"
 	if len(flags.processors) > 0 {
@@ -986,17 +1058,23 @@ func TransformResourcesToJar(ctx android.ModuleContext, outputFile android.Writa
 	jarArgs []string, deps android.Paths) {
 
 	rule := jar
+	args := map[string]string{
+		"jarArgs": strings.Join(proptools.NinjaAndShellEscapeList(jarArgs), " "),
+	}
 	if ctx.Config().UseREWrapper() && ctx.Config().IsEnvTrue("RBE_JAR") {
 		rule = jarRE
+		// Create an RSP file listing all the inputs for RBE.
+		rbeInputs := android.PathForModuleOut(ctx, "rbe_inputs.rsp")
+		android.WriteFileRule(ctx, rbeInputs, strings.Join(deps.Strings(), " "))
+		args["rspFiles"] = rbeInputs.String()
+		deps = append(deps, rbeInputs)
 	}
 	ctx.Build(pctx, android.BuildParams{
 		Rule:        rule,
 		Description: "jar",
 		Output:      outputFile,
 		Implicits:   deps,
-		Args: map[string]string{
-			"jarArgs": strings.Join(proptools.NinjaAndShellEscapeList(jarArgs), " "),
-		},
+		Args:        args,
 	})
 }
 

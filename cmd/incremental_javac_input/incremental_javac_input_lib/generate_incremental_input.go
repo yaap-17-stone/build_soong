@@ -44,7 +44,7 @@ type UsageMap struct {
 	CrossModuleClassDependencies []string
 }
 
-func GenerateIncrementalInput(classDir, srcs, deps, javacTarget, srcDeps, localHeaderJars, crossModuleJarRsp string) (err error) {
+func GenerateIncrementalInput(classDir, srcs, deps, javacTarget, srcDeps, localHeaderJars, crossModuleJarRsp string, tools []string) (err error) {
 	incInputPath := javacTarget + ".inc.rsp"
 	removedClassesPath := javacTarget + ".rem.rsp"
 	inputPcState := javacTarget + ".input.pc_state"
@@ -56,7 +56,6 @@ func GenerateIncrementalInput(classDir, srcs, deps, javacTarget, srcDeps, localH
 	var incAllSources bool
 
 	version := ""
-	tools := []string{}
 	// Read the srcRspFile contents
 	srcList := readRspFile(srcs)
 	// run find_input_delta, save [add + ch] as a []string,  and [del] as another []string
@@ -119,18 +118,26 @@ func GenerateIncrementalInput(classDir, srcs, deps, javacTarget, srcDeps, localH
 		chCM = filterClassFiles(chCM)
 	}
 
-	// use revDepsMap to find all usages, add them to output, alongside [add + ch] files
-	if fileExists(srcDeps) {
-		usageMap, _ := generateUsageMap(srcDeps)
-		// if including all sources, no need to check the usageMap
-		if headersChanged && !incAllSources {
-			incInputList, incAllSources = getUsages(usageMap, incInputList, delF, slices.Concat(addCM, chCM), delCM)
+	// If we are including all sources, there is no point in expanding it further
+	// or to get a removal set.
+	if !incAllSources {
+		// use revDepsMap to find all usages, add them to output, alongside [add + ch] files
+		if fileExists(srcDeps) {
+			usageMap, _ := generateUsageMap(srcDeps)
+			if headersChanged {
+				incInputList, incAllSources = getUsages(usageMap, incInputList, delF, slices.Concat(addCM, chCM), delCM)
+			}
+			// use usageMap to add all classes that were generated from to be re-compiled or removed files.
+			// if all sources are being compiled, everything will anyway be removed.
+			if !incAllSources {
+				classesForRemoval = generateRemovalList(usageMap, incInputList, delF, classDir)
+			}
 		}
-		// use usageMap to add all classes that were generated from removed files.
-		classesForRemoval = generateRemovalList(usageMap, delF, classDir)
 	}
 
 	if incAllSources {
+		// Remove the output class directory to prevent any stale files
+		os.RemoveAll(classDir)
 		incInputList = srcList
 	}
 
@@ -163,11 +170,17 @@ func usePartialCompile() bool {
 // Returns whether to include all src Files in incremental src set
 func getUsages(usageMap map[string]UsageMap, modifiedFiles, deletedFiles, modifiedClasses, deletedClasses []string) ([]string, bool) {
 	usagesSet := make(map[string]bool)
+	delFileSet := make(map[string]bool)
 
 	// First add all the modified files in the output
 	for _, incInput := range modifiedFiles {
 		usagesSet[incInput] = true
 	}
+	// Create a set containing deletedFiles
+	for _, delFile := range deletedFiles {
+		delFileSet[delFile] = true
+	}
+
 	// Add all the usages of modified + deleted files
 	for _, modFile := range slices.Concat(modifiedFiles, deletedFiles, modifiedClasses, deletedClasses) {
 		if um, exists := usageMap[modFile]; exists {
@@ -175,7 +188,10 @@ func getUsages(usageMap map[string]UsageMap, modifiedFiles, deletedFiles, modifi
 				return nil, true
 			}
 			for _, usage := range um.Usages {
-				usagesSet[usage] = true
+				// If a usage was also being deleted, then should skip adding the same.
+				if !delFileSet[usage] {
+					usagesSet[usage] = true
+				}
 			}
 		}
 	}
@@ -187,10 +203,10 @@ func getUsages(usageMap map[string]UsageMap, modifiedFiles, deletedFiles, modifi
 	return usages, false
 }
 
-// Returns the list of class files to be removed, as a result of deleting a source file.
-func generateRemovalList(usageMap map[string]UsageMap, delFiles []string, classesDir string) []string {
+// Returns the list of class files to be removed, as a result of re-compiling or deleting a source file.
+func generateRemovalList(usageMap map[string]UsageMap, modifiedFiles, delFiles []string, classesDir string) []string {
 	var classesForRemoval []string
-	for _, delFile := range delFiles {
+	for _, delFile := range slices.Concat(modifiedFiles, delFiles) {
 		if _, exists := usageMap[delFile]; exists {
 			for _, generatedClass := range usageMap[delFile].GeneratedClasses {
 				classesForRemoval = append(classesForRemoval, filepath.Join(classesDir, generatedClass))
@@ -321,11 +337,15 @@ func flattenChanges(root *fid_lib.FileList) ([]string, []string, []string) {
 	var allChangedFiles []string
 
 	for _, addition := range root.Additions {
-		allAdditions = append(allAdditions, addition)
+		allAdditions = append(allAdditions, addition.Name)
+		recAdd, _, _ := flattenChanges(&addition)
+		allAdditions = append(allAdditions, recAdd...)
 	}
 
 	for _, del := range root.Deletions {
-		allDeletions = append(allDeletions, del)
+		allDeletions = append(allDeletions, del.Name)
+		_, recDel, _ := flattenChanges(&del)
+		allDeletions = append(allDeletions, recDel...)
 	}
 
 	for _, ch := range root.Changes {

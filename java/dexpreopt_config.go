@@ -27,7 +27,7 @@ import (
 func dexpreoptTargets(ctx android.PathContext) []android.Target {
 	var targets []android.Target
 	for _, target := range ctx.Config().Targets[android.Android] {
-		if target.NativeBridge == android.NativeBridgeDisabled {
+		if target.NativeBridge == android.NativeBridgeDisabled && !target.LFI {
 			targets = append(targets, target)
 		}
 	}
@@ -55,6 +55,11 @@ func getImageNames() []string {
 }
 
 func genBootImageConfigRaw(ctx android.PathContext) map[string]*bootImageConfig {
+	mainlineBcpCompilerFilter := "verify"
+	if ctx.Config().GetBuildFlagBool("RELEASE_ART_COMPILE_BCP_APEX_SPEED_PROFILE") {
+		mainlineBcpCompilerFilter = "speed-profile"
+	}
+
 	return ctx.Config().Once(bootImageConfigRawKey, func() interface{} {
 		global := dexpreopt.GetGlobalConfig(ctx)
 
@@ -63,24 +68,19 @@ func genBootImageConfigRaw(ctx android.PathContext) map[string]*bootImageConfig 
 		mainlineBcpModules := global.ApexBootJars
 		frameworkSubdir := "system/framework"
 
-		profileImports := []string{"com.android.art"}
-
 		// ART boot image for testing only. Do not rely on it to make any build-time decision.
 		artCfg := bootImageConfig{
-			name:                  artBootImageName,
-			enabledIfExists:       "art-bootclasspath-fragment",
-			stem:                  bootImageStem,
-			installDir:            "apex/art_boot_images/javalib",
-			modules:               global.TestOnlyArtBootImageJars,
-			preloadedClassesFile:  "art/build/boot/preloaded-classes",
-			compilerFilter:        "speed-profile",
-			singleImage:           false,
-			profileImports:        profileImports,
-			profileProviderModule: "art-bootclasspath-fragment",
+			name:                 artBootImageName,
+			enabledIfExists:      "art-bootclasspath-fragment",
+			stem:                 bootImageStem,
+			installDir:           "apex/art_boot_images/javalib",
+			modules:              global.TestOnlyArtBootImageJars,
+			preloadedClassesFile: "art/build/boot/preloaded-classes",
+			compilerFilter:       "speed-profile",
+			singleImage:          false,
 		}
 
-		// Framework config for the boot image extension.
-		// It includes framework libraries and depends on the ART config.
+		// Framework config for the primary boot image. It includes ART and framework libraries.
 		frameworkCfg := bootImageConfig{
 			name:                 frameworkBootImageName,
 			enabledIfExists:      "platform-bootclasspath",
@@ -90,9 +90,9 @@ func genBootImageConfigRaw(ctx android.PathContext) map[string]*bootImageConfig 
 			preloadedClassesFile: "frameworks/base/config/preloaded-classes",
 			compilerFilter:       "speed-profile",
 			singleImage:          false,
-			profileImports:       profileImports,
 		}
 
+		// Mainline config for the boot image extension.
 		mainlineCfg := bootImageConfig{
 			extends:         &frameworkCfg,
 			name:            mainlineBootImageName,
@@ -100,7 +100,7 @@ func genBootImageConfigRaw(ctx android.PathContext) map[string]*bootImageConfig 
 			stem:            bootImageStem,
 			installDir:      frameworkSubdir,
 			modules:         mainlineBcpModules,
-			compilerFilter:  "verify",
+			compilerFilter:  mainlineBcpCompilerFilter,
 			singleImage:     true,
 		}
 
@@ -197,18 +197,6 @@ func defaultBootImageConfig(ctx android.PathContext) *bootImageConfig {
 
 func mainlineBootImageConfig(ctx android.PathContext) *bootImageConfig {
 	return genBootImageConfigs(ctx)[mainlineBootImageName]
-}
-
-// isProfileProviderApex returns true if this apex provides a boot image profile.
-func isProfileProviderApex(ctx android.PathContext, apexName string) bool {
-	for _, config := range genBootImageConfigs(ctx) {
-		for _, profileImport := range config.profileImports {
-			if profileImport == apexName {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // Returns a list of paths and a list of locations for the boot jars used in dexpreopt (to be

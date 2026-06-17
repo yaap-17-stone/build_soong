@@ -20,6 +20,7 @@ package java
 
 import (
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/google/blueprint"
@@ -34,7 +35,8 @@ var (
 		blueprint.RuleParams{
 			Command: `rm -f $out && $reTemplate${config.JavaCmd} ${config.JavaVmFlags} -Djava.library.path=$$(dirname ${config.SignapkJniLibrary}) ` +
 				`-jar ${config.SignapkCmd} $flags $certificates $in $out`,
-			CommandDeps: []string{"${config.SignapkCmd}", "${config.SignapkJniLibrary}"},
+			CommandDeps:     []string{"${config.SignapkCmd}", "${config.SignapkJniLibrary}"},
+			SandboxDisabled: true,
 		},
 		&remoteexec.REParams{Labels: map[string]string{"type": "tool", "name": "signapk"},
 			ExecStrategy:    "${config.RESignApkExecStrategy}",
@@ -47,12 +49,15 @@ var (
 
 var combineApk = pctx.AndroidStaticRule("combineApk",
 	blueprint.RuleParams{
-		Command:     `${config.MergeZipsCmd} $out $in`,
-		CommandDeps: []string{"${config.MergeZipsCmd}"},
+		Command2: blueprint.NewCommand(
+			android.MergeZips, ` $out $in`,
+		),
 	})
 
 func CreateAndSignAppPackage(ctx android.ModuleContext, outputFile android.WritablePath,
-	packageFile, jniJarFile, dexJarFile android.Path, certificates []Certificate, deps android.Paths, v4SignatureFile android.WritablePath, lineageFile android.Path, rotationMinSdkVersion string) {
+	packageFile, jniJarFile, dexJarFile android.Path, certificates []Certificate, deps android.Paths,
+	v4SignatureFile android.WritablePath, lineageFile android.Path, rotationMinSdkVersion string,
+	minSdkVersion android.ApiLevel) {
 
 	unsignedApkName := strings.TrimSuffix(outputFile.Base(), ".apk") + "-unsigned.apk"
 	unsignedApk := android.PathForModuleOut(ctx, unsignedApkName)
@@ -71,10 +76,13 @@ func CreateAndSignAppPackage(ctx android.ModuleContext, outputFile android.Writa
 		Output:    unsignedApk,
 		Implicits: deps,
 	})
-	SignAppPackage(ctx, outputFile, unsignedApk, certificates, v4SignatureFile, lineageFile, rotationMinSdkVersion)
+	SignAppPackage(ctx, outputFile, unsignedApk, certificates, v4SignatureFile, lineageFile, rotationMinSdkVersion,
+		minSdkVersion)
 }
 
-func SignAppPackage(ctx android.ModuleContext, signedApk android.WritablePath, unsignedApk android.Path, certificates []Certificate, v4SignatureFile android.WritablePath, lineageFile android.Path, rotationMinSdkVersion string) {
+func SignAppPackage(ctx android.ModuleContext, signedApk android.WritablePath, unsignedApk android.Path,
+	certificates []Certificate, v4SignatureFile android.WritablePath, lineageFile android.Path,
+	rotationMinSdkVersion string, minSdkVersion android.ApiLevel) {
 
 	var certificateArgs []string
 	var deps android.Paths
@@ -96,6 +104,10 @@ func SignAppPackage(ctx android.ModuleContext, signedApk android.WritablePath, u
 
 	if rotationMinSdkVersion != "" {
 		flags = append(flags, "--rotation-min-sdk-version", rotationMinSdkVersion)
+	}
+
+	if minSdkVersion.GreaterThanOrEqualTo(android.UncheckedFinalApiLevel(24)) {
+		flags = append(flags, "--disable-v1")
 	}
 
 	rule := Signapk
@@ -120,12 +132,14 @@ func SignAppPackage(ctx android.ModuleContext, signedApk android.WritablePath, u
 
 var buildAAR = pctx.AndroidStaticRule("buildAAR",
 	blueprint.RuleParams{
-		Command: `rm -rf ${outDir} && mkdir -p ${outDir} && ` +
-			`cp ${manifest} ${outDir}/AndroidManifest.xml && ` +
-			`cp ${classesJar} ${outDir}/classes.jar && ` +
-			`cp ${rTxt} ${outDir}/R.txt && ` +
-			`${config.SoongZipCmd} -jar -o $out -C ${outDir} -D ${outDir}`,
-		CommandDeps: []string{"${config.SoongZipCmd}"},
+		Command2: blueprint.NewCommand(
+			android.Rm, ` -rf ${outDir} && `,
+			android.Mkdir, ` -p ${outDir} && `,
+			android.Cp, ` ${manifest} ${outDir}/AndroidManifest.xml && `,
+			android.Cp, ` ${classesJar} ${outDir}/classes.jar && `,
+			android.Cp, ` ${rTxt} ${outDir}/R.txt && `,
+			android.SoongZip, ` -jar -o $out -C ${outDir} -D ${outDir}`,
+		),
 	},
 	"manifest", "classesJar", "rTxt", "outDir")
 
@@ -157,21 +171,24 @@ func BuildAAR(ctx android.ModuleContext, outputFile android.WritablePath,
 
 var buildBundleModule = pctx.AndroidStaticRule("buildBundleModule",
 	blueprint.RuleParams{
-		Command:     `${config.MergeZipsCmd} ${out} ${in}`,
-		CommandDeps: []string{"${config.MergeZipsCmd}"},
+		Command2: blueprint.NewCommand(
+			android.MergeZips, ` ${out} ${in}`,
+		),
 	})
 
 var bundleMungePackage = pctx.AndroidStaticRule("bundleMungePackage",
 	blueprint.RuleParams{
-		Command:     `${config.Zip2ZipCmd} -i ${in} -o ${out} AndroidManifest.xml:manifest/AndroidManifest.xml resources.pb "res/**/*" "assets/**/*"`,
-		CommandDeps: []string{"${config.Zip2ZipCmd}"},
+		Command2: blueprint.NewCommand(
+			android.Zip2zip, ` -i ${in} -o ${out} AndroidManifest.xml:manifest/AndroidManifest.xml resources.pb "res/**/*" "assets/**/*"`,
+		),
 	})
 
 var bundleMungeDexJar = pctx.AndroidStaticRule("bundleMungeDexJar",
 	blueprint.RuleParams{
-		Command: `${config.Zip2ZipCmd} -i ${in} -o ${out} "classes*.dex:dex/" && ` +
-			`${config.Zip2ZipCmd} -i ${in} -o ${resJar} -x "classes*.dex" "**/*:root/"`,
-		CommandDeps: []string{"${config.Zip2ZipCmd}"},
+		Command2: blueprint.NewCommand(
+			android.Zip2zip, ` -i ${in} -o ${out} "classes*.dex:dex/" && `,
+			android.Zip2zip, ` -i ${in} -o ${resJar} -x "classes*.dex" "**/*:root/"`,
+		),
 	}, "resJar")
 
 // Builds an app into a module suitable for input to bundletool
@@ -284,15 +301,23 @@ func TransformJniLibsToJar(
 }
 
 func (a *AndroidApp) generateJavaUsedByApex(ctx android.ModuleContext) {
+	// Skip generating the XML file for unbundled test apps that don't have the tools
+	if ctx.Config().UnbundledBuild() && !slices.Contains(ctx.Config().UnbundledBuildApps(), a.Name()) {
+		return
+	}
 	javaApiUsedByOutputFile := android.PathForModuleOut(ctx, a.installApkName+"_using.xml")
-	javaUsedByRule := android.NewRuleBuilder(pctx, ctx)
+	javaUsedByRule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	javaUsedByRule.Command().
-		Tool(android.PathForSource(ctx, "build/soong/scripts/gen_java_usedby_apex.sh")).
+		BuiltTool("gen_apex_symbols").
+		Text("java_usedby").
 		BuiltTool("dexdeps").
 		Output(javaApiUsedByOutputFile).
 		Input(a.Library.Module.outputFile)
 	javaUsedByRule.Build("java_usedby_list", "Generate Java APIs used by Apex")
-	a.javaApiUsedByOutputFile = javaApiUsedByOutputFile
+
+	if slices.Contains(ctx.Config().UnbundledBuildApps(), a.Name()) && !android.ShouldSkipAndroidMkProcessing(ctx, a) {
+		ctx.DistForGoalsWithFilename([]string{a.installApkName, "apps_only"}, javaApiUsedByOutputFile, "java_apis_used_by_apex/"+javaApiUsedByOutputFile.Base())
+	}
 }
 
 func targetToJniDir(target android.Target) string {

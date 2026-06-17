@@ -21,6 +21,7 @@ package genrule
 import (
 	"fmt"
 	"io"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -72,10 +73,11 @@ var (
 	// Used by gensrcs when there is more than 1 shard to merge the outputs
 	// of each shard into a zip file.
 	gensrcsMerge = pctx.AndroidStaticRule("gensrcsMerge", blueprint.RuleParams{
-		Command:        "${soongZip} -o ${tmpZip} @${tmpZip}.rsp && ${zipSync} -d ${genDir} ${tmpZip}",
-		CommandDeps:    []string{"${soongZip}", "${zipSync}"},
-		Rspfile:        "${tmpZip}.rsp",
-		RspfileContent: "${zipArgs}",
+		Command:         "${soongZip} -o ${tmpZip} @${tmpZip}.rsp && ${zipSync} -d ${genDir} ${tmpZip}",
+		CommandDeps:     []string{"${soongZip}", "${zipSync}"},
+		Rspfile:         "${tmpZip}.rsp",
+		RspfileContent:  "${zipArgs}",
+		SandboxDisabled: true,
 	}, "tmpZip", "genDir", "zipArgs")
 )
 
@@ -88,12 +90,6 @@ func init() {
 
 type SourceFileGenerator interface {
 	android.SourceFileGenerator
-}
-
-// Alias for android.HostToolProvider
-// Deprecated: use android.HostToolProvider instead.
-type HostToolProvider interface {
-	android.HostToolProvider
 }
 
 type hostToolDependencyTag struct {
@@ -141,7 +137,9 @@ type generatorProperties struct {
 	// List of directories to export generated headers from
 	Export_include_dirs []string
 
-	// list of input files
+	// list of input files without variations such as plain files, or output of another `genrule`.
+	// If you want to depend on modules with variations, use `device_first_srcs`,
+	// `device_common_srcs`, `common_os_srcs`, `host_first_srcs`, or `host_second_srcs` instead.
 	Srcs proptools.Configurable[[]string] `android:"path,arch_variant"`
 
 	// Same as srcs, but will add dependencies on modules via a device os variation and the device's
@@ -302,7 +300,10 @@ func isModuleInBuildNumberAllowlist(ctx android.ModuleContext) bool {
 			"trusty/vendor/google/aosp/scripts:trusty_desktop_test_vm_arm64.bin",
 			"trusty/vendor/google/aosp/scripts:trusty_desktop_test_vm_x86_64.bin",
 			"trusty/vendor/google/aosp/scripts:trusty_desktop_vm_arm64.bin",
+			"trusty/vendor/google/aosp/scripts:trusty_desktop_vm_arm64_ext_boot.bin",
 			"trusty/vendor/google/aosp/scripts:trusty_desktop_vm_x86_64.bin",
+			"trusty/vendor/google/aosp/scripts:trusty_desktop_vm_x86_64_ext_boot.bin",
+			"trusty/vendor/google/aosp/scripts:trusty_memshare_vm_arm64.bin",
 			"trusty/vendor/google/aosp/scripts:trusty_security_vm_arm64.bin",
 			"trusty/vendor/google/aosp/scripts:trusty_security_vm_x86_64.elf",
 			"trusty/vendor/google/aosp/scripts:trusty_tee_package",
@@ -338,7 +339,10 @@ func isModuleInBuildDateAllowlist(ctx android.ModuleContext) bool {
 			"trusty/vendor/google/aosp/scripts:trusty_desktop_test_vm_arm64.bin",
 			"trusty/vendor/google/aosp/scripts:trusty_desktop_test_vm_x86_64.bin",
 			"trusty/vendor/google/aosp/scripts:trusty_desktop_vm_arm64.bin",
+			"trusty/vendor/google/aosp/scripts:trusty_desktop_vm_arm64_ext_boot.bin",
 			"trusty/vendor/google/aosp/scripts:trusty_desktop_vm_x86_64.bin",
+			"trusty/vendor/google/aosp/scripts:trusty_desktop_vm_x86_64_ext_boot.bin",
+			"trusty/vendor/google/aosp/scripts:trusty_memshare_vm_arm64.bin",
 			"trusty/vendor/google/aosp/scripts:trusty_security_vm_arm64.bin",
 			"trusty/vendor/google/aosp/scripts:trusty_security_vm_x86_64.elf",
 			"trusty/vendor/google/aosp/scripts:trusty_tee_package",
@@ -409,32 +413,23 @@ func (g *Module) generateCommonBuildActions(ctx android.ModuleContext) {
 	var packagedTools []android.PackagingSpec
 	if len(g.properties.Tools) > 0 {
 		seenTools := make(map[string]bool)
-		ctx.VisitDirectDepsProxyAllowDisabled(func(proxy android.ModuleProxy) {
-			switch tag := ctx.OtherModuleDependencyTag(proxy).(type) {
+		ctx.VisitDirectDepsProxyAllowDisabled(func(module android.ModuleProxy) {
+			switch tag := ctx.OtherModuleDependencyTag(module).(type) {
 			case hostToolDependencyTag:
-				// Necessary to retrieve any prebuilt replacement for the tool, since
-				// toolDepsMutator runs too late for the prebuilt mutators to have
-				// replaced the dependency.
-				module := android.PrebuiltGetPreferred(ctx, proxy)
 				tool := ctx.OtherModuleName(module)
-				if h, ok := android.OtherModuleProvider(ctx, module, android.HostToolProviderInfoProvider); ok {
+				if h := android.GetHostToolInfo(ctx, module); h != nil {
 					// A HostToolProvider provides the path to a tool, which will be copied
 					// into the sandbox.
-					if !android.OtherModulePointerProviderOrDefault(ctx, module, android.CommonModuleInfoProvider).Enabled {
+					path := h.HostToolPath
+					if !path.Valid() {
 						if ctx.Config().AllowMissingDependencies() {
 							ctx.AddMissingDependencies([]string{tool})
 						} else {
-							ctx.ModuleErrorf("depends on disabled module %q", tool)
+							ctx.ModuleErrorf("host tool %q missing output file", tool)
 						}
 						return
 					}
-					path := h.HostToolPath
-					if !path.Valid() {
-						ctx.ModuleErrorf("host tool %q missing output file", tool)
-						return
-					}
-					if specs := android.OtherModuleProviderOrDefault(
-						ctx, module, android.InstallFilesProvider).TransitivePackagingSpecs.ToList(); specs != nil {
+					if specs := h.TransitivePackagingSpecs.ToList(); specs != nil {
 						// If the HostToolProvider has PackgingSpecs, which are definitions of the
 						// required relative locations of the tool and its dependencies, use those
 						// instead.  They will be copied to those relative locations in the sbox
@@ -457,7 +452,11 @@ func (g *Module) generateCommonBuildActions(ctx android.ModuleContext) {
 						addLocationLabel(tag.label, toolLocation{android.Paths{path.Path()}})
 					}
 				} else {
-					ctx.ModuleErrorf("%q is not a host tool provider", tool)
+					if ctx.Config().AllowMissingDependencies() {
+						ctx.AddMissingDependencies([]string{tool})
+					} else {
+						ctx.ModuleErrorf("%q is not a host tool provider", tool)
+					}
 					return
 				}
 
@@ -554,7 +553,7 @@ func (g *Module) generateCommonBuildActions(ctx android.ModuleContext) {
 		desc := "generate"
 		name := "generator"
 		if task.useNsjail {
-			rule = android.NewRuleBuilder(pctx, ctx).
+			rule = android.NewRuleBuilder(pctx, ctx).SandboxDisabled().
 				Nsjail(task.genDir, android.PathForModuleOut(ctx, "nsjail_build_sandbox")).
 				DirDepsFile(task.genDir.Join(ctx, "dir_deps.d"))
 			if task.keepGendir {
@@ -573,7 +572,7 @@ func (g *Module) generateCommonBuildActions(ctx android.ModuleContext) {
 			manifestPath := android.PathForModuleOut(ctx, manifestName)
 
 			// Use a RuleBuilder to create a rule that runs the command inside an sbox sandbox.
-			rule = android.NewRuleBuilder(pctx, ctx).Sbox(task.genDir, manifestPath).SandboxInputs()
+			rule = android.NewRuleBuilder(pctx, ctx).SandboxDisabled().Sbox(task.genDir, manifestPath)
 			rule.DirDepsFile(task.genDir.Join(ctx, "dir_deps.d"))
 		}
 		if Bool(g.properties.Write_if_changed) {
@@ -766,6 +765,8 @@ func (g *Module) setOutputFiles(ctx android.ModuleContext) {
 	for _, files := range g.outputFiles {
 		ctx.SetOutputFiles(android.Paths{files}, files.Rel())
 	}
+
+	ctx.CheckbuildFile(g.outputFiles...)
 }
 
 // Collect information for opening IDE project files in java/jdeps.go.
@@ -859,6 +860,40 @@ func NewGenSrcs() *Module {
 		shards := android.ShardPaths(srcFiles, shardSize)
 		var generateTasks []generateTask
 
+		// Expands the output path pattern to form the output path for the given
+		// input path.
+		expandOutputPath := func(properties *genSrcsProperties, in android.Path) (string, error) {
+			template := proptools.String(properties.Output)
+			outputExtension := proptools.String(properties.Output_extension)
+			if template == "" {
+				if outputExtension != "" {
+					template = "$(in:fullpath/base)." + outputExtension
+				} else {
+					template = "$(in)"
+				}
+			} else if outputExtension != "" {
+				return "", fmt.Errorf("cannot specify both output and output_extension")
+			}
+
+			return android.Expand(template, func(name string) (string, error) {
+				switch name {
+				case "in":
+					return in.String(), nil
+				case "in:base":
+					base := in.Base()
+					return strings.TrimSuffix(base, filepath.Ext(base)), nil
+				case "in:relpath/base":
+					base := in.Rel()
+					return strings.TrimSuffix(base, filepath.Ext(base)), nil
+				case "in:fullpath/base":
+					base := in.String()
+					return strings.TrimSuffix(base, filepath.Ext(base)), nil
+				default:
+					return "", fmt.Errorf("unknown variable '$(%s)'", name)
+				}
+			})
+		}
+
 		for i, shard := range shards {
 			var commands []string
 			var outFiles android.WritablePaths
@@ -877,16 +912,23 @@ func NewGenSrcs() *Module {
 			// TODO(ccross): this RuleBuilder is a hack to be able to call
 			// rule.Command().PathForOutput.  Replace this with passing the rule into the
 			// generator.
-			rule := android.NewRuleBuilder(pctx, ctx).Sbox(genDir, nil).SandboxInputs()
+			rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled().Sbox(genDir, nil)
 
 			for _, in := range shard {
-				outFile := android.GenPathWithExtAndTrimExt(ctx, finalSubDir, in, String(properties.Output_extension), String(properties.Trim_extension))
+				outFileRaw, err := expandOutputPath(properties, in)
+				if err != nil {
+					ctx.ModuleErrorf("%s", err)
+					// exit early to avoid more unrelated errors later
+					return nil
+				}
+
+				outFile := android.PathForModuleGen(ctx, finalSubDir, outFileRaw)
 
 				// If sharding is enabled, then outFile is the path to the output file in
 				// the shard directory, and copyTo is the path to the output file in the
 				// final directory.
 				if len(shards) > 1 {
-					shardFile := android.GenPathWithExtAndTrimExt(ctx, genSubDir, in, String(properties.Output_extension), String(properties.Trim_extension))
+					shardFile := android.PathForModuleGen(ctx, genSubDir, outFileRaw)
 					copyTo = append(copyTo, outFile)
 					outFile = shardFile
 				}
@@ -945,6 +987,28 @@ func GenSrcsFactory() android.Module {
 }
 
 type genSrcsProperties struct {
+	// The output filename template.
+	//
+	// This template string allows the output file name to be generated for
+	// each source file, using some limited properties of the source file.
+	//
+	//	$(in:base): The base filename, no path or extension
+	//	$(in:relpath/base): The filename with a relative path but no extension
+	//	$(in:fullpath/base): The filename with the full path but no extension
+	//	$(in): The full origional input path. Equivalent to $(in:fullpath/base), but with the file
+	//         extension as well.
+	//
+	// The "relative path" as mentioned above is the path of the file relative to the
+	// Android.bp file that references it. In most cases this is preferable in order to not
+	// expose the location of the code within the tree, which is probably an implementation detail.
+	//
+	// The template allows arbitrary prefixes and suffixes to be added to the
+	// output filename. For example, "a_$(in:base).d" would take an source filename
+	// of "b.c" and turn it into "a_b.d".
+	//
+	// It is an error if the same output file is generated by more than one source file.
+	Output *string
+
 	// extension that will be substituted for each output file
 	Output_extension *string
 
@@ -953,9 +1017,6 @@ type genSrcsProperties struct {
 
 	// Additional files needed for build that are not tooling related.
 	Data []string `android:"path"`
-
-	// Trim the matched extension for each input file, and it should start with ".".
-	Trim_extension *string
 }
 
 const defaultShardSize = 50

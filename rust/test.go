@@ -32,7 +32,7 @@ type TestProperties struct {
 
 	// the name of the test configuration (for example "AndroidTest.xml") that should be
 	// installed with the module.
-	Test_config *string `android:"path,arch_variant"`
+	Test_config proptools.Configurable[string] `android:"path,arch_variant,replace_instead_of_append"`
 
 	// the name of the test configuration template (for example "AndroidTestTemplate.xml") that
 	// should be installed with the module.
@@ -232,8 +232,8 @@ func (test *testDecorator) compilerFlags(ctx ModuleContext, flags Flags) Flags {
 	}
 
 	// Add a default rpath to allow tests to dlopen libraries specified in data_libs.
-	flags.GlobalLinkFlags = append(flags.GlobalLinkFlags, `-Wl,-rpath,\$$ORIGIN/lib64`)
-	flags.GlobalLinkFlags = append(flags.GlobalLinkFlags, `-Wl,-rpath,\$$ORIGIN/lib`)
+	flags.GlobalLinkFlags.Flags += ` -Wl,-rpath,\$$ORIGIN/lib64`
+	flags.GlobalLinkFlags.Flags += ` -Wl,-rpath,\$$ORIGIN/lib`
 
 	return flags
 }
@@ -256,6 +256,9 @@ func RustTestFactory() android.Module {
 	// rustTestHostMultilib load hook to set MultilibFirst for the
 	// host target.
 	android.AddLoadHook(module, rustTestHostMultilib)
+
+	// Keep symbols for test binaries, so that they can have proper backtraces.
+	android.AddLoadHook(module, rustTestKeepSymbols)
 
 	// Windows tests are currently unsupported, so disable them.
 	// To support Windows test modules, we likely need to switch
@@ -344,5 +347,16 @@ func rustTestDisableWindows(ctx android.LoadHookContext) {
 	}
 	p := &props{}
 	p.Target.Windows.Enabled = false
+	ctx.AppendProperties(p)
+}
+
+func rustTestKeepSymbols(ctx android.LoadHookContext) {
+	type props struct {
+		Strip struct {
+			Keep_symbols *bool
+		}
+	}
+	p := &props{}
+	p.Strip.Keep_symbols = proptools.BoolPtr(true)
 	ctx.AppendProperties(p)
 }

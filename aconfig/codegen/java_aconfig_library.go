@@ -17,6 +17,7 @@ package codegen
 import (
 	"android/soong/android"
 	"android/soong/java"
+	"strconv"
 
 	"github.com/google/blueprint"
 	"github.com/google/blueprint/proptools"
@@ -40,6 +41,13 @@ type JavaAconfigDeclarationsLibraryProperties struct {
 	// "force-read-only": to generate force-read-only mode version of the library
 	// an error will be thrown if the mode is not supported
 	Mode *string
+
+	// Whether to preserve the internal aconfig flags impl interface codegen for this library.
+	// If true, the generated library will include the full legacy interface for the flags impl.
+	// If false or not set, the generated library internals may be optimized in ways that don't
+	// export the entire set of flags impl APIs.
+	// Defaults to false.
+	Preserve_legacy_impl_interface *bool
 }
 
 type JavaAconfigDeclarationsLibraryCallbacks struct {
@@ -77,17 +85,13 @@ func (callbacks *JavaAconfigDeclarationsLibraryCallbacks) DepsMutator(module *ja
 
 func (callbacks *JavaAconfigDeclarationsLibraryCallbacks) GenerateSourceJarBuildActions(module *java.GeneratedJavaLibraryModule, ctx android.ModuleContext) (android.Path, android.Path) {
 	// Get the values that came from the global RELEASE_ACONFIG_VALUE_SETS flag
-	declarationsModules := ctx.GetDirectDepsProxyWithTag(declarationsTag)
 	srcJarPath := android.PathForModuleGen(ctx, ctx.ModuleName()+".srcjar")
-	if len(declarationsModules) != 1 {
-		if ctx.Config().AllowMissingDependencies() {
-			ctx.AddMissingDependencies([]string{"exactly_one_aconfig_declarations_required"})
-			return srcJarPath, android.PathForModuleOut(ctx, "missing_declarations")
-		} else {
-			panic("Exactly one aconfig_declarations property required")
-		}
+	declarationsModule := callbacks.getDeclarationsModule(ctx)
+	if declarationsModule == nil {
+		return srcJarPath, android.PathForModuleOut(ctx, "missing_declarations")
 	}
-	declarations, _ := android.OtherModuleProvider(ctx, declarationsModules[0], android.AconfigDeclarationsProviderKey)
+
+	declarations, _ := android.OtherModuleProvider(ctx, declarationsModule, android.AconfigDeclarationsProviderKey)
 
 	// Generate the action to build the srcjar
 
@@ -102,13 +106,21 @@ func (callbacks *JavaAconfigDeclarationsLibraryCallbacks) GenerateSourceJarBuild
 		ctx.PropertyErrorf("mode", "exported mode requires its aconfig_declaration has exportable prop true")
 	}
 
+	// Note that currently `preserve_legacy_impl_interface: false` is a no-op and will respect the
+	// release build flag value allowing for interface removal.
+	allow_impl_interface_removal := ctx.Config().GetBuildFlagBool("RELEASE_ACONFIG_DEFAULT_ALLOW_JAVA_IMPL_INTERFACE_REMOVAL")
+	if proptools.BoolDefault(callbacks.properties.Preserve_legacy_impl_interface, false) {
+		allow_impl_interface_removal = false
+	}
+
 	ctx.Build(pctx, android.BuildParams{
 		Rule:        javaRule,
 		Input:       declarations.IntermediateCacheOutputPath,
 		Output:      srcJarPath,
 		Description: "aconfig.srcjar",
 		Args: map[string]string{
-			"mode": mode,
+			"mode":                         mode,
+			"allow_impl_interface_removal": strconv.FormatBool(allow_impl_interface_removal),
 		},
 	})
 
@@ -124,7 +136,7 @@ func (callbacks *JavaAconfigDeclarationsLibraryCallbacks) GenerateSourceJarBuild
 	}
 
 	android.SetProvider(ctx, android.CodegenInfoProvider, android.CodegenInfo{
-		AconfigDeclarations:          []string{declarationsModules[0].Name()},
+		AconfigDeclarations:          []string{declarationsModule.Name()},
 		IntermediateCacheOutputPaths: android.Paths{declarations.IntermediateCacheOutputPath},
 		Srcjars:                      android.Paths{srcJarPath},
 		ModeInfos: map[string]android.ModeInfo{
@@ -137,6 +149,35 @@ func (callbacks *JavaAconfigDeclarationsLibraryCallbacks) GenerateSourceJarBuild
 	return srcJarPath, declarations.IntermediateCacheOutputPath
 }
 
+func (callbacks *JavaAconfigDeclarationsLibraryCallbacks) getDeclarationsModule(ctx android.BaseModuleContext) *android.ModuleProxy {
+	declarationsModules := ctx.GetDirectDepsProxyWithTag(declarationsTag)
+	if len(declarationsModules) != 1 {
+		if ctx.Config().AllowMissingDependencies() {
+			ctx.AddMissingDependencies([]string{"exactly_one_aconfig_declarations_required"})
+			return nil
+		} else {
+			panic("Exactly one aconfig_declarations property required")
+		}
+	}
+	return &declarationsModules[0]
+}
+
 func isModeSupported(mode string) bool {
 	return android.InList(mode, aconfigSupportedModes)
+}
+
+func (callbacks *JavaAconfigDeclarationsLibraryCallbacks) IDEInfo(module *java.GeneratedJavaLibraryModule, ctx android.BaseModuleContext, dpInfo *android.IdeInfo) {
+	declarationsModule := callbacks.getDeclarationsModule(ctx)
+	if declarationsModule == nil {
+		return
+	}
+
+	declarations, _ := android.OtherModuleProvider(ctx, declarationsModule, android.AconfigDeclarationsProviderKey)
+	if dpInfo.Aconfig == nil {
+		dpInfo.Aconfig = &android.AconfigIdeInfo{}
+	}
+	dpInfo.Aconfig.Srcs = append(dpInfo.Aconfig.Srcs, declarations.Srcs.Strings()...)
+	dpInfo.Aconfig.Mode = proptools.String(callbacks.properties.Mode)
+	dpInfo.Aconfig.Package = declarations.Package
+	dpInfo.Aconfig.Container = declarations.Container
 }

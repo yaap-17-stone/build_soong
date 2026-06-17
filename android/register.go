@@ -98,6 +98,7 @@ type mutator struct {
 	mutatesDependencies     bool
 	mutatesGlobalState      bool
 	neverFar                bool
+	prePartial              bool
 }
 
 var _ sortableComponent = &mutator{}
@@ -192,11 +193,6 @@ func (ctx *Context) registerSingletonMakeVarsProvider(makevars SingletonMakeVars
 func collateGloballyRegisteredSingletons() sortableComponents {
 	allSingletons := append(sortableComponents(nil), singletons...)
 	allSingletons = append(allSingletons,
-		// Soong only androidmk is registered later than other singletons in order to collect
-		// dist contributions from other singletons. This singleton is registered just before
-		// phony so that its phony rules can be collected by the phony singleton.
-		singleton{parallel: false, name: "soongonlyandroidmk", factory: soongOnlyAndroidMkSingletonFactory},
-
 		// Register phony just before makevars so it can write out its phony rules as Make rules
 		singleton{parallel: false, name: "phony", factory: phonySingletonFactory},
 
@@ -207,6 +203,8 @@ func collateGloballyRegisteredSingletons() sortableComponents {
 		// Ninja file dependencies stored in the config.
 		singleton{parallel: false, name: "rawfiles", factory: rawFilesSingletonFactory},
 		singleton{parallel: false, name: "ninjadeps", factory: ninjaDepsSingletonFactory},
+
+		singleton{parallel: false, name: "soong_metrics", factory: soongMetricsSingletonFactory},
 	)
 
 	return allSingletons
@@ -234,10 +232,9 @@ func ModuleTypeByFactory() map[reflect.Value]string {
 // and test environments.
 type RegistrationContext interface {
 	RegisterModuleType(name string, factory ModuleFactory)
-	RegisterSingletonModuleType(name string, factory SingletonModuleFactory)
-	RegisterParallelSingletonModuleType(name string, factory SingletonModuleFactory)
 	RegisterParallelSingletonType(name string, factory SingletonFactory)
 	RegisterSingletonType(name string, factory SingletonFactory)
+	PrePartialMutators(f RegisterMutatorFunc)
 	PreArchMutators(f RegisterMutatorFunc)
 
 	// Register pre arch mutators that are hard coded into mutator.go.
@@ -290,23 +287,6 @@ func (ctx *initRegistrationContext) RegisterModuleType(name string, factory Modu
 	RegisterModuleTypeForDocs(name, reflect.ValueOf(factory))
 }
 
-func (ctx *initRegistrationContext) RegisterSingletonModuleType(name string, factory SingletonModuleFactory) {
-	ctx.registerSingletonModuleType(name, factory, false)
-}
-func (ctx *initRegistrationContext) RegisterParallelSingletonModuleType(name string, factory SingletonModuleFactory) {
-	ctx.registerSingletonModuleType(name, factory, true)
-}
-
-func (ctx *initRegistrationContext) registerSingletonModuleType(name string, factory SingletonModuleFactory, parallel bool) {
-	s, m := SingletonModuleFactoryAdaptor(name, factory)
-	ctx.registerSingletonType(name, s, parallel)
-	ctx.RegisterModuleType(name, m)
-	// Overwrite moduleTypesForDocs with the original factory instead of the lambda returned by
-	// SingletonModuleFactoryAdaptor so that docs can find the module type documentation on the
-	// factory method.
-	RegisterModuleTypeForDocs(name, reflect.ValueOf(factory))
-}
-
 func (ctx *initRegistrationContext) registerSingletonType(name string, factory SingletonFactory, parallel bool) {
 	if _, present := ctx.singletonTypes[name]; present {
 		panic(fmt.Sprintf("singleton type %q is already registered", name))
@@ -321,6 +301,10 @@ func (ctx *initRegistrationContext) RegisterSingletonType(name string, factory S
 
 func (ctx *initRegistrationContext) RegisterParallelSingletonType(name string, factory SingletonFactory) {
 	ctx.registerSingletonType(name, factory, true)
+}
+
+func (ctx *initRegistrationContext) PrePartialMutators(f RegisterMutatorFunc) {
+	PrePartialMutators(f)
 }
 
 func (ctx *initRegistrationContext) PreArchMutators(f RegisterMutatorFunc) {

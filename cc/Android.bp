@@ -30,9 +30,8 @@ bootstrap_go_package {
         "androidmk.go",
         "api_level.go",
         "builder.go",
-        "builder_gob_enc.go",
         "cc.go",
-        "cc_gob_enc.go",
+        "cc_enc.go",
         "ccdeps.go",
         "cc_preprocess_no_configuration.go",
         "check.go",
@@ -40,8 +39,8 @@ bootstrap_go_package {
         "gen.go",
         "generated_cc_library.go",
         "image.go",
+        "lfi.go",
         "linkable.go",
-        "linkable_gob_enc.go",
         "llvm_coverage_tools_zip.go",
         "lto.go",
         "makevars.go",
@@ -51,9 +50,7 @@ bootstrap_go_package {
         "proto.go",
         "rs.go",
         "sanitize.go",
-        "sanitize_gob_enc.go",
         "sabi.go",
-        "sabi_gob_enc.go",
         "sdk.go",
         "snapshot_prebuilt.go",
         "stl.go",
@@ -72,17 +69,13 @@ bootstrap_go_package {
 
         "binary.go",
         "binary_sdk_member.go",
-        "binary_sdk_member_gob_enc.go",
         "device_for_host.go",
         "fuzz.go",
         "image_sdk_traits.go",
-        "image_sdk_traits_gob_enc.go",
         "library.go",
         "library_headers.go",
         "library_sdk_member.go",
-        "library_sdk_member_gob_enc.go",
         "native_bridge_sdk_trait.go",
-        "native_bridge_sdk_trait_gob_enc.go",
         "object.go",
         "test.go",
 
@@ -90,6 +83,7 @@ bootstrap_go_package {
         "ndk_headers.go",
         "ndk_library.go",
         "ndk_sysroot.go",
+        "artless_denylist.go",
 
         "ndk_translation_package.go",
 
@@ -107,6 +101,7 @@ bootstrap_go_package {
     ],
     testSrcs: [
         "afdo_test.go",
+        "artless_denylist_test.go",
         "binary_test.go",
         "cc_preprocess_no_configuration_test.go",
         "cc_test.go",
@@ -115,8 +110,10 @@ bootstrap_go_package {
         "compiler_test.go",
         "gen_test.go",
         "genrule_test.go",
+        "lfi_test.go",
         "library_headers_test.go",
         "library_test.go",
+        "linker_test.go",
         "lto_test.go",
         "ndk_test.go",
         "object_test.go",
@@ -167,5 +164,19 @@ phony {
         "libvendorsupport",
         "libvndksupport",
         "libvulkan",
+    ],
+}
+
+all_artless_denylists {
+    name: "libandroid_native_denylist",
+    visibility: [
+        "//visibility:any_system_partition",
+    ],
+}
+
+all_artless_blocked_symbol_files {
+    name: "all_artless_blocked_symbol_files",
+    visibility: [
+        "//cts:__subpackages__",
     ],
 }

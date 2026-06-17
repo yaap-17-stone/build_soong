@@ -47,6 +47,7 @@ var PrepareForTestWithJavaBuildComponents = android.GroupFixturePreparers(
 	// Make java build components available to the test.
 	android.FixtureRegisterWithContext(registerRequiredBuildComponentsForTest),
 	android.FixtureRegisterWithContext(registerJavaPluginBuildComponents),
+	android.PrepareForTestWithHostTools("cp_if_changed", "rm", "touch", "grep"),
 	// Additional files needed in tests that disallow non-existent source files.
 	// This includes files that are needed by all, or at least most, instances of a java module type.
 	android.MockFS{
@@ -62,9 +63,15 @@ var PrepareForTestWithJavaBuildComponents = android.GroupFixturePreparers(
         }
 			`),
 		// Needed for apps that do not provide their own.
-		"build/make/target/product/security": nil,
-		// Required to generate Java used-by API coverage
-		"build/soong/scripts/gen_java_usedby_apex.sh": nil,
+		"build/make/target/product/security/default_testkey.x509.pem": nil,
+		"external/error_prone/Android.bp": []byte(`
+			java_plugin {
+				name: "error_prone_plugin",
+				errorprone: {
+					enabled: false,
+				},
+			}
+			`),
 		// Needed for the global lint checks provided from tools/lint_checks
 		"tools/lint_checks/global/Android.bp": []byte(`
 			java_library_host {
@@ -100,7 +107,10 @@ var prepareForTestWithFrameworkDeps = android.GroupFixturePreparers(
 		// Needed for R8 rules on apps
 		"build/make/core/proguard.flags":             nil,
 		"build/make/core/proguard_basic_keeps.flags": nil,
+		"build/make/core/proguard/enumvalues.flags":  nil,
+		"build/make/core/proguard/kotlin.flags":      nil,
 		"prebuilts/cmdline-tools/shrinker.xml":       nil,
+		defaultJavaDir + "/framework-private.flags":  nil,
 	}.AddToFixture(),
 )
 
@@ -110,6 +120,10 @@ var prepareForTestWithJavaDefaultModulesBase = android.GroupFixturePreparers(
 	prepareForTestWithFrameworkDeps,
 	// Add dexpreopt compat libs (android.test.base, etc.) and a fake dex2oatd module.
 	dexpreopt.PrepareForTestWithDexpreoptCompatLibs,
+	android.PrepareForTestWithHostTools(
+		"dexdeps",
+		"gen_apex_symbols",
+	),
 )
 
 // Test fixture preparer that will define default java modules, e.g. standard prebuilt modules.
@@ -201,6 +215,9 @@ var PrepareForTestWithJacocoInstrumentation = android.GroupFixturePreparers(
 				"//apex_available:platform",
 			],
 			compile_dex: true,
+			optimize: {
+				force_disabled_with_source_stubs: true,
+			},
 		}
 	`)),
 )
@@ -532,6 +549,9 @@ func gatherRequiredDepsForTest() string {
 				export_include_dirs: ["framework/aidl"],
 			},
 			compile_dex: true,
+			optimize: {
+				force_disabled_with_source_stubs: true,
+			},
 		}
 		java_library {
 			name: "framework-minus-apex",
@@ -542,12 +562,21 @@ func gatherRequiredDepsForTest() string {
 				export_include_dirs: ["framework/aidl"],
 			},
 			compile_dex: true,
+			optimize: {
+				force_disabled_with_source_stubs: true,
+			},
 		}
 
 		android_app {
 			name: "framework-res",
 			sdk_version: "core_platform",
-		}`
+		}
+
+		filegroup {
+			name: "framework-private-proguard",
+			srcs: ["framework-private.flags"],
+		}
+		`
 
 	systemModules := []string{
 		"core-public-stubs-system-modules",
@@ -594,7 +623,11 @@ func getModuleDependencies(t *testing.T, ctx *android.TestContext, name, variant
 	t.Helper()
 	module := ctx.ModuleForTests(t, name, variant).Module()
 	deps := []string{}
-	ctx.VisitDirectDepsProxies(module, func(m android.ModuleProxy) {
+	ctx.VisitDirectDepsProxiesWithTags(module, func(m blueprint.ModuleProxy, tag blueprint.DependencyTag) {
+		if _, ok := tag.(android.HostToolDepTagType); ok {
+			// ignore host tools
+			return
+		}
 		deps = append(deps, m.Name())
 	})
 	return android.SortedUniqueStrings(deps)
@@ -778,6 +811,10 @@ func (f *fakeApexMutator) Split(ctx android.BaseModuleContext) []string {
 		return []string{"", "apex1000"}
 	}
 	return []string{""}
+}
+
+func (f *fakeApexMutator) SplitOnDemand(ctx android.BaseModuleContext) []string {
+	return nil
 }
 
 func (f *fakeApexMutator) OutgoingTransition(ctx android.OutgoingTransitionContext, sourceVariation string) string {

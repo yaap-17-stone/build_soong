@@ -18,9 +18,11 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
+	"github.com/google/blueprint/depset"
 	"github.com/google/blueprint/proptools"
 
 	"android/soong/android"
@@ -189,7 +191,7 @@ type BaseCompilerProperties struct {
 
 			// List of additional cflags that should be used to build vendor
 			// or product variant of the C/C++ module.
-			Cflags []string
+			Cflags proptools.Configurable[[]string]
 
 			// list of generated sources that should not be used to build
 			// vendor or product variant of the C/C++ module.
@@ -340,11 +342,11 @@ func maybeReplaceGnuToC(gnuExtensions *bool, cStd string, cppStd string) (string
 	return cStd, cppStd
 }
 
-func parseCppStd(cppStdPtr *string) string {
+func parseCppStd(ctx ModuleContext, cppStdPtr *string) string {
 	cppStd := String(cppStdPtr)
 	switch cppStd {
 	case "":
-		return config.CppStdVersion
+		return config.CppStdVersion(ctx)
 	case "experimental":
 		return config.ExperimentalCppStdVersion
 	default:
@@ -364,9 +366,9 @@ func parseCStd(cStdPtr *string) string {
 	}
 }
 
-func AddTargetFlags(ctx android.ModuleContext, flags Flags, tc config.Toolchain, version string, bpf bool) Flags {
+func AddTargetFlags(ctx android.ModuleContext, flags Flags, tc config.Toolchain, version string, bpf, lfi bool) Flags {
 	target := "-target " + tc.ClangTriple()
-	if ctx.Os().Class == android.Device {
+	if ctx.Os().Class == android.Device && !lfi {
 		if version == "" || version == "current" {
 			target += strconv.Itoa(android.FutureApiLevelInt)
 		} else {
@@ -400,22 +402,32 @@ func (compiler *baseCompiler) compilerFlags(ctx ModuleContext, flags Flags, deps
 
 	// If a reuseObjTag dependency exists then this module is reusing the objects (generally the shared variant
 	// reusing objects from the static variant), and doesn't need to compile any sources of its own.
-	var srcs []string
 	if !reuseObjs {
-		srcs = compiler.Properties.Srcs.GetOrDefault(ctx, nil)
+		srcs := compiler.Properties.Srcs.GetOrDefault(ctx, nil)
 		exclude_srcs := compiler.Properties.Exclude_srcs.GetOrDefault(ctx, nil)
 		compiler.srcsBeforeGen = android.PathsForModuleSrcExcludes(ctx, srcs, exclude_srcs)
 		compiler.srcsBeforeGen = append(compiler.srcsBeforeGen, deps.GeneratedSources...)
 	}
 
+	for _, lfiDep := range ctx.GetDirectDepsProxyWithTag(LFIDepTag) {
+		lfiInfo, ok := android.OtherModuleProvider(ctx, lfiDep, lfiInfoProvider)
+		if !ok {
+			ctx.ModuleErrorf("Expected lfi dep %s(%s) to provide lfi info", ctx.OtherModuleName(lfiDep), ctx.OtherModuleSubDir(lfiDep))
+			continue
+		}
+		compiler.srcsBeforeGen = append(compiler.srcsBeforeGen, lfiInfo.srcs...)
+	}
+
 	cflags := compiler.Properties.Cflags.GetOrDefault(ctx, nil)
 	cppflags := compiler.Properties.Cppflags.GetOrDefault(ctx, nil)
+	vendorcflags := compiler.Properties.Target.Vendor.Cflags.GetOrDefault(ctx, nil)
+	productcflags := compiler.Properties.Target.Product.Cflags.GetOrDefault(ctx, nil)
 	CheckBadCompilerFlags(ctx, "cflags", cflags)
 	CheckBadCompilerFlags(ctx, "cppflags", cppflags)
 	CheckBadCompilerFlags(ctx, "conlyflags", compiler.Properties.Conlyflags)
 	CheckBadCompilerFlags(ctx, "asflags", compiler.Properties.Asflags)
-	CheckBadCompilerFlags(ctx, "vendor.cflags", compiler.Properties.Target.Vendor.Cflags)
-	CheckBadCompilerFlags(ctx, "product.cflags", compiler.Properties.Target.Product.Cflags)
+	CheckBadCompilerFlags(ctx, "vendor.cflags", vendorcflags)
+	CheckBadCompilerFlags(ctx, "product.cflags", productcflags)
 	CheckBadCompilerFlags(ctx, "recovery.cflags", compiler.Properties.Target.Recovery.Cflags)
 	CheckBadCompilerFlags(ctx, "ramdisk.cflags", compiler.Properties.Target.Ramdisk.Cflags)
 	CheckBadCompilerFlags(ctx, "vendor_ramdisk.cflags", compiler.Properties.Target.Vendor_ramdisk.Cflags)
@@ -503,6 +515,26 @@ func (compiler *baseCompiler) compilerFlags(ctx ModuleContext, flags Flags, deps
 
 	if ctx.apexVariationName() != "" {
 		flags.Global.CommonFlags = append(flags.Global.CommonFlags, "-D__ANDROID_APEX__")
+
+		// As APEX modules ship to a variety of ARM64 devices, some with PAC/BTI and some without,
+		// enable both mitigations to ensure that devices which support PAC/BTI benefit from it,
+		// and devices which don't still have stack-protector enabled.
+		//
+		// PAC/BTI instructions are encoded in the NOP space, so this should not present any
+		// compatibility issues when pushed to hardware which does not support these instructions.
+		// Similarly, enabling stack-protector alongside PAC/BTI does not present any compatibility
+		// issues.
+		//
+		// LFI has a minimal libc that does not include __stack_chk_fail so it cannot use
+		// '-fstack-protector'. We already forced the LFI target to enable PAC/BTI for all LFI
+		// modules.
+		if ctx.Arch().ArchType == android.Arm64 && !ctx.Target().LFI {
+			// Some of these flags are intentionally duplicated from globals as some
+			// targets disable them. Duplicating them here ensures that no matter the
+			// build target for APEXes, these flags are enabled.
+			flags.Global.CFlags = append(flags.Global.CFlags, "-fstack-protector-strong")
+			flags.Global.CFlags = append(flags.Global.CFlags, "-mbranch-protection=standard")
+		}
 	}
 
 	if ctx.Target().NativeBridge == android.NativeBridgeEnabled {
@@ -540,7 +572,7 @@ func (compiler *baseCompiler) compilerFlags(ctx ModuleContext, flags Flags, deps
 	flags.Local.ConlyFlags = config.ClangFilterUnknownCflags(flags.Local.ConlyFlags)
 	flags.Local.LdFlags = config.ClangFilterUnknownCflags(flags.Local.LdFlags)
 
-	flags = AddTargetFlags(ctx, flags, tc, ctx.minSdkVersion(), Bool(compiler.Properties.Bpf_target))
+	flags = AddTargetFlags(ctx, flags, tc, ctx.minSdkVersion(), Bool(compiler.Properties.Bpf_target), ctx.isLFIVariation())
 
 	hod := "Host"
 	if ctx.Os().Class == android.Device {
@@ -588,7 +620,7 @@ func (compiler *baseCompiler) compilerFlags(ctx ModuleContext, flags Flags, deps
 	}
 
 	cStd := parseCStd(compiler.Properties.C_std)
-	cppStd := parseCppStd(compiler.Properties.Cpp_std)
+	cppStd := parseCppStd(ctx, compiler.Properties.Cpp_std)
 
 	cStd, cppStd = maybeReplaceGnuToC(compiler.Properties.Gnu_extensions, cStd, cppStd)
 
@@ -596,11 +628,11 @@ func (compiler *baseCompiler) compilerFlags(ctx ModuleContext, flags Flags, deps
 	flags.Local.CppFlags = append([]string{"-std=" + cppStd}, flags.Local.CppFlags...)
 
 	if ctx.inVendor() {
-		flags.Local.CFlags = append(flags.Local.CFlags, esc(compiler.Properties.Target.Vendor.Cflags)...)
+		flags.Local.CFlags = append(flags.Local.CFlags, esc(vendorcflags)...)
 	}
 
 	if ctx.inProduct() {
-		flags.Local.CFlags = append(flags.Local.CFlags, esc(compiler.Properties.Target.Product.Cflags)...)
+		flags.Local.CFlags = append(flags.Local.CFlags, esc(productcflags)...)
 	}
 
 	if ctx.inRecovery() {
@@ -652,18 +684,28 @@ func (compiler *baseCompiler) compilerFlags(ctx ModuleContext, flags Flags, deps
 		if len(compiler.Properties.Aidl.Local_include_dirs) > 0 {
 			localAidlIncludeDirs := android.PathsForModuleSrc(ctx, compiler.Properties.Aidl.Local_include_dirs)
 			flags.aidlFlags = append(flags.aidlFlags, includeDirsToFlags(localAidlIncludeDirs))
+			for _, includeDir := range localAidlIncludeDirs {
+				flags.aidlFlagsDeps = append(flags.aidlFlagsDeps, ctx.GlobFiles(filepath.Join(includeDir.String(), "**/*.aidl"), nil)...)
+			}
 		}
 		if len(compiler.Properties.Aidl.Include_dirs) > 0 {
 			rootAidlIncludeDirs := android.PathsForSource(ctx, compiler.Properties.Aidl.Include_dirs)
 			flags.aidlFlags = append(flags.aidlFlags, includeDirsToFlags(rootAidlIncludeDirs))
+			for _, includeDir := range rootAidlIncludeDirs {
+				flags.aidlFlagsDeps = append(flags.aidlFlagsDeps, ctx.GlobFilesOutsideModuleDir(filepath.Join(includeDir.String(), "**/*.aidl"), nil)...)
+			}
 		}
 
 		var rootAidlIncludeDirs android.Paths
+		var aidlLibraryHdrs []depset.DepSet[android.Path]
 		for _, aidlLibraryInfo := range deps.AidlLibraryInfos {
 			rootAidlIncludeDirs = append(rootAidlIncludeDirs, aidlLibraryInfo.IncludeDirs.ToList()...)
+			aidlLibraryHdrs = append(aidlLibraryHdrs, aidlLibraryInfo.Hdrs)
 		}
 		if len(rootAidlIncludeDirs) > 0 {
 			flags.aidlFlags = append(flags.aidlFlags, includeDirsToFlags(rootAidlIncludeDirs))
+			hdrs := depset.New(depset.PREORDER, nil, aidlLibraryHdrs).ToList()
+			flags.aidlFlagsDeps = append(flags.aidlFlagsDeps, hdrs...)
 		}
 
 		if proptools.BoolDefault(compiler.Properties.Aidl.Generate_traces, true) {
@@ -695,7 +737,7 @@ func (compiler *baseCompiler) compilerFlags(ctx ModuleContext, flags Flags, deps
 			"-I"+android.PathForModuleGen(ctx, "sysprop", "include").String())
 	}
 
-	if len(srcs) > 0 {
+	if len(compiler.srcsBeforeGen) > 0 {
 		module := ctx.ModuleDir() + "/Android.bp:" + ctx.ModuleName()
 		if inList("-Wno-error", flags.Local.CFlags) || inList("-Wno-error", flags.Local.CppFlags) {
 			ctx.getOrCreateMakeVarsInfo().UsingWnoError = module
@@ -715,8 +757,10 @@ func (compiler *baseCompiler) compilerFlags(ctx ModuleContext, flags Flags, deps
 	if ctx.optimizeForSize() {
 		flags.Local.CFlags = append(flags.Local.CFlags, "-Oz")
 		if !ctx.Config().IsEnvFalse("THINLTO_USE_MLGO") {
-			flags.Local.LdFlags = append(flags.Local.LdFlags, "-Wl,-mllvm,-enable-ml-inliner=release")
-			flags.Local.LdFlags = append(flags.Local.LdFlags, "-Wl,-mllvm,-ml-inliner-model-selector=arm64-mixed")
+			if ctx.Arch().ArchType == android.Arm64 {
+				flags.Local.LdFlags = append(flags.Local.LdFlags, "-Wl,-mllvm,-enable-ml-inliner=release")
+				flags.Local.LdFlags = append(flags.Local.LdFlags, "-Wl,-mllvm,-ml-inliner-model-selector=arm64-mixed")
+			}
 		}
 	}
 
@@ -730,6 +774,10 @@ func (compiler *baseCompiler) compilerFlags(ctx ModuleContext, flags Flags, deps
 
 	if flags.Toolchain.Is64Bit() {
 		flags.NoOverrideFlags = append(flags.NoOverrideFlags, "${config.NoOverride64GlobalCflags}")
+	}
+
+	if ctx.testBinary() || ctx.testLibrary() {
+		flags.NoOverrideFlags = append(flags.NoOverrideFlags, "${config.NoOverrideTestsGlobalCflags}")
 	}
 
 	if android.IsThirdPartyPath(ctx.ModuleDir()) {
@@ -783,7 +831,7 @@ func (compiler *baseCompiler) compile(ctx ModuleContext, flags Flags, deps PathD
 
 	buildFlags := flagsToBuilderFlags(flags)
 
-	srcs := append(android.Paths(nil), compiler.srcsBeforeGen...)
+	srcs := slices.Clone(compiler.srcsBeforeGen)
 
 	srcs, genDeps, info := genSources(ctx, deps.AidlLibraryInfos, srcs, buildFlags)
 	pathDeps = append(pathDeps, genDeps...)

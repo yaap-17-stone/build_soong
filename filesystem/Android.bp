@@ -8,13 +8,15 @@ bootstrap_go_package {
     deps: [
         "blueprint",
         "blueprint-depset",
+        "blueprint-gobtools",
         "blueprint-proptools",
         "soong",
         "soong-android",
-        "soong-etc",
         "soong-bpf", // for testing
-        "soong-cc", // for testing
         "soong-cc-config",
+        "soong-cc", // for testing
+        "soong-etc",
+        "soong-filesystem-ramdisk_16k-common",
         "soong-java", // for testing
         "soong-kernel",
         "soong-linkerconfig",
@@ -33,6 +35,7 @@ bootstrap_go_package {
         "check_partition_sizes.go",
         "dtboimg.go",
         "filesystem.go",
+        "filesystem_enc.go",
         "find_shareduid_violation_check.go",
         "fontchain_lint.go",
         "fsverity_metadata.go",
@@ -47,6 +50,7 @@ bootstrap_go_package {
         "system_image.go",
         "system_other.go",
         "vbmeta.go",
+        "vendor_module_check.go",
         "testing.go",
         "tzsw.go",
     ],
@@ -54,6 +58,7 @@ bootstrap_go_package {
         "filesystem_test.go",
         "find_shareduid_violation_check_test.go",
         "host_init_verifier_check_test.go",
+        "vendor_module_check_test.go",
     ],
     pluginFor: ["soong_build"],
 }

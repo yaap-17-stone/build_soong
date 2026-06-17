@@ -73,7 +73,7 @@ func vintfDataFactory() Module {
 }
 
 func (m *vintfDataRule) GenerateAndroidBuildActions(ctx ModuleContext) {
-	builder := NewRuleBuilder(pctx, ctx)
+	builder := NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	gensrc := PathForModuleOut(ctx, "manifest.xml")
 	assembleVintfEnvs := []string{}
 	inputPaths := make(Paths, 0)
@@ -115,7 +115,6 @@ func (m *vintfDataRule) GenerateAndroidBuildActions(ctx ModuleContext) {
 		}
 	case vendorManifestType:
 		assembleVintfEnvs = append(assembleVintfEnvs, fmt.Sprintf("BOARD_SEPOLICY_VERS=\"%s\"", ctx.DeviceConfig().BoardSepolicyVers()))
-		assembleVintfEnvs = append(assembleVintfEnvs, fmt.Sprintf("PRODUCT_ENFORCE_VINTF_MANIFEST=%t", *ctx.Config().productVariables.Enforce_vintf_manifest))
 		deviceManifestFiles := PathsForSource(ctx, ctx.Config().DeviceManifestFiles())
 		// Only need to generate the manifest if DEVICE_MANIFEST_FILE is defined.
 		if len(deviceManifestFiles) == 0 {

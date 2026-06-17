@@ -33,7 +33,7 @@ var (
 	}
 
 	// bindgen should specify its own Clang revision so updating Clang isn't potentially blocked on bindgen failures.
-	bindgenClangVersion = "clang-r563880"
+	bindgenClangVersion = "clang-r584948"
 
 	_ = pctx.VariableFunc("bindgenClangVersion", func(ctx android.PackageVarContext) string {
 		if override := ctx.Config().Getenv("LLVM_BINDGEN_PREBUILTS_VERSION"); override != "" {
@@ -72,9 +72,10 @@ var (
 		blueprint.RuleParams{
 			Command: "CLANG_PATH=$bindgenClang LIBCLANG_PATH=$bindgenLibClang RUSTFMT=${config.RustBin}/rustfmt " +
 				"$cmd $flags $$(cat $flagfiles) $in -o $out -- -MD -MF $out.d $cflags",
-			CommandDeps: []string{"$cmd"},
-			Deps:        blueprint.DepsGCC,
-			Depfile:     "$out.d",
+			CommandDeps:     []string{"$cmd"},
+			Deps:            blueprint.DepsGCC,
+			Depfile:         "$out.d",
+			SandboxDisabled: true,
 		},
 		"cmd", "flags", "flagfiles", "cflags")
 )
@@ -145,7 +146,7 @@ func (b *bindgenDecorator) getStdVersion(ctx ModuleContext, src android.Path) (s
 		if String(b.ClangProperties.Cpp_std) == "experimental" {
 			stdVersion = cc_config.ExperimentalCppStdVersion
 		} else if String(b.ClangProperties.Cpp_std) == "default" || String(b.ClangProperties.Cpp_std) == "" {
-			stdVersion = cc_config.CppStdVersion
+			stdVersion = cc_config.CppStdVersion(ctx)
 		} else {
 			stdVersion = String(b.ClangProperties.Cpp_std)
 		}
@@ -159,7 +160,7 @@ func (b *bindgenDecorator) getStdVersion(ctx ModuleContext, src android.Path) (s
 			stdVersion = String(b.ClangProperties.C_std)
 		}
 	} else if isCpp {
-		stdVersion = cc_config.CppStdVersion
+		stdVersion = cc_config.CppStdVersion(ctx)
 	} else {
 		stdVersion = cc_config.CStdVersion
 	}
@@ -319,7 +320,9 @@ func (b *bindgenDecorator) GenerateSource(ctx ModuleContext, deps PathDeps) andr
 	var cmd, cmdDesc string
 	if b.Properties.Custom_bindgen != "" {
 		m := ctx.GetDirectDepProxyWithTag(b.Properties.Custom_bindgen, customBindgenDepTag)
-		cmd = android.OtherModuleProviderOrDefault(ctx, m, android.HostToolProviderInfoProvider).HostToolPath.String()
+		if info := android.GetHostToolInfo(ctx, m); info != nil {
+			cmd = info.HostToolPath.String()
+		}
 		cmdDesc = b.Properties.Custom_bindgen
 	} else {
 		cmd = "$bindgenCmd"

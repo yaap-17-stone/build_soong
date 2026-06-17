@@ -69,6 +69,8 @@ def parse_args():
   parser.add_argument("--build-fingerprint-file", required=True, type=argparse.FileType("r"))
   parser.add_argument("--build-hostname-file", required=True, type=argparse.FileType("r"))
   parser.add_argument("--build-number-file", required=True, type=argparse.FileType("r"))
+  parser.add_argument("--build-uuid-file", required=True, type=argparse.FileType("r"))
+  parser.add_argument("--build-system-fingerprint-file", required=True, type=argparse.FileType("r"))
   parser.add_argument("--build-thumbprint-file", type=argparse.FileType("r"))
   parser.add_argument("--build-username", required=True)
   parser.add_argument("--date-file", required=True, type=argparse.FileType("r"))
@@ -99,8 +101,10 @@ def parse_args():
   config["BuildVariant"] = get_build_variant(config)
 
   config["BuildFingerprint"] = args.build_fingerprint_file.read().strip()
+  config["BuildSystemFingerprint"] = args.build_system_fingerprint_file.read().strip()
   config["BuildHostname"] = args.build_hostname_file.read().strip()
   config["BuildNumber"] = args.build_number_file.read().strip()
+  config["BuildUUID"] = args.build_uuid_file.read().strip()
   config["BuildUsername"] = args.build_username
   config["YaapDevice"] = args.yaap_device
 
@@ -179,8 +183,12 @@ def generate_common_build_props(args):
   # Allow optional assignments for ARC forward-declarations (b/249168657)
   # TODO: Remove any tag-related inconsistencies once the goals from
   # go/arc-android-sigprop-changes have been achieved.
-  print(f"ro.{partition}.build.fingerprint?={config['BuildFingerprint']}")
+  if partition == "system":
+    print(f"ro.{partition}.build.fingerprint?={config['BuildSystemFingerprint']}")
+  else:
+    print(f"ro.{partition}.build.fingerprint?={config['BuildFingerprint']}")
   print(f"ro.{partition}.build.id?={config['BuildId']}")
+  print(f"ro.{partition}.build.uuid?={config['BuildUUID']}")
   print(f"ro.{partition}.build.tags?={config['BuildVersionTags']}")
   print(f"ro.{partition}.build.type={config['BuildVariant']}")
   print(f"ro.{partition}.build.version.incremental={config['BuildNumber']}")
@@ -202,6 +210,7 @@ def generate_build_info(args):
   print(f"ro.build.fingerprint?={config['BuildFingerprint']}")
 
   print(f"ro.build.id?={config['BuildId']}")
+  print(f"ro.build.uuid?={config['BuildUUID']}")
 
   # ro.build.display.id is shown under Settings -> About Phone
   if config["BuildVariant"] == "user":
@@ -311,7 +320,10 @@ def append_additional_system_props(args):
     if "PRODUCT_PROPERTY_OVERRIDES" in config:
       props += config["PRODUCT_PROPERTY_OVERRIDES"]
 
-  props.append(f"ro.treble.enabled={'true' if config['FullTreble'] else 'false'}")
+  # We may be able to remove this property now and update all clients to assume
+  # that treble is enabled.
+  props.append(f"ro.treble.enabled=true")
+
   # Set ro.llndk.api_level to show the maximum vendor API level that the LLNDK
   # in the system partition supports.
   if config["VendorApiLevel"]:
@@ -417,7 +429,6 @@ def append_additional_vendor_props(args):
   props.append(f"ro.bionic.2nd_arch={config['DeviceSecondaryArch']}")
   props.append(f"ro.bionic.2nd_cpu_variant={config['DeviceSecondaryCpuVariantRuntime']}")
 
-  props.append(f"persist.sys.dalvik.vm.lib.2=libart.so")
   props.append(f"dalvik.vm.isa.{config['DeviceArch']}.variant={config['Dex2oatTargetCpuVariantRuntime']}")
   if config["Dex2oatTargetInstructionSetFeatures"]:
     props.append(f"dalvik.vm.isa.{config['DeviceArch']}.features={config['Dex2oatTargetInstructionSetFeatures']}")
@@ -491,6 +502,9 @@ def append_additional_vendor_props(args):
 
   config["ADDITIONAL_VENDOR_PROPERTIES"] = props
 
+  # Add the 16K developer args if it is defined for the product.
+  config["ADDITIONAL_VENDOR_PROPERTIES"].append(f"ro.product.build.16k_page.enabled={'true' if config['Product16KDeveloperOption'] else 'false'}")
+
 def append_additional_product_props(args):
   props = []
 
@@ -499,9 +513,6 @@ def append_additional_product_props(args):
   # Add the system server compiler filter if they are specified for the product.
   if config["SystemServerCompilerFilter"]:
     props.append(f"dalvik.vm.systemservercompilerfilter={config['SystemServerCompilerFilter']}")
-
-  # Add the 16K developer args if it is defined for the product.
-  props.append(f"ro.product.build.16k_page.enabled={'true' if config['Product16KDeveloperOption'] else 'false'}")
 
   props.append(f"ro.product.page_size={16384 if config['TargetBoots16K'] else 4096}")
 

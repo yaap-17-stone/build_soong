@@ -40,6 +40,8 @@ import (
 	"android/soong/sh"
 )
 
+var sdvApexPattern = regexp.MustCompile(`^com\.(?:\w+\.)?sdv\.`)
+
 func init() {
 	registerApexBuildComponents(android.InitRegistrationContext)
 }
@@ -109,13 +111,10 @@ type apexBundleProperties struct {
 	Java_libs []string
 
 	// List of sh binaries that are embedded inside this APEX bundle.
-	Sh_binaries []string
+	Sh_binaries proptools.Configurable[[]string]
 
 	// List of platform_compat_config files that are embedded inside this APEX bundle.
-	Compat_configs []string
-
-	// List of filesystem images that are embedded inside this APEX bundle.
-	Filesystems []string
+	Compat_configs proptools.Configurable[[]string]
 
 	// List of module names which we don't want to add as transitive deps. This can be used as
 	// a workaround when the current implementation collects more than necessary. For example,
@@ -145,6 +144,22 @@ type apexBundleProperties struct {
 
 	// The type of filesystem to use. Either 'ext4', 'f2fs' or 'erofs'. Default 'ext4'.
 	Payload_fs_type *string
+
+	// Override default settings (PRODUCT_DEFAULT_APEX_PAYLOAD_EROFS_*) for EROFS APEX
+	Erofs struct {
+		// Compressor and Compression level passed to mkfs.erofs. e.g. (lz4hc,9)
+		// Please see external/erofs-utils/README for complete documentation.
+		// Use "none" for uncompressed EROFS image.
+		// Default: (defined in apexer)
+		Compressor *string
+
+		// Used as --compress-hints for mkfs.erofs
+		Compress_hints *string `android:"path"`
+
+		// Specify the size of compress physical cluster in bytes
+		// Default: (defined in apexer)
+		Pcluster_size *int64
+	}
 
 	// For telling the APEX to ignore special handling for system libraries such as bionic.
 	// Default is false.
@@ -207,6 +222,9 @@ type ApexNativeDependencies struct {
 	// List of prebuilt_etcs that are embedded inside this APEX bundle.
 	Prebuilts proptools.Configurable[[]string]
 
+	// List of prebuilt_kernel_modules that are embedded inside this APEX bundle.
+	Kernel_modules []string
+
 	// List of native libraries to exclude from this APEX.
 	Exclude_native_shared_libs []string
 
@@ -227,6 +245,9 @@ type ApexNativeDependencies struct {
 
 	// List of prebuilt_etcs to exclude from this APEX bundle.
 	Exclude_prebuilts []string
+
+	// List of prebuilt_kernel_modules to exclude from this APEX bundle.
+	Exclude_kernel_modules []string
 }
 
 type ResolvedApexNativeDependencies struct {
@@ -251,6 +272,9 @@ type ResolvedApexNativeDependencies struct {
 	// List of prebuilt_etcs that are embedded inside this APEX bundle.
 	Prebuilts []string
 
+	// List of prebuilt_kernel_modules that are embedded inside this APEX bundle.
+	Kernel_modules []string
+
 	// List of native libraries to exclude from this APEX.
 	Exclude_native_shared_libs []string
 
@@ -271,6 +295,9 @@ type ResolvedApexNativeDependencies struct {
 
 	// List of prebuilt_etcs to exclude from this APEX bundle.
 	Exclude_prebuilts []string
+
+	// List of prebuilt_kernel_modules to exclude from this APEX bundle.
+	Exclude_kernel_modules []string
 }
 
 // Merge combines another ApexNativeDependencies into this one
@@ -282,6 +309,7 @@ func (a *ResolvedApexNativeDependencies) Merge(ctx android.BaseModuleContext, b 
 	a.Tests = append(a.Tests, b.Tests...)
 	a.Filesystems = append(a.Filesystems, b.Filesystems...)
 	a.Prebuilts = append(a.Prebuilts, b.Prebuilts.GetOrDefault(ctx, nil)...)
+	a.Kernel_modules = append(a.Kernel_modules, b.Kernel_modules...)
 
 	a.Exclude_native_shared_libs = append(a.Exclude_native_shared_libs, b.Exclude_native_shared_libs...)
 	a.Exclude_jni_libs = append(a.Exclude_jni_libs, b.Exclude_jni_libs...)
@@ -290,6 +318,7 @@ func (a *ResolvedApexNativeDependencies) Merge(ctx android.BaseModuleContext, b 
 	a.Exclude_tests = append(a.Exclude_tests, b.Exclude_tests...)
 	a.Exclude_filesystems = append(a.Exclude_filesystems, b.Exclude_filesystems...)
 	a.Exclude_prebuilts = append(a.Exclude_prebuilts, b.Exclude_prebuilts...)
+	a.Exclude_kernel_modules = append(a.Exclude_kernel_modules, b.Exclude_kernel_modules...)
 }
 
 type apexMultilibProperties struct {
@@ -409,6 +438,10 @@ type overridableProperties struct {
 	// Mainline beta namespace. Each mainline module would have a dedicated server side
 	// namespace to support flag based A/B feature testing on mainline beta population.
 	Beta_namespace *string
+
+	// Mark the apex as non-production. Google Play Store will prevent it from being
+	// distributed to production channels.
+	Non_production *bool
 }
 
 // installPair stores a path to a built object and its install location.  It is used for holding
@@ -440,6 +473,7 @@ type apexBundle struct {
 	android.ModuleBase
 	android.DefaultableModuleBase
 	android.OverridableModuleBase
+	blueprint.ModuleUsesIncrementalWalkDeps
 
 	// Properties
 	properties            apexBundleProperties
@@ -574,7 +608,8 @@ type apexFile struct {
 	installDir string
 	partition  string
 	customStem string
-	symlinks   []string // additional symlinks
+	symlinks   []string             // additional symlinks
+	extraZip   android.OptionalPath // addition zip files to be unzipped into installDir
 
 	checkbuildTarget android.Path
 
@@ -627,7 +662,7 @@ func newApexFile(ctx android.BaseModuleContext, builtFile android.Path, androidM
 		module:              module,
 	}
 	if !module.IsNil() {
-		if buildTargetsInfo, ok := android.OtherModuleProvider(ctx, module, android.ModuleBuildTargetsProvider); ok {
+		if buildTargetsInfo := android.GetModuleBuildTargets(ctx, module); buildTargetsInfo != nil {
 			ret.checkbuildTarget = buildTargetsInfo.CheckbuildTarget
 		}
 		ret.moduleDir = ctx.OtherModuleDir(module)
@@ -741,6 +776,12 @@ type dependencyTag struct {
 	installable bool
 }
 
+type excludeFromVisibilityEnforcementDependencyTag struct {
+	dependencyTag
+}
+
+func (e excludeFromVisibilityEnforcementDependencyTag) ExcludeFromVisibilityEnforcement() {}
+
 func (d *dependencyTag) SdkMemberType(_ android.ModuleContext, _ android.ModuleProxy) android.SdkMemberType {
 	return d.memberType
 }
@@ -776,12 +817,14 @@ var (
 	compatConfigTag = &dependencyTag{name: "compatConfig", payload: true, sourceOnly: true, memberType: java.CompatConfigSdkMemberType}
 	javaLibTag      = &dependencyTag{name: "javaLib", payload: true}
 	jniLibTag       = &dependencyTag{name: "jniLib", payload: true}
-	keyTag          = &dependencyTag{name: "key"}
-	prebuiltTag     = &dependencyTag{name: "prebuilt", payload: true}
-	rroTag          = &dependencyTag{name: "rro", payload: true}
-	sharedLibTag    = &dependencyTag{name: "sharedLib", payload: true}
-	testTag         = &dependencyTag{name: "test", payload: true}
-	shBinaryTag     = &dependencyTag{name: "shBinary", payload: true}
+	//TODO(b/465840743): Enable the visibility enforcement for keyTag dependency.
+	keyTag           = &excludeFromVisibilityEnforcementDependencyTag{dependencyTag{name: "key"}}
+	prebuiltTag      = &dependencyTag{name: "prebuilt", payload: true}
+	rroTag           = &dependencyTag{name: "rro", payload: true}
+	sharedLibTag     = &dependencyTag{name: "sharedLib", payload: true}
+	testTag          = &dependencyTag{name: "test", payload: true}
+	shBinaryTag      = &dependencyTag{name: "shBinary", payload: true}
+	kernelModulesTag = &dependencyTag{name: "kernelModule", payload: true}
 )
 
 type fragmentInApexDepTag struct {
@@ -819,7 +862,7 @@ func addDependenciesForNativeModules(ctx android.BottomUpMutatorContext, nativeM
 		android.RemoveListFromList(nativeModules.Tests, nativeModules.Exclude_tests)...)
 	ctx.AddFarVariationDependencies(libVariations, jniLibTag,
 		android.RemoveListFromList(nativeModules.Jni_libs, nativeModules.Exclude_jni_libs)...)
-	ctx.AddFarVariationDependencies(libVariations, sharedLibTag,
+	ctx.AddVariationDependencies(libVariations, sharedLibTag,
 		android.RemoveListFromList(nativeModules.Native_shared_libs, nativeModules.Exclude_native_shared_libs)...)
 	ctx.AddFarVariationDependencies(rustLibVariations, sharedLibTag,
 		android.RemoveListFromList(nativeModules.Rust_dyn_libs, nativeModules.Exclude_rust_dyn_libs)...)
@@ -827,6 +870,8 @@ func addDependenciesForNativeModules(ctx android.BottomUpMutatorContext, nativeM
 		android.RemoveListFromList(nativeModules.Filesystems, nativeModules.Exclude_filesystems)...)
 	ctx.AddFarVariationDependencies(target.Variations(), prebuiltTag,
 		android.RemoveListFromList(nativeModules.Prebuilts, nativeModules.Exclude_prebuilts)...)
+	ctx.AddFarVariationDependencies(target.Variations(), kernelModulesTag,
+		android.RemoveListFromList(nativeModules.Kernel_modules, nativeModules.Exclude_kernel_modules)...)
 }
 
 func (a *apexBundle) combineProperties(ctx android.BottomUpMutatorContext) {
@@ -887,6 +932,7 @@ func (a *apexBundle) DepsMutator(ctx android.BottomUpMutatorContext) {
 			Rust_dyn_libs:      a.properties.Rust_dyn_libs,
 			Tests:              a.properties.Tests,
 			Jni_libs:           a.properties.Jni_libs,
+			Kernel_modules:     a.properties.Kernel_modules,
 		})
 
 		// Add native modules targeting the first ABI When multilib.* is omitted for
@@ -935,7 +981,7 @@ func (a *apexBundle) DepsMutator(ctx android.BottomUpMutatorContext) {
 			ctx.AddFarVariationDependencies([]blueprint.Variation{
 				{Mutator: "os", Variation: target.OsVariation()},
 				{Mutator: "arch", Variation: target.ArchVariation()},
-			}, shBinaryTag, a.properties.Sh_binaries...)
+			}, shBinaryTag, a.properties.Sh_binaries.GetOrDefault(ctx, nil)...)
 		}
 	}
 
@@ -947,7 +993,7 @@ func (a *apexBundle) DepsMutator(ctx android.BottomUpMutatorContext) {
 	ctx.AddFarVariationDependencies(commonVariation, sscpfTag, a.properties.Systemserverclasspath_fragments.GetOrDefault(ctx, nil)...)
 	ctx.AddFarVariationDependencies(commonVariation, javaLibTag, a.properties.Java_libs...)
 	ctx.AddFarVariationDependencies(commonVariation, fsTag, a.properties.Filesystems...)
-	ctx.AddFarVariationDependencies(commonVariation, compatConfigTag, a.properties.Compat_configs...)
+	ctx.AddFarVariationDependencies(commonVariation, compatConfigTag, a.properties.Compat_configs.GetOrDefault(ctx, nil)...)
 
 	// Add a reverse dependency to all_apex_certs singleton module.
 	// all_apex_certs will use this dependency to collect the certificate of this apex.
@@ -958,6 +1004,8 @@ func (a *apexBundle) DepsMutator(ctx android.BottomUpMutatorContext) {
 	if ctx.OtherModuleExists("all_apex_contributions") {
 		ctx.AddDependency(ctx.Module(), android.AcDepTag, "all_apex_contributions")
 	}
+
+	ctx.AddHostToolDependencies("zipsync", "apex_compression_tool", "gen_apex_symbols", "dexdeps")
 }
 
 type allApexCertsDependencyTag struct {
@@ -1105,12 +1153,14 @@ var (
 		"com.android.ipsec",
 		"com.android.media",
 		"com.android.mediaprovider",
+		"com.android.nfcservices",
 		"com.android.ondevicepersonalization",
 		"com.android.os.statsd",
 		"com.android.permission",
 		"com.android.profiling",
 		"com.android.rkpd",
 		"com.android.scheduling",
+		"com.android.telephonycore",
 		"com.android.tethering",
 		"com.android.uwb",
 		"com.android.wifi",
@@ -1208,6 +1258,10 @@ func (a *apexTransitionMutator) Split(ctx android.BaseModuleContext) []android.A
 		return ai.ApexTransitionMutatorSplit(ctx)
 	}
 	return []android.ApexInfo{{}}
+}
+
+func (a *apexTransitionMutator) SplitOnDemand(ctx android.BaseModuleContext) []android.ApexInfo {
+	return nil
 }
 
 func (a *apexTransitionMutator) OutgoingTransition(ctx android.OutgoingTransitionContext, sourceInfo android.ApexInfo) android.ApexInfo {
@@ -1341,6 +1395,10 @@ func (a *apexBundle) dynamic_common_lib_apex() bool {
 	return proptools.BoolDefault(a.properties.Dynamic_common_lib_apex, false)
 }
 
+func (a *apexBundle) nonProduction() bool {
+	return proptools.Bool(a.overridableProperties.Non_production)
+}
+
 // These functions are interfacing with cc/sanitizer.go. The entire APEX (along with all of its
 // members) can be sanitized, either forcibly, or by the global configuration. For some of the
 // sanitizers, extra dependencies can be forcibly added as well.
@@ -1366,6 +1424,9 @@ func (a *apexBundle) IsSanitizerEnabled(config android.Config, sanitizerName str
 }
 
 func (a *apexBundle) AddSanitizerDependencies(ctx android.BottomUpMutatorContext, sanitizerName string) {
+	if ctx.Config().GetBuildFlagBool("RELEASE_DEPRECATE_RUNTIME_APEX") {
+		return
+	}
 	// TODO(jiyong): move this info (the sanitizer name, the lib name, etc.) to cc/sanitize.go
 	// Keep only the mechanism here.
 	if sanitizerName == "hwaddress" && strings.HasPrefix(a.Name(), "com.android.runtime") {
@@ -1581,6 +1642,12 @@ func apexFilesForAndroidApp(ctx android.BaseModuleContext, module android.Module
 		dirInApex := filepath.Join("etc", "permissions")
 		privAppAllowlist := newApexFile(ctx, allowlist.Path(), commonInfo.BaseModuleName+"_privapp", dirInApex, etc, module)
 		apexFiles = append(apexFiles, privAppAllowlist)
+	}
+
+	if preinstall := aapp.PreinstallAllowlist; preinstall.Valid() {
+		dirInApex := filepath.Join("etc", "sysconfig")
+		preinstallAllowlist := newApexFile(ctx, preinstall.Path(), commonInfo.BaseModuleName+"_preinstall", dirInApex, etc, module)
+		apexFiles = append(apexFiles, preinstallAllowlist)
 	}
 
 	apexFiles = append(apexFiles, af)
@@ -1932,6 +1999,7 @@ func (a *apexBundle) depVisitor(vctx *visitorContext, ctx android.ModuleContext,
 					appDirName := filepath.Join(appDir, commonInfo.BaseModuleName+"@"+sanitizedBuildIdForPath(ctx))
 					af := newApexFile(ctx, appInfo.OutputFile, commonInfo.BaseModuleName, appDirName, appSet, child)
 					af.certificate = java.PresignedCertificate
+					af.extraZip = android.OptionalPathForPath(appInfo.PackedAdditionalOutputs)
 					vctx.filesInfo = append(vctx.filesInfo, af)
 				} else {
 					vctx.filesInfo = append(vctx.filesInfo, apexFilesForAndroidApp(ctx, child, commonInfo, appInfo)...)
@@ -1981,6 +2049,19 @@ func (a *apexBundle) depVisitor(vctx *visitorContext, ctx android.ModuleContext,
 				}
 			} else {
 				ctx.PropertyErrorf("prebuilts", "%q is not a prebuilt_etc module", depName)
+			}
+		case kernelModulesTag:
+			if _, ok := android.OtherModuleProvider(ctx, child, android.PrebuiltKernelModulesComplianceMetadataProvider); ok {
+				for _, ps := range android.GetInstallFilesCommon(commonInfo).PackagingSpecs {
+					src := ps.SrcPath()
+					dir := path.Dir(ps.RelPathInPackage())
+					makeModuleName := strings.ReplaceAll(filepath.Join(dir, src.Base()), "/", "_")
+					af := newApexFile(ctx, src, makeModuleName, dir, etc, child)
+					af.extraZip = ps.ExtraZip()
+					vctx.filesInfo = append(vctx.filesInfo, af)
+				}
+			} else {
+				ctx.PropertyErrorf("kernel_modules", "%q is not a prebuilt_kernel_modules module", depName)
 			}
 		case compatConfigTag:
 			if compatConfig, ok := android.OtherModuleProvider(ctx, child, java.PlatformCompatConfigInfoProvider); ok {
@@ -2137,6 +2218,8 @@ func (a *apexBundle) depVisitor(vctx *visitorContext, ctx android.ModuleContext,
 		// nothing
 	} else if depTag == android.RequiredDepTag {
 		// nothing
+	} else if depTag == cc.LFIDepTag {
+		// nothing
 	} else if commonInfo.IsInstallableToApex {
 		ctx.ModuleErrorf("unexpected tag %s for indirect dependency %q", android.PrettyPrintTag(depTag), depName)
 	} else if android.IsVintfDepTag(depTag) {
@@ -2246,15 +2329,11 @@ func (a *apexBundle) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	a.verifyNativeImplementationLibs(ctx)
 	a.enforceNoVintfInUpdatable(ctx)
 
-	android.SetProvider(ctx, android.ApexBundleDepsDataProvider, android.ApexBundleDepsData{
-		FlatListPath: a.FlatListPath(),
-		Updatable:    a.Updatable(),
-	})
-
 	android.SetProvider(ctx, filesystem.ApexKeyPathInfoProvider, filesystem.ApexKeyPathInfo{a.apexKeysPath})
 
 	android.SetProvider(ctx, java.ApkCertsInfoProvider, a.apkCerts)
 	a.setSymbolInfosProvider(ctx)
+	a.setProguardInfosProvider(ctx)
 
 	pem, key := a.getCertificateAndPrivateKey(ctx)
 	android.SetProvider(ctx, android.ApexBundleTypeInfoProvider, android.ApexBundleTypeInfo{
@@ -2371,7 +2450,7 @@ func apexBootclasspathFragmentFiles(ctx android.ModuleContext, module android.Mo
 			// We need to copy the profile to a temporary path with the right filename because the apexer
 			// will take the filename as is.
 			ctx.Build(pctx, android.BuildParams{
-				Rule:   android.Cp,
+				Rule:   android.CpRule,
 				Input:  pathOnHost,
 				Output: tempPath,
 			})
@@ -2675,7 +2754,7 @@ func (a *apexBundle) checkApexAvailability(ctx android.ModuleContext) {
 
 	// Temporarily bypass /product APEXes with a specific prefix.
 	// TODO: b/352818241 - Remove this after APEX availability is enforced for /product APEXes.
-	if a.ProductSpecific() && strings.HasPrefix(a.ApexVariationName(), "com.sdv.") {
+	if a.ProductSpecific() && sdvApexPattern.MatchString(a.ApexVariationName()) {
 		return
 	}
 
@@ -2997,5 +3076,21 @@ func (a *apexBundle) setSymbolInfosProvider(ctx android.ModuleContext) {
 		}
 
 		cc.CopySymbolsAndSetSymbolsInfoProvider(ctx, infos)
+	}
+}
+
+func (a *apexBundle) setProguardInfosProvider(ctx android.ModuleContext) {
+	var proguardInfos java.ProguardInfos
+	ctx.VisitDirectDepsProxy(func(child android.ModuleProxy) {
+		tag := ctx.OtherModuleDependencyTag(child)
+		if tag == androidAppTag || tag == bcpfTag || tag == sscpfTag || tag == javaLibTag {
+			if infos, ok := android.OtherModuleProvider(ctx, child, java.ProguardProvider); ok {
+				proguardInfos = append(proguardInfos, infos...)
+			}
+		}
+	})
+
+	if len(proguardInfos) > 0 {
+		android.SetProvider(ctx, java.ProguardProvider, proguardInfos)
 	}
 }

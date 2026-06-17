@@ -23,10 +23,11 @@ import (
 
 	"android/soong/android"
 	"android/soong/cc/config"
+
 	"github.com/google/blueprint"
 )
 
-//go:generate go run ../../blueprint/gobtools/codegen/gob_gen.go
+//go:generate go run ../../blueprint/gobtools/codegen
 
 type lsdumpTag string
 
@@ -251,6 +252,10 @@ func (s *sabiTransitionMutator) Split(ctx android.BaseModuleContext) []string {
 	return []string{""}
 }
 
+func (s *sabiTransitionMutator) SplitOnDemand(ctx android.BaseModuleContext) []string {
+	return nil
+}
+
 func (s *sabiTransitionMutator) OutgoingTransition(ctx android.OutgoingTransitionContext, sourceVariation string) string {
 	// Escape hatch to not check any ABI dump.
 	if ctx.Config().IsEnvTrue("SKIP_ABI_CHECKS") {
@@ -429,7 +434,7 @@ func checkAbiDumpList(ctx android.SingletonContext, stubLibraries []string) {
 		android.ErrorRule(ctx, checkAbiDumpListTimestamp, errorMsg)
 	} else {
 		ctx.Build(pctx, android.BuildParams{
-			Rule:   android.Touch,
+			Rule:   android.TouchRule,
 			Output: checkAbiDumpListTimestamp,
 		})
 	}

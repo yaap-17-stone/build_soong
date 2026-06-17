@@ -25,15 +25,14 @@ import (
 	"android/soong/android"
 )
 
-func init() {
-	pctx.HostBinToolVariable("logtagsCmd", "java-event-log-tags")
-}
-
 var (
+	logtagCmd = pctx.HostTool("java-event-log-tags")
+
 	logtags = pctx.AndroidStaticRule("logtags",
 		blueprint.RuleParams{
-			Command:     "$logtagsCmd -o $out $in",
-			CommandDeps: []string{"$logtagsCmd"},
+			Command2: blueprint.NewCommand(
+				logtagCmd, ` -o $out $in`,
+			),
 		})
 )
 
@@ -50,7 +49,7 @@ func genAidl(ctx android.ModuleContext, aidlFiles android.Paths, aidlGlobalFlags
 
 		outDir := srcJarFile.ReplaceExtension(ctx, "tmp")
 
-		rule := android.NewRuleBuilder(pctx, ctx)
+		rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 
 		rule.Command().Text("rm -rf").Flag(outDir.String())
 		rule.Command().Text("mkdir -p").Flag(outDir.String())
@@ -170,7 +169,7 @@ func (j *Module) genSources(ctx android.ModuleContext, srcFiles android.Paths,
 		outSrcFiles = append(outSrcFiles, srcJarFiles...)
 	}
 
-	android.SetProvider(ctx, android.LogtagsProviderKey, &android.LogtagsInfo{
+	ctx.SetLogtagsInfo(&android.LogtagsInfo{
 		Logtags: j.logtagsSrcs,
 	})
 

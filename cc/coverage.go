@@ -209,14 +209,20 @@ func (cov *coverage) flags(ctx ModuleContext, flags Flags, deps PathDeps) (Flags
 	return flags, deps
 }
 
-func (cov *coverage) begin(ctx BaseModuleContext) {
-	if IsCoverageEnabled(ctx) {
+func (cov *coverage) begin(ctx BaseModuleContext, binary bool, test bool) {
+	if IsCoverageEnabled(ctx, binary, test) {
 		cov.Properties = SetCoverageProperties(ctx, cov.Properties, ctx.nativeCoverage(), ctx.useSdk(), ctx.sdkVersion())
 	}
 }
 
-func IsCoverageEnabled(ctx android.BaseModuleContext) bool {
+func IsCoverageEnabled(ctx android.BaseModuleContext, binary bool, test bool) bool {
 	if ctx.Host() {
+		// Only allow coverage for host modules if they are explicitly marked as tests
+		// or if they are libraries (which might be dependencies of tests).
+		// Build tools (binaries that are NOT tests) should be excluded.
+		if binary && !test {
+			return false
+		}
 		// Host coverage is only supported on Linux 64-bit binaries
 		if !ctx.Os().Linux() {
 			return false
@@ -246,6 +252,11 @@ func SetCoverageProperties(ctx android.BaseModuleContext, properties CoveragePro
 			if fromApi, err := strconv.Atoi(sdkVersion); err == nil && fromApi < 23 {
 				needCoverageVariant = false
 			}
+		}
+
+		// Coverage is still untested with LFI
+		if ctx.Target().LFI {
+			needCoverageVariant = false
 		}
 
 		if needCoverageVariant {
@@ -290,7 +301,7 @@ type UseCoverageDeptag interface {
 
 type coverageTransitionMutator struct{}
 
-func (c coverageTransitionMutator) Split(ctx android.BaseModuleContext) []string {
+func (c coverageTransitionMutator) split(ctx android.BaseModuleContext) []string {
 	if c, ok := ctx.Module().(*Module); ok && c.coverage != nil {
 		if c.coverage.Properties.NeedCoverageVariant {
 			return []string{"", "cov"}
@@ -309,6 +320,24 @@ func (c coverageTransitionMutator) Split(ctx android.BaseModuleContext) []string
 	}
 
 	return []string{""}
+}
+
+func (c coverageTransitionMutator) Split(ctx android.BaseModuleContext) []string {
+	allSplits := c.split(ctx)
+	if ctx.Config().GetBuildFlagBool("RELEASE_SOONG_COV_VARIANT_ON_DEMAND") {
+		return allSplits[0:1]
+	} else {
+		return allSplits
+	}
+}
+
+func (c coverageTransitionMutator) SplitOnDemand(ctx android.BaseModuleContext) []string {
+	allSplits := c.split(ctx)
+	if len(allSplits) <= 1 || !ctx.Config().GetBuildFlagBool("RELEASE_SOONG_COV_VARIANT_ON_DEMAND") {
+		return nil
+	} else {
+		return allSplits[1:]
+	}
 }
 
 func (c coverageTransitionMutator) OutgoingTransition(ctx android.OutgoingTransitionContext, sourceVariation string) string {
@@ -381,7 +410,7 @@ func ParseSymbolFileForAPICoverage(ctx android.ModuleContext, symbolFile string)
 	symbolFilePath := android.PathForModuleSrc(ctx, symbolFile)
 	outputFile := ctx.Module().(LinkableInterface).BaseModuleName() + ".xml"
 	parsedApiCoveragePath := android.PathForModuleOut(ctx, outputFile)
-	rule := android.NewRuleBuilder(pctx, ctx)
+	rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	rule.Command().
 		BuiltTool("ndk_api_coverage_parser").
 		Input(symbolFilePath).

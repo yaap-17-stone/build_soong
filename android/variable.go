@@ -75,6 +75,10 @@ type variableProperties struct {
 			Header_libs         []string `android:"arch_variant"`
 		} `android:"arch_variant"`
 
+		Malloc_scudo_tsds_max struct {
+			Cflags []string `android:"arch_variant"`
+		} `android:"arch_variant"`
+
 		Malloc_zero_contents struct {
 			Cflags []string `android:"arch_variant"`
 		} `android:"arch_variant"`
@@ -92,16 +96,6 @@ type variableProperties struct {
 		}
 
 		Override_rs_driver struct {
-			Cflags []string
-		}
-
-		// treble_linker_namespaces is true when the system/vendor linker namespace separation is
-		// enabled.
-		Treble_linker_namespaces struct {
-			Cflags []string
-		}
-		// enforce_vintf_manifest is true when a device is required to have a vintf manifest.
-		Enforce_vintf_manifest struct {
 			Cflags []string
 		}
 
@@ -147,6 +141,7 @@ type variableProperties struct {
 		Eng struct {
 			Cflags   []string
 			Cppflags []string
+			Flags    []string
 			Lto      struct {
 				Never *bool
 			}
@@ -200,30 +195,33 @@ type ProductVariables struct {
 	// Suffix to add to generated Makefiles
 	Make_suffix *string `json:",omitempty"`
 
-	BuildId              *string `json:",omitempty"`
-	BuildFingerprintFile *string `json:",omitempty"`
-	BuildNumberFile      *string `json:",omitempty"`
-	BuildHostnameFile    *string `json:",omitempty"`
-	BuildThumbprintFile  *string `json:",omitempty"`
-	DisplayBuildNumber   *bool   `json:",omitempty"`
+	BuildId                    *string `json:",omitempty"`
+	BuildFingerprintFile       *string `json:",omitempty"`
+	BuildNumberFile            *string `json:",omitempty"`
+	BuildUUIDFile              *string `json:",omitempty"`
+	BuildHostnameFile          *string `json:",omitempty"`
+	BuildSystemFingerprintFile *string `json:",omitempty"`
+	BuildThumbprintFile        *string `json:",omitempty"`
+	DisplayBuildNumber         *bool   `json:",omitempty"`
 
+	Platform_base_os                       *string  `json:",omitempty"`
+	Platform_base_sdk_extension_version    *int     `json:",omitempty"`
 	Platform_display_version_name          *string  `json:",omitempty"`
-	Platform_version_name                  *string  `json:",omitempty"`
+	Platform_preview_sdk_version           *string  `json:",omitempty"`
+	Platform_prospective_sdk_version_full  *string  `json:",omitempty"`
+	Platform_sdk_codename                  *string  `json:",omitempty"`
+	Platform_sdk_extension_version         *int     `json:",omitempty"`
+	Platform_sdk_final                     *bool    `json:",omitempty"`
 	Platform_sdk_version                   *int     `json:",omitempty"`
 	Platform_sdk_version_full              *string  `json:",omitempty"`
-	Platform_sdk_codename                  *string  `json:",omitempty"`
 	Platform_sdk_version_or_codename       *string  `json:",omitempty"`
-	Platform_sdk_final                     *bool    `json:",omitempty"`
-	Platform_sdk_extension_version         *int     `json:",omitempty"`
-	Platform_base_sdk_extension_version    *int     `json:",omitempty"`
+	Platform_security_patch                *string  `json:",omitempty"`
+	Platform_systemsdk_versions            []string `json:",omitempty"`
 	Platform_version_active_codenames      []string `json:",omitempty"`
 	Platform_version_all_preview_codenames []string `json:",omitempty"`
-	Platform_systemsdk_versions            []string `json:",omitempty"`
-	Platform_security_patch                *string  `json:",omitempty"`
-	Platform_preview_sdk_version           *string  `json:",omitempty"`
-	Platform_base_os                       *string  `json:",omitempty"`
-	Platform_version_last_stable           *string  `json:",omitempty"`
 	Platform_version_known_codenames       *string  `json:",omitempty"`
+	Platform_version_last_stable           *string  `json:",omitempty"`
+	Platform_version_name                  *string  `json:",omitempty"`
 
 	DeviceName                            *string  `json:",omitempty" generic:"generic"`
 	DeviceProduct                         *string  `json:",omitempty" generic:"generic"`
@@ -282,6 +280,7 @@ type ProductVariables struct {
 	ExtraOtaRecoveryKeys                     []string `json:",omitempty"`
 	MainlineSepolicyDevCertificates          *string  `json:",omitempty"`
 	MainlineBluetoothSepolicyDevCertificates *string  `json:",omitempty"`
+	MainlineNfcSepolicyDevCertificates       *string  `json:",omitempty"`
 
 	AppsDefaultVersionName *string `json:",omitempty"`
 
@@ -292,6 +291,7 @@ type ProductVariables struct {
 	Always_use_prebuilt_sdks     *bool    `json:",omitempty"`
 	Skip_boot_jars_check         *bool    `json:",omitempty"`
 	Malloc_low_memory            *bool    `json:",omitempty"`
+	Malloc_scudo_tsds_max        *bool    `json:",omitempty"`
 	Malloc_zero_contents         *bool    `json:",omitempty"`
 	Malloc_pattern_fill_contents *bool    `json:",omitempty"`
 	Safestack                    *bool    `json:",omitempty"`
@@ -300,13 +300,9 @@ type ProductVariables struct {
 	UseABFS                      *bool    `json:",omitempty"`
 	UseRBE                       *bool    `json:",omitempty"`
 	UseREWrapper                 *bool    `json:",omitempty"`
-	UseRBEJAVAC                  *bool    `json:",omitempty"`
-	UseRBER8                     *bool    `json:",omitempty"`
-	UseRBED8                     *bool    `json:",omitempty"`
+	RBEContainerImage            *string  `json:",omitempty"`
 	Debuggable                   *bool    `json:",omitempty"`
 	Eng                          *bool    `json:",omitempty"`
-	Treble_linker_namespaces     *bool    `json:",omitempty"`
-	Enforce_vintf_manifest       *bool    `json:",omitempty"`
 	Uml                          *bool    `json:",omitempty"`
 	Arc                          *bool    `json:",omitempty"`
 	MinimizeJavaDebugInfo        *bool    `json:",omitempty"`
@@ -327,6 +323,9 @@ type ProductVariables struct {
 	EnableCFI       *bool    `json:",omitempty"`
 	CFIExcludePaths []string `json:",omitempty"`
 	CFIIncludePaths []string `json:",omitempty"`
+
+	EnableXOM       *bool    `json:",omitempty"`
+	XOMExcludePaths []string `json:",omitempty"`
 
 	DisableScudo *bool `json:",omitempty"`
 
@@ -389,8 +388,6 @@ type ProductVariables struct {
 
 	PgoAdditionalProfileDirs []string `json:",omitempty"`
 
-	MultitreeUpdateMeta bool `json:",omitempty"`
-
 	BoardVendorSepolicyDirs      []string `json:",omitempty"`
 	BoardOdmSepolicyDirs         []string `json:",omitempty"`
 	SystemExtPublicSepolicyDirs  []string `json:",omitempty"`
@@ -411,10 +408,14 @@ type ProductVariables struct {
 
 	Ndk_abis *bool `json:",omitempty"`
 
-	ForceApexSymlinkOptimization *bool   `json:",omitempty"`
-	CompressedApex               *bool   `json:",omitempty"`
-	DefaultApexPayloadType       *string `json:",omitempty"`
-	Aml_abis                     *bool   `json:",omitempty"`
+	ForceApexSymlinkOptimization *bool `json:",omitempty"`
+	CompressedApex               *bool `json:",omitempty"`
+	Aml_abis                     *bool `json:",omitempty"`
+
+	DefaultApexPayloadType               *string `json:",omitempty"`
+	DefaultApexPayloadErofsCompressor    *string `json:",omitempty"`
+	DefaultApexPayloadErofsCompressHints *string `json:",omitempty"`
+	DefaultApexPayloadErofsPclusterSize  int64   `json:",omitempty"`
 
 	DexpreoptGlobalConfig *string `json:",omitempty"`
 
@@ -562,6 +563,8 @@ type ProductVariables struct {
 	SELinuxTrebleLabelingTrackingListFile *string `json:",omitempty"`
 
 	BuildOTAPackage *bool `json:",omitempty"`
+
+	RestrictsAshmemUsage bool `json:",omitempty"`
 }
 
 type CompatibilityTestcaseJSON struct {
@@ -576,6 +579,7 @@ type PartitionQualifiedVariablesType struct {
 	BoardErofsCompressHints     string `json:",omitempty"`
 	BoardErofsPclusterSize      string `json:",omitempty"`
 	BoardErofsBlockSize         string `json:",omitempty"`
+	BoardErofsEnableDedupe      string `json:",omitempty"`
 	BoardExtfsInodeCount        string `json:",omitempty"`
 	BoardExtfsRsvPct            string `json:",omitempty"`
 	BoardF2fsSloadCompressFlags string `json:",omitempty"`
@@ -584,10 +588,6 @@ type PartitionQualifiedVariablesType struct {
 	BoardJournalSize            string `json:",omitempty"`
 	BoardPartitionReservedSize  string `json:",omitempty"`
 	BoardPartitionSize          string `json:",omitempty"`
-	BoardSquashfsBlockSize      string `json:",omitempty"`
-	BoardSquashfsCompressor     string `json:",omitempty"`
-	BoardSquashfsCompressorOpt  string `json:",omitempty"`
-	BoardSquashfsDisable4kAlign string `json:",omitempty"`
 	ProductBaseFsPath           string `json:",omitempty"`
 	ProductHeadroom             string `json:",omitempty"`
 	ProductVerityPartition      string `json:",omitempty"`
@@ -631,10 +631,9 @@ type PartitionVariables struct {
 	TargetUserimagesUseExt3     bool `json:",omitempty"`
 	TargetUserimagesUseExt4     bool `json:",omitempty"`
 
-	TargetUserimagesSparseExtDisabled      bool `json:",omitempty"`
-	TargetUserimagesSparseErofsDisabled    bool `json:",omitempty"`
-	TargetUserimagesSparseSquashfsDisabled bool `json:",omitempty"`
-	TargetUserimagesSparseF2fsDisabled     bool `json:",omitempty"`
+	TargetUserimagesSparseExtDisabled   bool `json:",omitempty"`
+	TargetUserimagesSparseErofsDisabled bool `json:",omitempty"`
+	TargetUserimagesSparseF2fsDisabled  bool `json:",omitempty"`
 
 	BoardErofsCompressor           string `json:",omitempty"`
 	BoardErofsCompressorHints      string `json:",omitempty"`
@@ -642,6 +641,7 @@ type PartitionVariables struct {
 	BoardErofsBlockSize            string `json:",omitempty"`
 	BoardErofsShareDupBlocks       string `json:",omitempty"`
 	BoardErofsUseLegacyCompression string `json:",omitempty"`
+	BoardErofsEnableDedupe         string `json:",omitempty"`
 	BoardExt4ShareDupBlocks        string `json:",omitempty"`
 	BoardFlashLogicalBlockSize     string `json:",omitempty"`
 	BoardFlashEraseBlockSize       string `json:",omitempty"`
@@ -662,7 +662,6 @@ type PartitionVariables struct {
 	ProductBuildVendorBootImage       string   `json:",omitempty"`
 	ProductBuildInitBootImage         bool     `json:",omitempty"`
 	BoardUsesRecoveryAsBoot           bool     `json:",omitempty"`
-	BoardPrebuiltBootimage            string   `json:",omitempty"`
 	BoardPrebuiltInitBootimage        string   `json:",omitempty"`
 	BoardBootimagePartitionSize       string   `json:",omitempty"`
 	BoardVendorBootimagePartitionSize string   `json:",omitempty"`
@@ -760,18 +759,22 @@ type PartitionVariables struct {
 	DeviceFcmFileOfMakefile                     map[string][]string `json:",omitempty"`
 	ArtifactPathRequirementsIsRelaxedOfMakefile map[string]bool     `json:",omitempty"`
 
-	BuildingSystemDlkmImage             bool     `json:",omitempty"`
-	SystemKernelModules                 []string `json:",omitempty"`
-	SystemKernelBlocklistFile           string   `json:",omitempty"`
-	SystemKernelLoadModules             []string `json:",omitempty"`
-	BuildingVendorDlkmImage             bool     `json:",omitempty"`
-	VendorKernelModules                 []string `json:",omitempty"`
-	VendorKernelModulesLoad             []string `json:",omitempty"`
-	VendorKernelBlocklistFile           string   `json:",omitempty"`
-	VendorKernelModules2ndStage16kbMode []string `json:",omitempty"`
-	BuildingOdmDlkmImage                bool     `json:",omitempty"`
-	OdmKernelModules                    []string `json:",omitempty"`
-	OdmKernelBlocklistFile              string   `json:",omitempty"`
+	BoardKernelModulesZip                              string   `json:",omitempty"`
+	BoardKernelModulesZipExtraVendorKernelRamdiskLoads []string `json:",omitempty"`
+	BoardKernelModulesZipExtraVendorKernelModules      []string `json:",omitempty"`
+	BoardKernelModulesZipExtraBlocked16kModules        []string `json:",omitempty"`
+	BuildingSystemDlkmImage                            bool     `json:",omitempty"`
+	SystemKernelModules                                []string `json:",omitempty"`
+	SystemKernelBlocklistFile                          string   `json:",omitempty"`
+	SystemKernelLoadModules                            []string `json:",omitempty"`
+	BuildingVendorDlkmImage                            bool     `json:",omitempty"`
+	VendorKernelModules                                []string `json:",omitempty"`
+	VendorKernelModulesLoad                            []string `json:",omitempty"`
+	VendorKernelBlocklistFile                          string   `json:",omitempty"`
+	VendorKernelModules2ndStage16kbMode                []string `json:",omitempty"`
+	BuildingOdmDlkmImage                               bool     `json:",omitempty"`
+	OdmKernelModules                                   []string `json:",omitempty"`
+	OdmKernelBlocklistFile                             string   `json:",omitempty"`
 
 	VendorRamdiskKernelModules       []string `json:",omitempty"`
 	VendorRamdiskKernelBlocklistFile string   `json:",omitempty"`
@@ -794,6 +797,8 @@ type PartitionVariables struct {
 	ProductFsCasefold    string `json:",omitempty"`
 	ProductQuotaProjid   string `json:",omitempty"`
 	ProductFsCompression string `json:",omitempty"`
+	BoardF2fsBlockSize   string `json:",omitempty"`
+	BoardF2fsPackedSsa   string `json:",omitempty"`
 
 	ReleaseToolsExtensionDir string `json:",omitempty"`
 
@@ -812,6 +817,16 @@ type PartitionVariables struct {
 	VendorBlobsLicense string `json:",omitempty"`
 
 	MinimalFontFootprint bool `json:",omitempty"`
+
+	CustomImagesPartitions []string `json:",omitempty"`
+
+	ProductRestrictVendorFiles       string   `json:",omitempty"`
+	VendorProductRestrictVendorFiles string   `json:",omitempty"`
+	VendorExceptionPaths             []string `json:",omitempty"`
+	VendorExceptionModules           []string `json:",omitempty"`
+
+	AllDistGoalOutputPairs []string `json:",omitempty"`
+	AllDistSrcDstPairs     []string `json:",omitempty"`
 }
 
 func boolPtr(v bool) *bool {
@@ -859,6 +874,7 @@ func (v *ProductVariables) SetDefaultConfig() {
 		AAPTPrebuiltDPI:     []string{"xhdpi", "xxhdpi"},
 
 		Malloc_low_memory:            boolPtr(false),
+		Malloc_scudo_tsds_max:        boolPtr(false),
 		Malloc_zero_contents:         boolPtr(true),
 		Malloc_pattern_fill_contents: boolPtr(false),
 		Safestack:                    boolPtr(false),
@@ -899,7 +915,7 @@ func VariableMutator(mctx BottomUpMutatorContext) {
 
 	variableValues := reflect.ValueOf(a.variableProperties).Elem().FieldByName("Product_variables")
 
-	productVariables := reflect.ValueOf(mctx.Config().productVariables)
+	productVariables := reflect.ValueOf(&mctx.Config().productVariables).Elem()
 
 	for i := 0; i < variableValues.NumField(); i++ {
 		variableValue := variableValues.Field(i)

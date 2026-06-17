@@ -92,14 +92,9 @@ var hwasanFlags = []string{
 	"-C llvm-args=--aarch64-enable-global-isel-at-O=-1",
 	"-C llvm-args=-fast-isel=false",
 	"-C llvm-args=-instcombine-lower-dbg-declare=0",
-}
-var hwasanFlagsExtra = []string{
+
 	// Additional flags for HWASAN-ified Rust/C interop
 	"-C llvm-args=-hwasan-mapping-offset-dynamic=ifunc",
-}
-var hwasanFlagsDeprecated = []string{
-	// --hwasan-with-ifunc is replaced by -hwasan-mapping-offset-dynamic=ifunc in LLVM 20
-	"-C llvm-args=--hwasan-with-ifunc",
 }
 
 func init() {
@@ -247,11 +242,6 @@ func (sanitize *sanitize) flags(ctx ModuleContext, flags Flags, deps PathDeps) (
 
 	if Bool(sanitize.Properties.Sanitize.Hwaddress) {
 		flags.RustFlags = append(flags.RustFlags, hwasanFlags...)
-		if config.GetRustVersion(ctx) >= "1.87" {
-			flags.RustFlags = append(flags.RustFlags, hwasanFlagsExtra...)
-		} else {
-			flags.RustFlags = append(flags.RustFlags, hwasanFlagsDeprecated...)
-		}
 	}
 
 	if Bool(sanitize.Properties.Sanitize.Address) {
@@ -259,7 +249,7 @@ func (sanitize *sanitize) flags(ctx ModuleContext, flags Flags, deps PathDeps) (
 		if ctx.Host() {
 			// -nodefaultlibs (provided with libc++) prevents the driver from linking
 			// libraries needed with -fsanitize=address. http://b/18650275 (WAI)
-			flags.LinkFlags = append(flags.LinkFlags, []string{"-Wl,--no-as-needed"}...)
+			flags.LinkFlags = flags.LinkFlags.AppendNoDeps("-Wl,--no-as-needed")
 		}
 	}
 	return flags, deps

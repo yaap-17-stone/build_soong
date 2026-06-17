@@ -30,16 +30,19 @@ import (
 	"android/soong/phony"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 var (
 	pctx = android.NewPackageContext("android/soong/test_suites")
 
 	_ = pctx.HostBinToolVariable("buildLicenseMetadataCmd", "build_license_metadata")
 
 	licenseMetadataRule = pctx.AndroidStaticRule("licenseMetadataRule", blueprint.RuleParams{
-		Command:        "${buildLicenseMetadataCmd} -o $out @${out}.rsp",
-		CommandDeps:    []string{"${buildLicenseMetadataCmd}"},
-		Rspfile:        "${out}.rsp",
-		RspfileContent: "${args}",
+		Command:         "${buildLicenseMetadataCmd} -o $out @${out}.rsp",
+		CommandDeps:     []string{"${buildLicenseMetadataCmd}"},
+		Rspfile:         "${out}.rsp",
+		RspfileContent:  "${args}",
+		SandboxDisabled: true,
 	}, "args")
 )
 
@@ -80,6 +83,7 @@ func (t *testSuiteFiles) GenerateBuildActions(ctx android.SingletonContext) {
 		"device-tests",
 		"vts",
 		"tvts",
+		"sdvts",
 		"art-host-tests",
 		"host-unit-tests",
 		"sdv-host-unit-tests",
@@ -87,18 +91,23 @@ func (t *testSuiteFiles) GenerateBuildActions(ctx android.SingletonContext) {
 		"automotive-tests",
 		"automotive-general-tests",
 		"automotive-sdv-tests",
+		"chdts",
 	}
 
 	ctx.VisitAllModuleProxies(func(m android.ModuleProxy) {
 		commonInfo := android.OtherModuleProviderOrDefault(ctx, m, android.CommonModuleInfoProvider)
-		testSuiteSharedLibsInfo := android.OtherModuleProviderOrDefault(ctx, m, android.TestSuiteSharedLibsInfoProvider)
-		makeName := android.OtherModuleProviderOrDefault(ctx, m, android.MakeNameInfoProvider).Name
+		var makeName string
+		var sharedLibsMakeNames []string
+		if makeNameInfo := commonInfo.MakeNames; makeNameInfo != nil {
+			makeName = makeNameInfo.MakeName
+			sharedLibsMakeNames = makeNameInfo.SharedLibsMakeNames
+		}
 		if makeName != "" && commonInfo.Target.Os == ctx.Config().BuildOS {
-			sharedLibGraph[makeName] = append(sharedLibGraph[makeName], testSuiteSharedLibsInfo.MakeNames...)
+			sharedLibGraph[makeName] = append(sharedLibGraph[makeName], sharedLibsMakeNames...)
 		}
 
 		if tsm, ok := android.OtherModuleProvider(ctx, m, android.TestSuiteInfoProvider); ok {
-			installFilesProvider := android.OtherModuleProviderOrDefault(ctx, m, android.InstallFilesProvider)
+			installFilesProvider := android.GetInstallFilesCommon(commonInfo)
 
 			for _, testSuite := range tsm.TestSuites {
 				regularInstalledFiles[testSuite] = append(regularInstalledFiles[testSuite], installFilesProvider.InstallFiles...)
@@ -109,7 +118,8 @@ func (t *testSuiteFiles) GenerateBuildActions(ctx android.SingletonContext) {
 				}
 			}
 
-			if testSuiteInstalls, ok := android.OtherModuleProvider(ctx, m, android.TestSuiteInstallsInfoProvider); ok {
+			if tsm.TestSuiteInstalls != nil {
+				testSuiteInstalls := tsm.TestSuiteInstalls
 				for _, testSuite := range tsm.TestSuites {
 					for _, f := range testSuiteInstalls.Files {
 						allTestSuiteInstalls[testSuite] = append(allTestSuiteInstalls[testSuite], f.Dst)
@@ -120,7 +130,7 @@ func (t *testSuiteFiles) GenerateBuildActions(ctx android.SingletonContext) {
 						allTestSuiteSrcs[testSuite] = append(allTestSuiteSrcs[testSuite], f.Src)
 					}
 				}
-				installs := android.OtherModuleProviderOrDefault(ctx, m, android.InstallFilesProvider).InstallFiles
+				installs := installFilesProvider.InstallFiles
 				oneVariantInstalls = append(oneVariantInstalls, testSuiteInstalls.OneVariantInstalls...)
 				for _, f := range testSuiteInstalls.Files {
 					alreadyInstalled := false
@@ -177,7 +187,7 @@ func (t *testSuiteFiles) GenerateBuildActions(ctx android.SingletonContext) {
 	for _, suite := range allTestSuitesWithHostSharedLibs {
 		var myTestCases android.WritablePath = hostOutTestCases
 		switch suite {
-		case "vts", "tvts":
+		case "vts", "tvts", "sdvts":
 			suiteInfo := ctx.Config().CompatibilityTestcases()[suite]
 			outDir := suiteInfo.OutDir
 			if outDir == "" {
@@ -195,7 +205,7 @@ func (t *testSuiteFiles) GenerateBuildActions(ctx android.SingletonContext) {
 			out := android.JoinWriteablePath(ctx, myTestCases, dir, filepath.Base(f.String()))
 			if _, ok := testInstalledSharedLibsDeduper[out.String()]; !ok {
 				ctx.Build(pctx, android.BuildParams{
-					Rule:   android.Cp,
+					Rule:   android.CpRule,
 					Input:  f,
 					Output: out,
 				})
@@ -229,14 +239,14 @@ func (t *testSuiteFiles) GenerateBuildActions(ctx android.SingletonContext) {
 
 	for _, install := range toInstall {
 		ctx.Build(pctx, android.BuildParams{
-			Rule:   android.Cp,
+			Rule:   android.CpRule,
 			Input:  install.Src,
 			Output: install.Dst,
 		})
 	}
 	for _, install := range oneVariantInstalls {
 		ctx.Build(pctx, android.BuildParams{
-			Rule:   android.Cp,
+			Rule:   android.CpRule,
 			Input:  install.Src,
 			Output: install.Dst,
 		})
@@ -352,7 +362,7 @@ func generateApiMapReport(ctx android.SingletonContext, pctx android.PackageCont
 	sboxManifest := android.PathForOutput(ctx, "api_map_report_temps", moduleName, fmt.Sprintf("%s_genrule.sbox.textproto", moduleName))
 	outputFileName := fmt.Sprintf("%s-%s.xml", suite, reportType.String())
 	jarFilesList := hostOutApiMap.Join(ctx, fmt.Sprintf("%s_jar_files_%s.txt", suite, reportType.String()))
-	jarFiles_rule := android.NewRuleBuilder(pctx, ctx)
+	jarFiles_rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	jarFiles_rule.Command().
 		Text("cat").
 		Inputs(jarFileLists).
@@ -360,7 +370,9 @@ func generateApiMapReport(ctx android.SingletonContext, pctx android.PackageCont
 		Output(jarFilesList)
 	jarFiles_rule.Build(jarFilesList.Base(), fmt.Sprintf("Jar files list for %s", suite))
 
-	rule := android.NewRuleBuilder(pctx, ctx).Sbox(sboxOut, sboxManifest)
+	rule := android.NewRuleBuilder(pctx, ctx).
+		SandboxDisabled().
+		Sbox(sboxOut, sboxManifest)
 	switch reportType {
 	case apiMapReportType:
 		rule.Command().BuiltTool("cts-api-map").
@@ -391,7 +403,7 @@ func generateApiMapReport(ctx android.SingletonContext, pctx android.PackageCont
 	rule.Build(fmt.Sprintf("generate_%s_report_%s", reportType.String(), suite), reportDesc)
 	ctx.Phony(moduleName, hostOutApiMap.Join(ctx, outputFileName))
 	ctx.Build(pctx, android.BuildParams{
-		Rule:   android.Cp,
+		Rule:   android.CpRule,
 		Input:  sboxOut.Join(ctx, outputFileName),
 		Output: hostOutApiMap.Join(ctx, outputFileName),
 	})
@@ -435,14 +447,14 @@ func gatherHostSharedLibs(ctx android.SingletonContext, sharedLibRoots, sharedLi
 	hostSharedLibs := make(map[string]android.Paths)
 
 	ctx.VisitAllModuleProxies(func(m android.ModuleProxy) {
-		if makeName, ok := android.OtherModuleProvider(ctx, m, android.MakeNameInfoProvider); ok {
-			commonInfo := android.OtherModuleProviderOrDefault(ctx, m, android.CommonModuleInfoProvider)
-			if commonInfo.SkipInstall {
-				return
-			}
-			installFilesProvider := android.OtherModuleProviderOrDefault(ctx, m, android.InstallFilesProvider)
+		commonInfo := android.OtherModuleProviderOrDefault(ctx, m, android.CommonModuleInfoProvider)
+		if commonInfo.SkipInstall {
+			return
+		}
+		if makeName := commonInfo.MakeNames; makeName != nil {
+			installFilesProvider := android.GetInstallFilesCommon(commonInfo)
 			for suite, sharedLibModulesInSuite := range suiteToSharedLibModules {
-				if sharedLibModulesInSuite[makeName.Name] {
+				if sharedLibModulesInSuite[makeName.MakeName] {
 					for _, f := range installFilesProvider.InstallFiles {
 						if strings.HasSuffix(f.String(), ".so") && strings.HasPrefix(f.String(), hostOut) {
 							hostSharedLibs[suite] = append(hostSharedLibs[suite], f)
@@ -470,7 +482,7 @@ func gatherCommonHostSharedLibsForSymlinks(ctx android.SingletonContext, suite s
 		if commonInfo.SkipInstall || !commonInfo.Host || !android.InList(suite, testInfo.TestSuites) {
 			return
 		}
-		installFilesProvider := android.OtherModuleProviderOrDefault(ctx, m, android.InstallFilesProvider)
+		installFilesProvider := android.GetInstallFilesCommon(commonInfo)
 		for _, transitive := range installFilesProvider.TransitiveInstallFiles.ToList() {
 			transitivePathString := transitive.String()
 			if strings.HasPrefix(transitivePathString, hostOut32And64) &&
@@ -482,6 +494,7 @@ func gatherCommonHostSharedLibsForSymlinks(ctx android.SingletonContext, suite s
 	return moduleNameToCommonHostSharedLibs
 }
 
+// @auto-generate: gob
 type testSuiteConfig struct {
 	name                                         string
 	buildHostSharedLibsZip                       bool
@@ -495,7 +508,7 @@ func buildTestSuite(ctx android.SingletonContext, suiteName string, files androi
 	installedPaths := android.SortedUniquePaths(files.Paths())
 
 	outputFile := pathForPackaging(ctx, suiteName+".zip")
-	rule := android.NewRuleBuilder(pctx, ctx)
+	rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	rule.Command().BuiltTool("soong_zip").
 		FlagWithOutput("-o ", outputFile).
 		FlagWithArg("-P ", "host/testcases").
@@ -581,7 +594,7 @@ func packageTestSuite(
 	testsZipCmdTargetFileInput := android.PathForIntermediates(ctx, suiteConfig.name+"_target_list.txt")
 	var testsZipCmdHostFileInputContent, testsZipCmdTargetFileInputContent []string
 
-	testsZipBuilder := android.NewRuleBuilder(pctx, ctx)
+	testsZipBuilder := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	testsZipCmd := testsZipBuilder.Command().
 		BuiltTool("soong_zip").
 		Flag("-sha256").
@@ -589,7 +602,7 @@ func packageTestSuite(
 		FlagWithArg("-P ", "host").
 		FlagWithArg("-C ", hostOut)
 
-	testsConfigsZipBuilder := android.NewRuleBuilder(pctx, ctx)
+	testsConfigsZipBuilder := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	testsConfigsZipCmd := testsConfigsZipBuilder.Command().
 		BuiltTool("soong_zip").
 		Flag("-d").
@@ -722,7 +735,7 @@ func packageTestSuite(
 		testsZipCmd.FlagWithOutput("-o ", unmergedTestsZip)
 		testsZipBuilder.Build(suiteConfig.name+"-unmerged", "building "+suiteConfig.name+" unmerged zip")
 
-		mergeBuilder := android.NewRuleBuilder(pctx, ctx)
+		mergeBuilder := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 		mergeBuilder.Command().
 			BuiltTool("merge_zips").
 			Output(testsZip).
@@ -737,7 +750,7 @@ func packageTestSuite(
 	testsConfigsZipBuilder.Build(suiteConfig.name+"-configs", "building "+suiteConfig.name+" configs zip")
 
 	if suiteConfig.buildHostSharedLibsZip {
-		testsHostSharedLibsZipBuilder := android.NewRuleBuilder(pctx, ctx)
+		testsHostSharedLibsZipBuilder := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 		testsHostSharedLibsZipCmd := testsHostSharedLibsZipBuilder.Command().
 			BuiltTool("soong_zip").
 			Flag("-d").
@@ -761,7 +774,7 @@ func packageTestSuite(
 		android.WriteFileRule(ctx, generalTestsHostFilesListText, strings.Join(hostFilesListLines, "\n"))
 		android.WriteFileRule(ctx, generalTestsTargetFilesListText, strings.Join(targetFilesListLines, "\n"))
 	}
-	testsListZipBuilder := android.NewRuleBuilder(pctx, ctx)
+	testsListZipBuilder := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	testsListZipBuilder.Command().
 		BuiltTool("soong_zip").
 		Flag("-d").
@@ -806,7 +819,7 @@ func buildCompatibilitySuitePackage(
 
 	// Some make rules still rely on the zip being at this location
 	out := hostOutSuite.Join(ctx, fmt.Sprintf("android-%s.zip", testSuiteName))
-	builder := android.NewRuleBuilder(pctx, ctx)
+	builder := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	cmd := builder.Command().BuiltTool("soong_zip").
 		FlagWithOutput("-o ", out).
 		FlagWithArg("-e ", subdir+"/tools/version.txt").
@@ -919,7 +932,7 @@ func buildCompatibilitySuitePackage(
 		sort.Strings(listLines)
 		android.WriteFileRule(ctx, testsListTxt, strings.Join(listLines, "\n"))
 
-		testsListZipBuilder := android.NewRuleBuilder(pctx, ctx)
+		testsListZipBuilder := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 		testsListZipBuilder.Command().
 			BuiltTool("soong_zip").
 			FlagWithOutput("-o ", testsListZip).
@@ -932,7 +945,7 @@ func buildCompatibilitySuitePackage(
 	}
 
 	if suite.BuildMetadata {
-		metadata_rule := android.NewRuleBuilder(pctx, ctx)
+		metadata_rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 		compatibility_files_metadata := hostOutSuite.Join(ctx, fmt.Sprintf("%s_files_metadata.textproto", testSuiteName))
 
 		metadata_rule.Command().BuiltTool("file_metadata_generation").
@@ -967,10 +980,11 @@ func buildSharedReport(
 	metaLicOutput := compatibilityOutput.Join(ctx, "meta_lic")
 	// Aggregate license metadata from all component modules into a single file.
 	var componentMetadataFiles android.Paths
-	meta_builder := android.NewRuleBuilder(pctx, ctx)
+	meta_builder := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	for _, mod := range testSuiteModules {
-		if provider, ok := android.OtherModuleProvider(ctx, mod, android.LicenseMetadataProvider); ok && provider.LicenseMetadataPath != nil {
-			if testSuiteInstalls, ok := android.OtherModuleProvider(ctx, mod, android.TestSuiteInstallsInfoProvider); ok {
+		if provider := android.OtherModulePointerProviderOrDefault(ctx, mod, android.CommonModuleInfoProvider).LicenseMetadata; provider != nil && provider.LicenseMetadataPath != nil {
+			if testSuite, ok := android.OtherModuleProvider(ctx, mod, android.TestSuiteInfoProvider); ok && testSuite.TestSuiteInstalls != nil {
+				testSuiteInstalls := testSuite.TestSuiteInstalls
 				for _, f := range testSuiteInstalls.Files {
 					if strings.Contains(f.Dst.String(), mod.Name()) && strings.HasPrefix(f.Dst.String(), hostOutSubDir) {
 						if f.Dst.Ext() == ".jar" || f.Dst.Ext() == ".apk" {
@@ -1034,7 +1048,7 @@ func buildSharedReport(
 	})
 
 	// Only gts build shared report. The output is gts-shared-report.txt.
-	gtsReportBuilder := android.NewRuleBuilder(pctx, ctx)
+	gtsReportBuilder := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	reportCmd := gtsReportBuilder.Command().BuiltTool("generate_gts_shared_report")
 	reportCmd.FlagWithInput("--checkshare ", ctx.Config().HostToolPath(ctx, "compliance_checkshare"))
 	shared_report := hostOutSuite.Join(ctx, "gts-shared-report.txt")
@@ -1104,6 +1118,7 @@ type compatibilityTestSuitePackage struct {
 	properties compatibilityTestSuitePackageProperties
 }
 
+// @auto-generate: gob
 type compatibilitySuitePackageInfo struct {
 	Name              string
 	Readme            android.Path
@@ -1176,7 +1191,7 @@ func (m *compatibilityTestSuitePackage) GenerateAndroidBuildActions(ctx android.
 	tradefedName := proptools.String(m.properties.Tradefed)
 	tradefed := ctx.GetDirectDepProxyWithTag(tradefedName, ctspTradefedDeptag)
 
-	tradefedFiles := android.OtherModuleProviderOrDefault(ctx, tradefed, android.InstallFilesProvider).InstallFiles
+	tradefedFiles := android.GetInstallFiles(ctx, tradefed).InstallFiles
 
 	if len(tradefedFiles) != 2 || tradefedFiles[0].Base() != tradefedName || tradefedFiles[1].Base() != tradefedName+".jar" {
 		ctx.PropertyErrorf("tradefed", "Dependency %q did not provide expected files, produced: %s", tradefedName, tradefedFiles.Strings())
@@ -1198,7 +1213,7 @@ func (m *compatibilityTestSuitePackage) GenerateAndroidBuildActions(ctx android.
 	})
 
 	ctx.VisitDirectDepsProxyWithTag(ctspHostToolDeptag, func(dep android.ModuleProxy) {
-		files := android.OtherModuleProviderOrDefault(ctx, dep, android.InstallFilesProvider).InstallFiles
+		files := android.GetInstallFiles(ctx, dep).InstallFiles
 		if len(files) != 1 {
 			ctx.ModuleErrorf("Dependency %q did not provide expected single file", ctx.OtherModuleName(dep))
 		}
@@ -1210,7 +1225,7 @@ func (m *compatibilityTestSuitePackage) GenerateAndroidBuildActions(ctx android.
 
 	var hostSharedLibs android.Paths
 	ctx.VisitDirectDepsProxyWithTag(ctspHostSharedLibDeptag, func(dep android.ModuleProxy) {
-		libs := android.OtherModuleProviderOrDefault(ctx, dep, android.InstallFilesProvider).InstallFiles
+		libs := android.GetInstallFiles(ctx, dep).InstallFiles
 		for _, lib := range libs {
 			hostSharedLibs = append(hostSharedLibs, lib)
 		}

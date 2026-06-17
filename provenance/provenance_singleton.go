@@ -22,6 +22,8 @@ import (
 	"github.com/google/blueprint"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 var (
 	pctx = android.NewPackageContext("android/soong/provenance")
 	rule = pctx.HostBinToolVariable("gen_provenance_metadata", "gen_provenance_metadata")
@@ -31,7 +33,8 @@ var (
 			Command: `rm -rf "$out" && ` +
 				`${gen_provenance_metadata} --module_name=${module_name} ` +
 				`--artifact_path=$in --install_path=${install_path} --metadata_path=$out`,
-			CommandDeps: []string{"${gen_provenance_metadata}"},
+			CommandDeps:     []string{"${gen_provenance_metadata}"},
+			SandboxDisabled: true,
 		}, "module_name", "install_path")
 
 	mergeProvenanceMetaData = pctx.AndroidStaticRule("mergeProvenanceMetaData",
@@ -40,11 +43,13 @@ var (
 				`echo "# proto-file: build/soong/provenance/proto/provenance_metadata.proto" > $out && ` +
 				`echo "# proto-message: ProvenanceMetaDataList" >> $out && ` +
 				`cat $out.rsp | tr ' ' '\n' | while read -r file || [ -n "$$file" ]; do echo '' >> $out; echo 'metadata {' | cat - $$file | grep -Ev "^#.*|^$$" >> $out; echo '}' >> $out; done`,
-			Rspfile:        `$out.rsp`,
-			RspfileContent: `$in`,
+			Rspfile:         `$out.rsp`,
+			RspfileContent:  `$in`,
+			SandboxDisabled: true,
 		})
 )
 
+// @auto-generate: gob
 type ProvenanceMetadataInfo struct {
 	ProvenanceMetaDataFile android.Path
 }

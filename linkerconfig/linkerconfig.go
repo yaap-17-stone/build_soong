@@ -72,6 +72,10 @@ func (l *linkerConfig) OutputFile() android.OutputPath {
 	return l.outputFilePath
 }
 
+func (l *linkerConfig) DepsMutator(ctx android.BottomUpMutatorContext) {
+	ctx.AddHostToolDependencies("conv_linker_config")
+}
+
 func (l *linkerConfig) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	input := android.PathForModuleSrc(ctx, android.String(l.properties.Src))
 	output := android.PathForModuleOut(ctx, "linker.config.pb").OutputPath
@@ -100,22 +104,26 @@ func BuildLinkerConfig(
 	// First, convert the input json to protobuf format
 	builder := android.NewRuleBuilder(pctx, ctx)
 	interimOutput := android.PathForModuleOut(ctx, "temp.pb")
-	cmd := builder.Command().
+	builder.Command().
 		BuiltTool("conv_linker_config").
 		Flag("proto").
-		Flag("--force")
-	for _, input := range inputs {
-		cmd.FlagWithInput("-s ", input)
-	}
-	cmd.FlagWithOutput("-o ", interimOutput)
+		Flag("--force").
+		FlagWithInputList("-s ", inputs, ":").
+		FlagWithOutput("-o ", interimOutput)
 
 	// Secondly, if there's provideLibs gathered from provideModules, append them
 	var provideLibs []string
 	for _, m := range provideModules {
-		ccInfo, ok := android.OtherModuleProvider(ctx, m, cc.CcInfoProvider)
-		if ok && (cc.IsStubTarget(android.OtherModuleProviderOrDefault(ctx, m, cc.LinkableInfoProvider)) || ccInfo.HasLlndkStubs) {
-			for _, ps := range android.OtherModuleProviderOrDefault(
-				ctx, m, android.InstallFilesProvider).PackagingSpecs {
+		stub := false
+		// This could be a cc or rust module
+		if cc.IsStubTarget(android.OtherModuleProviderOrDefault(ctx, m, cc.LinkableInfoProvider)) {
+			stub = true
+		} else if ccInfo, ok := android.OtherModuleProvider(ctx, m, cc.CcInfoProvider); ok && ccInfo.HasLlndkStubs {
+			stub = true
+		}
+		if stub {
+			for _, ps := range android.GetInstallFiles(
+				ctx, m).PackagingSpecs {
 				provideLibs = append(provideLibs, ps.FileName())
 			}
 		}
@@ -166,7 +174,7 @@ func BuildLinkerConfig(
 	}
 
 	// cp to the final output
-	builder.Command().Text("cp").Input(interimOutput).Output(output)
+	builder.Command().BuiltTool("cp").Input(interimOutput).Output(output)
 
 	builder.Temporary(interimOutput)
 	builder.DeleteTemporaryFiles()

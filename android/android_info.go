@@ -19,15 +19,18 @@ import (
 	"github.com/google/blueprint/proptools"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 var (
 	removeComments = pctx.AndroidStaticRule("remove_comments",
 		blueprint.RuleParams{
-			Command: "grep -v '#' $in > $out",
+			Command2: blueprint.NewCommand(Grep, " -v '#' $in > $out"),
 		},
 	)
 	androidInfoTxtToProp = pctx.AndroidStaticRule("android_info_txt_to_prop",
 		blueprint.RuleParams{
-			Command: "grep 'require version-' $in | sed -e 's/require version-/ro.build.expect./g' > $out",
+			Command2: blueprint.NewCommand(
+				Grep, ` 'require version-' $in | `, Sed, ` -e 's/require version-/ro.build.expect./g' > $out`),
 		},
 	)
 )
@@ -50,6 +53,7 @@ type androidInfoModule struct {
 	properties AndroidInfoProperties
 }
 
+// @auto-generate: gob
 type AndroidInfo struct {
 	// Path to the android info prop file which is used to generate the vendor/build.prop
 	AndroidInfoProp Path
@@ -79,7 +83,7 @@ func (p *androidInfoModule) GenerateAndroidBuildActions(ctx ModuleContext) {
 
 	if boardInfoFiles := PathsForModuleSrc(ctx, p.properties.Board_info_files); len(boardInfoFiles) > 0 {
 		ctx.Build(pctx, BuildParams{
-			Rule:   Cat,
+			Rule:   CatRule,
 			Inputs: boardInfoFiles,
 			Output: mergedBoardInfoTxt,
 		})

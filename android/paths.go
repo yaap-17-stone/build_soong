@@ -27,7 +27,7 @@ import (
 	"github.com/google/blueprint/pathtools"
 )
 
-//go:generate go run ../../blueprint/gobtools/codegen/gob_gen.go
+//go:generate go run ../../blueprint/gobtools/codegen
 
 var absSrcDir string
 
@@ -84,6 +84,44 @@ func GlobFiles(ctx EarlyModulePathContext, globPattern string, excludes []string
 		ctx.ModuleErrorf("glob: %s", err.Error())
 	}
 	return pathsForModuleSrcFromFullPath(ctx, ret, false)
+}
+
+// GlobFiles globs *only* files (not directories) matching globPattern relative to ModuleDir().
+// Paths in the excludes parameter will be omitted.
+//
+// Unlike GlobFiles(), this function allows globbing files from anywhere in the source tree,
+// not just in the current module's directory. Prefer GlobFiles() over this, it was added to handle
+// legacy include_dirs use cases, which should be switched to local_include_dirs.
+func GlobFilesOutsideModuleDir(ctx PathGlobContext, globPattern string, excludes []string) Paths {
+	globResults, err := ctx.GlobWithDeps(globPattern, excludes)
+	if err != nil {
+		switch c := ctx.(type) {
+		case EarlyModulePathContext:
+			c.ModuleErrorf("glob: %s", err.Error())
+		case MakeVarsContext:
+			c.Errorf("glob: %s", err.Error())
+		default:
+			panic(fmt.Sprintf("glob: %s", err.Error()))
+		}
+	}
+
+	ret := make(Paths, 0, len(globResults))
+	for _, p := range globResults {
+		// no directories
+		if strings.HasSuffix(p, "/") {
+			continue
+		}
+		// use pathForSource instead of PathForSource because the former does not check that
+		// the file exists while the latter does. These paths are all from a glob we just did,
+		// so we know that they exist already.
+		path, err := pathForSource(ctx, p)
+		if err != nil {
+			reportPathError(ctx, err)
+			continue
+		}
+		ret = append(ret, path)
+	}
+	return ret
 }
 
 // ModuleWithDepsPathContext is a subset of *ModuleContext methods required by
@@ -514,7 +552,7 @@ func ExistentPathsForSources(ctx PathGlobContext, paths []string) Paths {
 //   - glob, relative to the local module directory, resolves as filepath(s), relative to the local
 //     source directory.
 //   - other modules using the ":name{.tag}" syntax. These modules must implement SourceFileProducer
-//     or set the OutputFilesProvider. These resolve as a filepath to an output filepath or generated
+//     or set the OutputFiles in CommonModuleInfo. These resolve as a filepath to an output filepath or generated
 //     source filepath.
 //
 // Properties passed as the paths argument must have been annotated with struct tag
@@ -542,7 +580,7 @@ type SourceInput struct {
 //   - glob, relative to the local module directory, resolves as filepath(s), relative to the local
 //     source directory. Not valid in excludes.
 //   - other modules using the ":name{.tag}" syntax. These modules must implement SourceFileProducer
-//     or set the OutputFilesProvider. These resolve as a filepath to an output filepath or generated
+//     or set the OutputFiles in CommonModuleInfo. These resolve as a filepath to an output filepath or generated
 //     source filepath.
 //
 // excluding the items (similarly resolved
@@ -574,6 +612,7 @@ func PathsRelativeToModuleSourceDir(input SourceInput) Paths {
 	return ret
 }
 
+// @auto-generate: gob
 type directoryPath struct {
 	basePath
 }
@@ -594,6 +633,7 @@ type DirectoryPath interface {
 
 var _ DirectoryPath = (*directoryPath)(nil)
 
+// @auto-generate: gob
 type DirectoryPaths []DirectoryPath
 
 func (paths DirectoryPaths) Strings() []string {
@@ -738,7 +778,7 @@ func GetModuleProxyFromPathDep(ctx ModuleWithDepsPathContext, moduleName, tag st
 //   - glob, relative to the local module directory, resolves as filepath(s), relative to the local
 //     source directory. Not valid in excludes.
 //   - other modules using the ":name{.tag}" syntax. These modules must implement SourceFileProducer
-//     or set the OutputFilesProvider. These resolve as a filepath to an output filepath or generated
+//     or set the OutputFiles in CommonModuleInfo. These resolve as a filepath to an output filepath or generated
 //     source filepath.
 //
 // and a list of the module names of missing module dependencies are returned as the second return.

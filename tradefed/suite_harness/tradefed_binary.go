@@ -125,6 +125,7 @@ var tradefedBinaryGenRule = pctx.StaticRule("tradefedBinaryGenRule", blueprint.R
 		`echo "name = ${name}" >> $out && ` +
 		`echo "fullname = ${fullname}" >> $out && ` +
 		`echo "version = ${version}" >> $out`,
+	SandboxDisabled: true,
 }, "buildNumberFile", "arch", "name", "fullname", "version")
 
 func (tfg *tradefedBinaryGen) GenerateAndroidBuildActions(ctx android.ModuleContext) {
@@ -155,7 +156,7 @@ func (tfg *tradefedBinaryGen) GenerateAndroidBuildActions(ctx android.ModuleCont
 	if dynamicConfig.Valid() {
 		outputFile := android.PathForModuleOut(ctx, strings.TrimSuffix(ctx.ModuleName(), genSuffix)+".dynamic")
 		ctx.Build(pctx, android.BuildParams{
-			Rule:   android.Cp,
+			Rule:   android.CpRule,
 			Input:  dynamicConfig.Path(),
 			Output: outputFile,
 		})

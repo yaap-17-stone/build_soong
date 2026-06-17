@@ -115,11 +115,11 @@ func decodeSdkDep(ctx android.EarlyModuleContext, sdkContext SdkVersionContext) 
 	}
 
 	if sdkVersion.UsePrebuilt(ctx) {
-		dir := filepath.Join("prebuilts", "sdk", sdkVersion.ApiLevel.String(), sdkVersion.Kind.String())
+		dir := filepath.Join("prebuilts", "sdk", sdkVersion.ApiLevel.GetSdkVersion(), sdkVersion.Kind.String())
 		jar := filepath.Join(dir, "android.jar")
 		// There's no aidl for other SDKs yet.
 		// TODO(77525052): Add aidl files for other SDKs too.
-		publicDir := filepath.Join("prebuilts", "sdk", sdkVersion.ApiLevel.String(), "public")
+		publicDir := filepath.Join("prebuilts", "sdk", sdkVersion.ApiLevel.GetSdkVersion(), "public")
 		aidl := filepath.Join(publicDir, "framework.aidl")
 		jarPath := android.ExistentPathForSource(ctx, jar)
 		aidlPath := android.ExistentPathForSource(ctx, aidl)
@@ -128,7 +128,7 @@ func decodeSdkDep(ctx android.EarlyModuleContext, sdkContext SdkVersionContext) 
 		if (!jarPath.Valid() || !aidlPath.Valid()) && ctx.Config().AllowMissingDependencies() {
 			return sdkDep{
 				invalidVersion: true,
-				bootclasspath:  []string{fmt.Sprintf("sdk_%s_%s_android", sdkVersion.Kind, sdkVersion.ApiLevel.String())},
+				bootclasspath:  []string{fmt.Sprintf("sdk_%s_%s_android", sdkVersion.Kind, sdkVersion.ApiLevel.GetSdkVersion())},
 			}
 		}
 
@@ -145,7 +145,7 @@ func decodeSdkDep(ctx android.EarlyModuleContext, sdkContext SdkVersionContext) 
 		var systemModules string
 		if defaultJavaLanguageVersion(ctx, sdkVersion).usesJavaModules() {
 			systemModuleKind := systemModuleKind(sdkVersion.Kind, sdkVersion.ApiLevel)
-			systemModules = fmt.Sprintf("sdk_%s_%s_system_modules", systemModuleKind, sdkVersion.ApiLevel)
+			systemModules = fmt.Sprintf("sdk_%s_%s_system_modules", systemModuleKind, sdkVersion.ApiLevel.GetSdkVersion())
 		}
 
 		return sdkDep{
@@ -172,12 +172,28 @@ func decodeSdkDep(ctx android.EarlyModuleContext, sdkContext SdkVersionContext) 
 
 	switch sdkVersion.Kind {
 	case android.SdkPrivate:
+		// SdkPrivate is for platform apps that are not bundled in any APEX.
+		// Such apps are allowed to use private platform APIs.
+		//
+		// Allowlisted /product apps may use select hidden APIs, but not private resources.
+		// framework-minus-internal-res is identical to framework, except that
+		// com.android.internal.R is explicitly removed with jarjar.
+		classpath := append([]string{}, config.FrameworkLibraries...)
+		if ctx.ProductSpecific() {
+			for i, lib := range classpath {
+				if lib == "framework" {
+					classpath[i] = "framework-minus-internal-res"
+					break
+				}
+			}
+		}
 		return sdkDep{
 			useModule:          true,
 			systemModules:      corePlatformSystemModules(ctx),
 			bootclasspath:      corePlatformBootclasspathLibraries(ctx),
-			classpath:          config.FrameworkLibraries,
+			classpath:          classpath,
 			frameworkResModule: "framework-res",
+			proguardFlags:      []string{"framework-private-proguard"},
 		}
 	case android.SdkNone:
 		systemModules := sdkContext.SystemModules()
@@ -296,7 +312,7 @@ func createFrameworkAidl(stubsModules []string, path android.WritablePath, ctx a
 		}
 	}
 
-	rule := android.NewRuleBuilder(pctx, ctx)
+	rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	rule.MissingDeps(missingDeps)
 
 	var aidls android.Paths
@@ -344,7 +360,7 @@ func nonUpdatableFrameworkAidlPath(ctx android.PathContext) android.OutputPath {
 func createAPIFingerprint(ctx android.SingletonContext) {
 	out := android.ApiFingerprintPath(ctx)
 
-	rule := android.NewRuleBuilder(pctx, ctx)
+	rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 
 	rule.Command().
 		Text("rm -f").Output(out)

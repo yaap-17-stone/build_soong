@@ -21,7 +21,7 @@ const testDefaultUpdatableModuleVersion = "340090000"
 var PrepareForTestWithApexBuildComponents = android.GroupFixturePreparers(
 	android.FixtureRegisterWithContext(registerApexBuildComponents),
 	android.FixtureRegisterWithContext(registerApexKeyBuildComponents),
-	android.FixtureRegisterWithContext(registerApexDepsInfoComponents),
+	android.PrepareForTestWithHostTools("cp_if_changed"),
 	android.FixtureAddTextFile("all_apex_certs/Android.bp", `
 		all_apex_certs { name: "all_apex_certs" }
 	`),
@@ -30,11 +30,23 @@ var PrepareForTestWithApexBuildComponents = android.GroupFixturePreparers(
 	android.MockFS{
 		// Needed by apex.
 		"system/core/rootdir/etc/public.libraries.android.txt": nil,
-		"build/soong/scripts/gen_ndk_backedby_apex.sh":         nil,
 		// Needed by prebuilt_apex.
 		"build/soong/scripts/unpack-prebuilt-apex.sh": nil,
 		// Needed by all_apex_certs
 		"build/make/target/product/security/testkey.x509.pem": nil,
+		"prebuilts/build-tools/linux-x86/bin/one-true-awk":    nil,
 	}.AddToFixture(),
 	android.PrepareForTestWithBuildFlag("RELEASE_DEFAULT_UPDATABLE_MODULE_VERSION", testDefaultUpdatableModuleVersion),
+	android.PrepareForTestWithHostTools(
+		"apex_compression_tool",
+		"cat",
+		"cp",
+		"dexdeps",
+		"find",
+		"echo",
+		"gen_apex_symbols",
+		"sort",
+		"zipinfo",
+		"zipsync",
+	),
 )

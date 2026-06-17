@@ -28,6 +28,8 @@ import (
 	"android/soong/android"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 func init() {
 	android.RegisterModuleType("vbmeta", VbmetaFactory)
 	pctx.HostBinToolVariable("avbtool", "avbtool")
@@ -40,6 +42,7 @@ var (
 			CommandDeps: []string{
 				"${avbtool}",
 			},
+			SandboxDisabled: true,
 		})
 )
 
@@ -91,6 +94,10 @@ type VbmetaProperties struct {
 
 	// List of key-value pair of avb properties
 	Avb_properties []avbProperty
+
+	// Determines if the module is auto-generated from Soong or not. If the module is
+	// auto-generated, it does not use generic config.
+	Is_auto_generated *bool
 }
 
 type avbProperty struct {
@@ -119,6 +126,7 @@ type ChainedPartitionProperties struct {
 	Private_key *string `android:"path"`
 }
 
+// @auto-generate: gob
 type vbmetaPartitionInfo struct {
 	// Name of the partition
 	Name string
@@ -144,6 +152,7 @@ type vbmetaPartitionInfo struct {
 	AbOtaBootloaderPartition bool
 }
 
+// @auto-generate: gob
 type vbmetaPartitionInfos []vbmetaPartitionInfo
 
 var vbmetaPartitionProvider = blueprint.NewProvider[vbmetaPartitionInfo]()
@@ -209,7 +218,7 @@ var includeDescriptorsFromImgOrder = []string{
 }
 
 func (v *vbmeta) GenerateAndroidBuildActions(ctx android.ModuleContext) {
-	builder := android.NewRuleBuilder(pctx, ctx)
+	builder := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	cmd := builder.Command().BuiltTool("avbtool").Text("make_vbmeta_image")
 
 	key := android.PathForModuleSrc(ctx, proptools.String(v.properties.Private_key))
@@ -438,6 +447,11 @@ func (v *vbmeta) buildPropFileForMiscInfo(ctx android.ModuleContext) android.Pat
 	ctx.VisitDirectDepsProxyWithTag(vbmetaPartitionDep, func(child android.ModuleProxy) {
 		if info, ok := android.OtherModuleProvider(ctx, child, vbmetaPartitionProvider); ok {
 			partitionDepNames = append(partitionDepNames, info.Name)
+			if info.Name == "tzsw" {
+				// The tzsw partition is a bootloader partition that is signed with avb and its
+				// hashtree descriptors are included in vbmeta.img
+				bootloaderPartitions = append(bootloaderPartitions, info.Output)
+			}
 		} else if info, ok := android.OtherModuleProvider(ctx, child, vbmetaPartitionsProvider); ok {
 			for _, vbmetaPartition := range info {
 				if vbmetaPartition.AbOtaBootloaderPartition {

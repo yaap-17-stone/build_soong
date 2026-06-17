@@ -48,6 +48,9 @@ var (
 		"-Werror=bool-operation",
 		// Using __DATE__/__TIME__ causes build nondeterminism.
 		"-Werror=date-time",
+		// Bans format strings in printf-like functions that are not known at
+		// compile time and cannot be checked against their arguments.
+		"-Werror=format-security",
 		// Detects forgotten */& that usually cause a crash
 		"-Werror=int-conversion",
 		// Detects multi-character constants such as 'abcd', which have
@@ -77,8 +80,6 @@ var (
 		// Making deprecated usages an error causes extreme pain when trying to
 		// deprecate anything.
 		"-Wno-error=deprecated-declarations",
-		// http://b/315246135 temporarily disabled
-		"-Wno-error=unused-variable",
 
 		// Warnings disabled by default.
 
@@ -171,9 +172,13 @@ var (
 		"-fdata-sections",
 		"-fno-short-enums",
 		"-funwind-tables",
-		"-fstack-protector-strong",
 		"-Wa,--noexecstack",
 		"-D_FORTIFY_SOURCE=3",
+
+		// Add stack canaries on every frame, checked on return.
+		// -fstack-clash-protection isn't supported in clang for ILP32,
+		// so that's in each of the LP64 architectures' configurations instead.
+		"-fstack-protector-strong",
 
 		// Bans classes that have virtual functions and a public non-virtual destructor.
 		// This potentially allows the class to be partially destroyed, causing memory
@@ -184,9 +189,6 @@ var (
 		"-Werror=address",
 		// Detects stuff like 'x++ = x++ * x++;', which has undefined effects.
 		"-Werror=sequence-point",
-		// Bans format strings in printf-like functions that are not known at
-		// compile time and cannot be checked against their arguments.
-		"-Werror=format-security",
 	}
 
 	commonGlobalLdflags = []string{
@@ -316,6 +318,20 @@ var (
 		// New warnings to be fixed after clang-r563880
 		"-Wno-nontrivial-memcall",
 		"-Wno-invalid-specialization",
+		// New warnings to be fixed after clang-r574158
+		"-Wno-unterminated-string-initialization",
+		"-Wno-implicit-int-conversion-on-negation",
+		"-Wno-default-const-init-field-unsafe",
+		"-Wno-default-const-init-var-unsafe",
+		"-Wno-preferred-type-bitfield-enum-conversion",
+		"-Wno-implicit-enum-enum-cast",
+		// New warnings to be fixed after clang-r584948
+		"-Wno-character-conversion", // http://b/452740154
+		// TODO: Disable this warning in external projects after switching clang.
+		"-Wno-error=uninitialized-const-pointer", // http://b/458489157
+		// New warnings to be fixed after clang-r596125
+		"-Wno-incompatible-pointer-types", // http://b/490481169
+		"-Wno-c2y-extensions",             // http://b/493691159
 
 		// Allow using VLA CXX extension.
 		"-Wno-vla-cxx-extension",
@@ -330,10 +346,17 @@ var (
 
 	noOverride64GlobalCflags = []string{}
 
+	// Extra cflags applied to tests code.
 	extraTestsCflags = []string{
 		"-Wno-error=unused-but-set-variable",
+	}
+
+	// This is similar to noOverrideGlobalCflags, but applies only to tests
+	// code. This section can unblock compiler upgrades when a test module
+	// that enables -Wall, -Wextra, or a particular warnings explicitly triggers
+	// newly added warnings. See note above noOverrideGlobalCflags.
+	noOverrideTestsGlobalCflags = []string{
 		"-Wno-unused-variable",
-		"-Wno-error=range-loop-construct", // http://b/153747076
 	}
 
 	// Extra cflags applied to third-party code (anything for which
@@ -346,9 +369,6 @@ var (
 		// http://b/72331524 Allow null pointer arithmetic until the instances detected by
 		// this new warning are fixed.
 		"-Wno-null-pointer-arithmetic",
-
-		// http://b/165945989
-		"-Wno-psabi",
 
 		// http://b/199369603
 		"-Wno-null-pointer-subtraction",
@@ -363,7 +383,6 @@ var (
 		"-Wno-unused-but-set-variable",
 		"-Wno-deprecated",
 		"-Wno-tautological-constant-compare",
-		"-Wno-error=range-loop-construct", // http://b/153747076
 	}
 
 	// This is similar to noOverrideGlobalCflags, but applies only to third-party
@@ -371,8 +390,6 @@ var (
 	// that enables -Wall, -Wextra, or a particular warnings explicitly triggers
 	// newly added warnings. See note above noOverrideGlobalCflags.
 	noOverrideExternalGlobalCflags = []string{
-		// http://b/151457797
-		"-fcommon",
 		// http://b/191699019
 		"-Wno-format-insufficient-args",
 		// http://b/296321508
@@ -411,7 +428,7 @@ var (
 	}
 
 	CStdVersion               = "gnu23"
-	CppStdVersion             = "gnu++20"
+	CppDefaultStdVersion      = "gnu++20"
 	ExperimentalCStdVersion   = "gnu2y"
 	ExperimentalCppStdVersion = "gnu++2b"
 
@@ -419,10 +436,12 @@ var (
 	ClangDefaultBase = "prebuilts/clang/host"
 	// The Clang version used in the trunk branch.
 	// NOTE: This is deprecated and will be removed in a future version, use the getter function instead.
-	ClangDefaultVersion = "clang-r563880c"
-	// The Clang short version used in the trunk branch.
-	// NOTE: This is deprecated and will be removed in a future version, use the getter function instead.
-	ClangDefaultShortVersion = "21"
+	ClangDefaultVersion = "clang-r584948"
+
+	RsGlobalIncludes = []string{
+		"external/clang/lib/Headers",
+		"frameworks/rs/script_api/include",
+	}
 
 	// Directories with warnings from Android.bp files.
 	WarningAllowedProjects = []string{
@@ -439,6 +458,9 @@ var (
 func init() {
 	if runtime.GOOS == "linux" {
 		commonGlobalCflags = append(commonGlobalCflags, "-fdebug-prefix-map=/proc/self/cwd=")
+	}
+	if runtime.GOOS == "darwin" {
+		commonGlobalCflags = append(commonGlobalCflags, "-Wno-unguarded-availability")
 	}
 
 	pctx.StaticVariable("CommonGlobalConlyflags", strings.Join(commonGlobalConlyflags, " "))
@@ -499,14 +521,6 @@ func init() {
 
 	pctx.VariableFunc("NoOverrideGlobalCflags", func(ctx android.PackageVarContext) string {
 		flags := noOverrideGlobalCflags
-		if ClangVersionAtLeast(ctx, 574158) {
-			flags = append(flags, "-Wno-unterminated-string-initialization")
-			flags = append(flags, "-Wno-implicit-int-conversion-on-negation")
-			flags = append(flags, "-Wno-default-const-init-field-unsafe")
-			flags = append(flags, "-Wno-default-const-init-var-unsafe")
-			flags = append(flags, "-Wno-preferred-type-bitfield-enum-conversion")
-			flags = append(flags, "-Wno-implicit-enum-enum-cast")
-		}
 		if ctx.Config().IsEnvTrue("LLVM_NEXT") {
 			flags = append(noOverrideGlobalCflags, llvmNextExtraCommonGlobalCflags...)
 			IllegalFlags = []string{} // Don't fail build while testing a new compiler.
@@ -516,8 +530,15 @@ func init() {
 
 	pctx.StaticVariable("NoOverride64GlobalCflags", strings.Join(noOverride64GlobalCflags, " "))
 	pctx.StaticVariable("HostGlobalCflags", strings.Join(hostGlobalCflags, " "))
-	pctx.StaticVariable("NoOverrideExternalGlobalCflags", strings.Join(noOverrideExternalGlobalCflags, " "))
+	pctx.VariableFunc("NoOverrideExternalGlobalCflags", func(ctx android.PackageVarContext) string {
+		flags := noOverrideExternalGlobalCflags
+		if !ctx.Config().ReleaseUseFnoCommonFor3pCode() {
+			flags = append(flags, "-fcommon")
+		}
+		return strings.Join(flags, " ")
+	})
 	pctx.StaticVariable("CommonGlobalCppflags", strings.Join(commonGlobalCppflags, " "))
+	pctx.StaticVariable("NoOverrideTestsGlobalCflags", strings.Join(noOverrideTestsGlobalCflags, " "))
 	pctx.StaticVariable("TestsCflags", strings.Join(extraTestsCflags, " "))
 	pctx.StaticVariable("ExternalCflags", strings.Join(extraExternalCflags, " "))
 
@@ -541,18 +562,14 @@ func init() {
 		if override := ctx.Config().Getenv("LLVM_PREBUILTS_VERSION"); override != "" {
 			return override
 		}
-		return ctx.Config().ReleaseBuildClangVersion(ClangDefaultVersion)
+		return ClangVersion(ctx)
 	})
-	pctx.VariableFunc("ClangShortVersion", func(ctx android.PackageVarContext) string {
-		if override := ctx.Config().Getenv("LLVM_RELEASE_VERSION"); override != "" {
-			return override
-		}
-		return ctx.Config().ReleaseBuildClangShortVersion(ClangDefaultShortVersion)
+	pctx.VariableFunc("CppStdVersion", func(ctx android.PackageVarContext) string {
+		return ctx.Config().ReleaseBuildCppStdVersion(CppDefaultStdVersion)
 	})
 
 	pctx.StaticVariable("ClangPath", "${ClangBase}/${HostPrebuiltTag}/${ClangVersion}")
 	pctx.StaticVariable("ClangBin", "${ClangPath}/bin")
-	pctx.StaticVariable("ClangAsanLibDir", "${ClangBase}/linux-x86/${ClangVersion}/lib/clang/${ClangShortVersion}/lib/linux")
 
 	pctx.StaticVariable("WarningAllowedProjects", strings.Join(WarningAllowedProjects, " "))
 
@@ -563,12 +580,6 @@ func init() {
 	pctx.SourcePathVariable("RSReleaseVersion", "3.8")
 	pctx.StaticVariable("RSLLVMPrebuiltsPath", "${RSClangBase}/${HostPrebuiltTag}/${RSClangVersion}/bin")
 	pctx.StaticVariable("RSIncludePath", "${RSLLVMPrebuiltsPath}/../lib64/clang/${RSReleaseVersion}/include")
-
-	rsGlobalIncludes := []string{
-		"external/clang/lib/Headers",
-		"frameworks/rs/script_api/include",
-	}
-	pctx.PrefixedExistentPathsForSourcesVariable("RsGlobalIncludes", "-I", rsGlobalIncludes)
 
 	pctx.VariableFunc("CcWrapper", func(ctx android.PackageVarContext) string {
 		if override := ctx.Config().Getenv("CC_WRAPPER"); override != "" {
@@ -588,47 +599,58 @@ func init() {
 
 var HostPrebuiltTag = pctx.VariableConfigMethod("HostPrebuiltTag", android.Config.PrebuiltOS)
 
+// ClangPath returns the path to a tool in the LLVM prebuilts directory.
+//
+// The environment variable configuration is cached via a config.Once(), but the path
+// recalculation via PathForSource() is performed every time. This is needed because
+// in incremental soong, the PathForSource() calls may add missing dependencies to a
+// module, and we don't want it to be nondeterministically whichever module calls this first.
 func ClangPath(ctx android.PathContext, file string) android.SourcePath {
-	type clangToolKey string
-
-	key := android.NewCustomOnceKey(clangToolKey(file))
-
-	return ctx.Config().OnceSourcePath(key, func() android.SourcePath {
-		return clangPath(ctx).Join(ctx, file)
-	})
+	return clangPath(ctx).Join(ctx, file)
 }
 
 var clangPathKey = android.NewOnceKey("clangPath")
 
+type clangPathResult struct {
+	clangBase    string
+	clangVersion string
+}
+
 func clangPath(ctx android.PathContext) android.SourcePath {
-	return ctx.Config().OnceSourcePath(clangPathKey, func() android.SourcePath {
+	res := ctx.Config().Once(clangPathKey, func() interface{} {
 		clangBase := ClangDefaultBase
 		if override := ctx.Config().Getenv("LLVM_PREBUILTS_BASE"); override != "" {
 			clangBase = override
 		}
-		clangVersion := ctx.Config().ReleaseBuildClangVersion(ClangDefaultVersion)
+		clangVersion := ClangVersion(ctx)
 		if override := ctx.Config().Getenv("LLVM_PREBUILTS_VERSION"); override != "" {
 			clangVersion = override
 		}
-		return android.PathForSource(ctx, clangBase, ctx.Config().PrebuiltOS(), clangVersion)
-	})
+		return clangPathResult{clangBase, clangVersion}
+	}).(clangPathResult)
+	return android.PathForSource(ctx, res.clangBase, ctx.Config().PrebuiltOS(), res.clangVersion)
 }
 
 func ClangVersion(ctx android.PathContext) string {
 	return ctx.Config().ReleaseBuildClangVersion(ClangDefaultVersion)
 }
 
-func ClangShortVersion(ctx android.PathContext) string {
-	return ctx.Config().ReleaseBuildClangShortVersion(ClangDefaultShortVersion)
+func CppStdVersion(ctx android.PathContext) string {
+	return ctx.Config().ReleaseBuildCppStdVersion(CppDefaultStdVersion)
 }
 
 // Check if the Clang revision is greater or equal to minRev. Returns false if failed to parse.
 func ClangVersionAtLeast(ctx android.PathContext, minRev int) bool {
 	curRevStr := ClangVersion(ctx)
+	// Slice the string to keep only the digits (e.g., "584948")
 	if !strings.HasPrefix(curRevStr, "clang-r") {
 		return false
 	}
-	curRev, err := strconv.Atoi(curRevStr[7:])
+	i := 7
+	for i < len(curRevStr) && curRevStr[i] >= '0' && curRevStr[i] <= '9' {
+		i++
+	}
+	curRev, err := strconv.Atoi(curRevStr[7:i])
 	if err != nil {
 		return false
 	}

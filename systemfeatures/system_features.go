@@ -20,7 +20,6 @@ import (
 	"strings"
 
 	"android/soong/android"
-	"android/soong/genrule"
 
 	"github.com/google/blueprint/proptools"
 )
@@ -47,18 +46,24 @@ type javaSystemFeaturesSrcs struct {
 		// method names, but don't want the fully generated API class (e.g., for linting).
 		Metadata_only *bool
 	}
-	outputFiles android.WritablePaths
+
+	// Explicitly generated Java sources.
+	outputSrcs android.Paths
+
+	// Implicitly generated Proguard flags corresponding to any optimized read-only system features.
+	outputProguardFlags android.Paths
 }
 
-var _ genrule.SourceFileGenerator = (*javaSystemFeaturesSrcs)(nil)
+var _ android.SourceFileGenerator = (*javaSystemFeaturesSrcs)(nil)
 var _ android.SourceFileProducer = (*javaSystemFeaturesSrcs)(nil)
 
 func (m *javaSystemFeaturesSrcs) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	// Create a file name appropriate for the given fully qualified (w/ package) class name.
 	classNameParts := strings.Split(m.properties.Full_class_name, ".")
 	outputDir := android.PathForModuleGen(ctx)
-	outputFileName := classNameParts[len(classNameParts)-1] + ".java"
-	outputFile := android.PathForModuleGen(ctx, outputFileName).OutputPath
+	outputSrcFileName := classNameParts[len(classNameParts)-1] + ".java"
+	outputSrcFile := android.PathForModuleGen(ctx, outputSrcFileName)
+	outputProguardFlagsFile := android.PathForModuleGen(ctx, "proguard.options")
 
 	// Collect all RELEASE_SYSTEM_FEATURE_$K:$V build flags into a list of "$K:$V" pairs.
 	var features []string
@@ -71,7 +76,7 @@ func (m *javaSystemFeaturesSrcs) GenerateAndroidBuildActions(ctx android.ModuleC
 	// Ensure sorted outputs for consistency of flag ordering in ninja outputs.
 	sort.Strings(features)
 
-	rule := android.NewRuleBuilder(pctx, ctx)
+	rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	rule.Command().Text("rm -rf").Text(outputDir.String())
 	rule.Command().Text("mkdir -p").Text(outputDir.String())
 	ruleCmd := rule.Command().
@@ -87,22 +92,27 @@ func (m *javaSystemFeaturesSrcs) GenerateAndroidBuildActions(ctx android.ModuleC
 		}
 	}
 
-	ruleCmd.FlagWithOutput(" > ", outputFile)
+	ruleCmd.FlagWithOutput("--output=", outputSrcFile)
+	ruleCmd.FlagWithOutput("--output-proguard-rules=", outputProguardFlagsFile)
 	rule.Build(ctx.ModuleName(), "Generating systemfeatures srcs filegroup")
 
-	m.outputFiles = append(m.outputFiles, outputFile)
+	m.outputSrcs = android.Paths{outputSrcFile}
+	m.outputProguardFlags = android.Paths{outputProguardFlagsFile}
+
+	ctx.SetOutputFiles(m.outputSrcs, "")
+	ctx.SetOutputFiles(m.outputProguardFlags, ".proguardFlagsFiles")
 }
 
 func (m *javaSystemFeaturesSrcs) Srcs() android.Paths {
-	return m.outputFiles.Paths()
+	return m.outputSrcs
 }
 
 func (m *javaSystemFeaturesSrcs) GeneratedSourceFiles() android.Paths {
-	return m.outputFiles.Paths()
+	return m.outputSrcs
 }
 
 func (m *javaSystemFeaturesSrcs) GeneratedDeps() android.Paths {
-	return m.outputFiles.Paths()
+	return m.outputSrcs
 }
 
 func (m *javaSystemFeaturesSrcs) GeneratedHeaderDirs() android.Paths {

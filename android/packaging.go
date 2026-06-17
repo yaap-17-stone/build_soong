@@ -25,7 +25,7 @@ import (
 	"github.com/google/blueprint/uniquelist"
 )
 
-//go:generate go run ../../blueprint/gobtools/codegen/gob_gen.go
+//go:generate go run ../../blueprint/gobtools/codegen
 
 // PackagingSpec abstracts a request to place a built artifact at a certain path in a package. A
 // package can be the traditional <partition>.img, but isn't limited to those. Other examples could
@@ -84,6 +84,9 @@ type PackagingSpec struct {
 
 	// Whether the owner module is a prebuilt module or not
 	prebuilt bool
+
+	// Extra files zip to be installed with this packaging spec.
+	extraZip OptionalPath
 }
 
 func (p *PackagingSpec) Owner() string {
@@ -182,6 +185,11 @@ func (p *PackagingSpec) SrcPath() Path {
 // The symlink target of the PackagingSpec. Do not use, for the soong-only migration.
 func (p *PackagingSpec) SymlinkTarget() string {
 	return p.symlinkTarget
+}
+
+// The extra zip file to be installed with this packaging spec.
+func (p *PackagingSpec) ExtraZip() OptionalPath {
+	return p.extraZip
 }
 
 type PackageModule interface {
@@ -481,6 +489,7 @@ func (p *PackagingBase) AddDeps(ctx BottomUpMutatorContext, depTag blueprint.Dep
 			return
 		}
 		targetVariation := t.Variations()
+
 		sharedVariation := blueprint.Variation{
 			Mutator:   "link",
 			Variation: "shared",
@@ -493,9 +502,9 @@ func (p *PackagingBase) AddDeps(ctx BottomUpMutatorContext, depTag blueprint.Dep
 		// If a shared variation exists, use that. Static variants do not provide any standalone files
 		// for packaging. Similarly, use the dylib variation of rust library if it exists as
 		// the static lib (rlib) variants are never installed.
-		if ctx.OtherModuleFarDependencyVariantExists([]blueprint.Variation{sharedVariation}, dep) {
+		if ctx.OtherModuleDependencyVariantExists(append(targetVariation, sharedVariation), dep) {
 			targetVariation = append(targetVariation, sharedVariation)
-		} else if ctx.OtherModuleFarDependencyVariantExists([]blueprint.Variation{rustLibDylibVariation}, dep) {
+		} else if ctx.OtherModuleDependencyVariantExists(append(targetVariation, rustLibDylibVariation), dep) {
 			targetVariation = append(targetVariation, rustLibDylibVariation)
 		}
 
@@ -511,7 +520,7 @@ func (p *PackagingBase) AddDeps(ctx BottomUpMutatorContext, depTag blueprint.Dep
 			ctx.ModuleErrorf("depType must provide an associated depTag")
 		}
 
-		ctx.AddFarVariationDependencies(targetVariation, depTagToUse, dep)
+		ctx.AddVariationDependencies(targetVariation, depTagToUse, dep)
 	}
 	for _, t := range getSupportedTargets(ctx) {
 		normalDeps, highPriorityDeps, overriddenDeps := p.getDepsForTarget(ctx, t)
@@ -576,8 +585,8 @@ func (p *PackagingBase) GatherPackagingSpecsWithFilterAndModifier(ctx ModuleCont
 		if pi, ok := depTag.(PackagingItem); !ok || !pi.IsPackagingItem() {
 			return
 		}
-		for _, ps := range filteredTransitivePackagingSpecs(OtherModuleProviderOrDefault(
-			ctx, child, InstallFilesProvider).TransitivePackagingSpecs).ToList() {
+		for _, ps := range filteredTransitivePackagingSpecs(GetInstallFiles(
+			ctx, child).TransitivePackagingSpecs).ToList() {
 			if !filterArch(ps) {
 				continue
 			}
@@ -701,8 +710,8 @@ type InterPartitionIncludeVintfsInterface interface {
 // Returns `Vintf_fragments` of the module. This will be collected by the top-level filesystem.
 // `Vintf_fragment_modules` are ignored.
 func getVintFragmentsPaths(ctx ModuleContext, m ModuleProxy) Paths {
-	info := OtherModuleProviderOrDefault(ctx, m, InstallFilesProvider)
 	commonInfo := OtherModulePointerProviderOrDefault(ctx, m, CommonModuleInfoProvider)
+	info := GetInstallFilesCommon(commonInfo)
 	if !commonInfo.HideFromMake && !commonInfo.SkipInstall {
 		return info.VintfFragmentsPaths
 	}
@@ -763,7 +772,7 @@ func (p *PackagingBase) CopySpecsToDirs(ctx ModuleContext, builder *RuleBuilder,
 				builder.Command().Textf("mkdir -p %s", destDir)
 			}
 			if ps.symlinkTarget == "" {
-				cmd := builder.Command().Text("cp")
+				cmd := builder.Command().Text("cp").Text(ctx.Config().CpPreserveSymlinksFlags())
 				if preserveTimestamps {
 					cmd.Flag("-p")
 				}
@@ -774,6 +783,11 @@ func (p *PackagingBase) CopySpecsToDirs(ctx ModuleContext, builder *RuleBuilder,
 			if ps.executable {
 				builder.Command().Textf("chmod a+x %s", destPath)
 			}
+			if ps.extraZip.Valid() {
+				builder.Command().BuiltTool("zipsync").
+					Textf("--keep-existing-files -d '%s'", destDir).
+					Input(ps.extraZip.Path())
+			}
 		}
 	}
 
@@ -782,7 +796,7 @@ func (p *PackagingBase) CopySpecsToDirs(ctx ModuleContext, builder *RuleBuilder,
 
 // See PackageModule.CopyDepsToZip
 func (p *PackagingBase) CopyDepsToZip(ctx ModuleContext, specs map[string]PackagingSpec, zipOut WritablePath) (entries []string) {
-	builder := NewRuleBuilder(pctx, ctx)
+	builder := NewRuleBuilder(pctx, ctx).SandboxDisabled()
 
 	dir := PathForModuleOut(ctx, ".zip")
 	builder.Command().Text("rm").Flag("-rf").Text(dir.String())
@@ -800,3 +814,11 @@ func (p *PackagingBase) CopyDepsToZip(ctx ModuleContext, specs map[string]Packag
 	builder.Build("zip_deps", fmt.Sprintf("Zipping deps for %s", ctx.ModuleName()))
 	return entries
 }
+
+// RROInfo contains information about RROs from a module.
+// @auto-generate: gob
+type RROInfo struct {
+	Paths Paths
+}
+
+var RROInfoProvider = blueprint.NewProvider[RROInfo]()

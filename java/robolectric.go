@@ -25,10 +25,13 @@ import (
 	"github.com/google/blueprint/proptools"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 func init() {
 	RegisterRobolectricBuildComponents(android.InitRegistrationContext)
 }
 
+// @auto-generate: gob
 type RobolectricRuntimesInfo struct {
 	Runtimes []android.InstallPath
 }
@@ -165,7 +168,7 @@ func (r *robolectricTest) GenerateAndroidBuildActions(ctx android.ModuleContext)
 		DeviceTemplate:          "${RobolectricTestConfigTemplate}",
 		HostTemplate:            "${RobolectricTestConfigTemplate}",
 	})
-	r.data = android.PathsForModuleSrc(ctx, r.testProperties.Data)
+	r.data = android.PathsForModuleSrc(ctx, r.testProperties.Data.GetOrDefault(ctx, nil))
 	r.data = append(r.data, android.PathsForModuleSrc(ctx, r.testProperties.Device_common_data)...)
 	r.data = append(r.data, android.PathsForModuleSrc(ctx, r.testProperties.Device_first_data)...)
 	r.data = append(r.data, android.PathsForModuleSrc(ctx, r.testProperties.Device_first_prefer32_data)...)
@@ -287,14 +290,14 @@ func (r *robolectricTest) GenerateAndroidBuildActions(ctx android.ModuleContext)
 		TestSuites: r.TestSuites(),
 	})
 
-	android.SetProvider(ctx, android.TestOnlyProviderKey, android.TestModuleInformation{
+	ctx.SetTestModuleInfo(&android.TestModuleInformation{
 		TestOnly:       Bool(r.sourceProperties.Test_only),
 		TopLevelTarget: r.sourceProperties.Top_level_test_target,
 	})
 }
 
 func generateSameDirRoboTestConfigJar(ctx android.ModuleContext, outputFile android.ModuleOutPath) {
-	rule := android.NewRuleBuilder(pctx, ctx)
+	rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 
 	outputDir := outputFile.InSameDir(ctx)
 	configFile := outputDir.Join(ctx, "com/android/tools/test_config.properties")

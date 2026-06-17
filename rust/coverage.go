@@ -76,7 +76,7 @@ func (cov *coverage) flags(ctx ModuleContext, flags Flags, deps PathDeps) (Flags
 		if ctx.Device() {
 			m := ctx.GetDirectDepProxyWithTag(getClangProfileLibraryName(ctx), cc.CoverageDepTag)
 			coverage := android.OtherModuleProviderOrDefault(ctx, m, cc.LinkableInfoProvider)
-			flags.LinkFlags = append(flags.LinkFlags,
+			flags.LinkFlags = flags.LinkFlags.AppendNoDeps(
 				profileInstrFlag, "-g", coverage.OutputFile.Path().String(), "-Wl,--wrap,open")
 			deps.StaticLibs = append(deps.StaticLibs, coverage.OutputFile.Path())
 		}
@@ -90,15 +90,15 @@ func (cov *coverage) flags(ctx ModuleContext, flags Flags, deps PathDeps) (Flags
 
 		if cc.EnableContinuousCoverage(ctx) {
 			flags.RustFlags = append(flags.RustFlags, "-C llvm-args=--runtime-counter-relocation")
-			flags.LinkFlags = append(flags.LinkFlags, "-Wl,-mllvm,-runtime-counter-relocation")
+			flags.LinkFlags = flags.LinkFlags.AppendNoDeps("-Wl,-mllvm,-runtime-counter-relocation")
 		}
 	}
 
 	return flags, deps
 }
 
-func (cov *coverage) begin(ctx BaseModuleContext) {
-	if cc.IsCoverageEnabled(ctx) {
+func (cov *coverage) begin(ctx BaseModuleContext, binary bool, test bool) {
+	if cc.IsCoverageEnabled(ctx, binary, test) {
 		// Update useSdk and sdkVersion args if Rust modules become SDK aware.
 		cov.Properties = cc.SetCoverageProperties(ctx, cov.Properties, ctx.RustModule().nativeCoverage(), false, "")
 	}

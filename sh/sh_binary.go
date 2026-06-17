@@ -27,6 +27,8 @@ import (
 	"android/soong/tradefed"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 // sh_binary is for shell scripts (and batch files) that are installed as
 // executable files into .../bin/
 //
@@ -41,6 +43,7 @@ func init() {
 	registerShBuildComponents(android.InitRegistrationContext)
 }
 
+// @auto-generate: gob
 type ShBinaryInfo struct {
 	SubDir     string
 	OutputFile android.Path
@@ -73,7 +76,7 @@ var PrepareForTestWithShBuildComponents = android.GroupFixturePreparers(
 
 type shBinaryProperties struct {
 	// Source file of this prebuilt.
-	Src *string `android:"path,arch_variant"`
+	Src proptools.Configurable[string] `android:"path,arch_variant,replace_instead_of_append"`
 
 	// optional subdirectory under which this file is installed into
 	Sub_dir *string `android:"arch_variant"`
@@ -122,7 +125,7 @@ type TestProperties struct {
 
 	// the name of the test configuration (for example "AndroidTest.xml") that should be
 	// installed with the module.
-	Test_config *string `android:"path,arch_variant"`
+	Test_config proptools.Configurable[string] `android:"path,arch_variant,replace_instead_of_append"`
 
 	// list of files or filegroup modules that provide data that should be installed alongside
 	// the test.
@@ -300,11 +303,17 @@ func (s *ShBinary) InstallInRecovery() bool {
 }
 
 func (s *ShBinary) generateAndroidBuildActions(ctx android.ModuleContext) {
-	if s.properties.Src == nil {
-		ctx.PropertyErrorf("src", "missing prebuilt source file")
+	src := s.properties.Src.Get(ctx)
+
+	if src.IsEmpty() {
+		if ctx.Config().AllowMissingDependencies() {
+			ctx.AddMissingDependencies([]string{"missing_prebuilt_source_file"})
+		} else {
+			ctx.PropertyErrorf("src", "missing prebuilt source file")
+		}
 	}
 
-	s.sourceFilePath = android.PathForModuleSrc(ctx, proptools.String(s.properties.Src))
+	s.sourceFilePath = android.PathForModuleSrc(ctx, src.Get())
 	filename := proptools.String(s.properties.Filename)
 	filenameFromSrc := proptools.Bool(s.properties.Filename_from_src)
 	if filename == "" {
@@ -525,7 +534,7 @@ func (s *ShTest) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 				}
 				relocatedLib := android.PathForModuleOut(ctx, "relocated").Join(ctx, relPath)
 				ctx.Build(pctx, android.BuildParams{
-					Rule:   android.Cp,
+					Rule:   android.CpRule,
 					Input:  linkableInfo.OutputFile.Path(),
 					Output: relocatedLib,
 				})

@@ -15,11 +15,13 @@
 package android
 
 import (
+	"bytes"
 	"fmt"
 	"reflect"
 	"testing"
 
 	"github.com/google/blueprint"
+	"github.com/google/blueprint/gobtools"
 	"github.com/google/blueprint/proptools"
 )
 
@@ -81,6 +83,22 @@ func TestSelects(t *testing.T) {
 			`,
 			provider: selectsTestProvider{
 				my_bool: proptools.BoolPtr(true),
+			},
+		},
+		{
+			name: "basic int64",
+			bp: `
+			my_module_type {
+				name: "foo",
+				my_int64: select(soong_config_variable("my_namespace", "my_variable"), {
+					"a": 6,
+					"b": 7,
+					default: 8,
+				}),
+			}
+			`,
+			provider: selectsTestProvider{
+				my_int64: proptools.Int64Ptr(8),
 			},
 		},
 		{
@@ -960,6 +978,31 @@ func TestSelects(t *testing.T) {
 			},
 		},
 		{
+			name: "Simple int64 binding",
+			bp: `
+			my_module_type {
+				name: "foo",
+				my_int64: select(soong_config_variable("my_namespace", "my_variable"), {
+					any @ my_binding: my_binding,
+					default: unset,
+				})
+			}
+			`,
+			vendorVars: map[string]map[string]string{
+				"my_namespace": {
+					"my_variable": "1234",
+				},
+			},
+			vendorVarTypes: map[string]map[string]string{
+				"my_namespace": {
+					"my_variable": "int",
+				},
+			},
+			provider: selectsTestProvider{
+				my_int64: proptools.Int64Ptr(1234),
+			},
+		},
+		{
 			name: "Any branch with binding not taken",
 			bp: `
 			my_module_type {
@@ -1252,10 +1295,21 @@ type selectsTestProvider struct {
 	my_nonconfigurable_string_list []string
 }
 
+func (selectsTestProvider) Encode(ctx gobtools.EncContext, buf *bytes.Buffer) error {
+	return nil
+}
+
+func (selectsTestProvider) GetTypeId() int16 {
+	return -1
+}
 func (p *selectsTestProvider) String() string {
 	myBoolStr := "nil"
 	if p.my_bool != nil {
 		myBoolStr = fmt.Sprintf("%t", *p.my_bool)
+	}
+	myInt64Str := "nil"
+	if p.my_int64 != nil {
+		myInt64Str = fmt.Sprintf("%d", *p.my_int64)
 	}
 	myStringStr := "nil"
 	if p.my_string != nil {
@@ -1267,6 +1321,7 @@ func (p *selectsTestProvider) String() string {
 	}
 	return fmt.Sprintf(`selectsTestProvider {
 	my_bool: %s,
+	my_int64: %s,
 	my_string: %s,
     my_string_list: %s,
     my_paths: %s,
@@ -1277,6 +1332,7 @@ func (p *selectsTestProvider) String() string {
 	my_nonconfigurable_string_list: %s,
 }`,
 		myBoolStr,
+		myInt64Str,
 		myStringStr,
 		p.my_string_list,
 		p.my_paths,
@@ -1292,6 +1348,14 @@ var selectsTestProviderKey = blueprint.NewProvider[selectsTestProvider]()
 
 type selectsTestInitializingProvider struct {
 	replacing_initialized_bool *bool
+}
+
+func (selectsTestInitializingProvider) Encode(ctx gobtools.EncContext, buf *bytes.Buffer) error {
+	return nil
+}
+
+func (selectsTestInitializingProvider) GetTypeId() int16 {
+	return -1
 }
 
 func (p *selectsTestInitializingProvider) String() string {
@@ -1381,6 +1445,17 @@ type selectsMockModuleDefaults struct {
 func (d *selectsMockModuleDefaults) GenerateAndroidBuildActions(ctx ModuleContext) {
 }
 
+type addToElementsPostProcessor struct {
+	s string
+}
+
+func (p addToElementsPostProcessor) PostProcess(x []string) []string {
+	for i := range x {
+		x[i] = x[i] + p.s
+	}
+	return x
+}
+
 func newSelectsMockModuleDefaults() Module {
 	module := &selectsMockModuleDefaults{}
 
@@ -1393,12 +1468,8 @@ func newSelectsMockModuleDefaults() Module {
 
 	AddLoadHook(module, func(lhc LoadHookContext) {
 		if module.defaultsProperties.String_list_postprocessor_add_to_elements != "" {
-			module.myProperties.My_string_list.AddPostProcessor(func(x []string) []string {
-				for i := range x {
-					x[i] = x[i] + module.defaultsProperties.String_list_postprocessor_add_to_elements
-				}
-				return x
-			})
+			module.myProperties.My_string_list.AddPostProcessor(
+				addToElementsPostProcessor{module.defaultsProperties.String_list_postprocessor_add_to_elements})
 		}
 	})
 

@@ -33,7 +33,7 @@ import (
 
 // NewNinjaReader reads the protobuf frontend format from ninja and translates it
 // into calls on the ToolStatus API.
-func NewNinjaReader(ctx logger.Logger, status ToolStatus, fifo string) *NinjaReader {
+func NewNinjaReader(ctx logger.Logger, status ToolStatus, fifo string, sigNumFunc func() os.Signal) *NinjaReader {
 	os.Remove(fifo)
 
 	if err := syscall.Mkfifo(fifo, 0666); err != nil {
@@ -43,6 +43,7 @@ func NewNinjaReader(ctx logger.Logger, status ToolStatus, fifo string) *NinjaRea
 	n := &NinjaReader{
 		status:     status,
 		fifo:       fifo,
+		sigNumFunc: sigNumFunc,
 		forceClose: make(chan bool),
 		done:       make(chan bool),
 		cancelOpen: make(chan bool),
@@ -57,6 +58,7 @@ func NewNinjaReader(ctx logger.Logger, status ToolStatus, fifo string) *NinjaRea
 type NinjaReader struct {
 	status       ToolStatus
 	fifo         string
+	sigNumFunc   func() os.Signal
 	forceClose   chan bool
 	done         chan bool
 	cancelOpen   chan bool
@@ -104,13 +106,15 @@ func (n *NinjaReader) Close() {
 		n.status.Verbose(fmt.Sprintf("ninja fifo didn't finish even after force closing after %s", NINJA_READER_CLOSE_TIMEOUT.String()))
 	}
 
-	err := fmt.Errorf("error: action cancelled when ninja exited")
-	for _, action := range n.running {
-		n.status.FinishAction(ActionResult{
-			Action: action,
-			Output: err.Error(),
-			Error:  err,
-		})
+	if n.sigNumFunc() != os.Interrupt {
+		err := fmt.Errorf("error: action cancelled when ninja exited")
+		for _, action := range n.running {
+			n.status.FinishAction(ActionResult{
+				Action: action,
+				Output: err.Error(),
+				Error:  err,
+			})
+		}
 	}
 }
 
@@ -235,33 +239,35 @@ func (n *NinjaReader) run() {
 			if started, ok := n.running[msg.EdgeFinished.GetId()]; ok {
 				delete(n.running, msg.EdgeFinished.GetId())
 
-				var err error
-				exitCode := int(msg.EdgeFinished.GetStatus())
-				if exitCode != 0 {
-					err = fmt.Errorf("exited with code: %d", exitCode)
+				if !msg.EdgeFinished.GetCanceled() {
+					var err error
+					exitCode := int(msg.EdgeFinished.GetStatus())
+					if exitCode != 0 {
+						err = fmt.Errorf("exited with code: %d", exitCode)
+					}
+
+					rawOutput := msg.EdgeFinished.GetOutput()
+					outputWithErrorHint := errorHintGenerator.GetOutputWithErrorHint(rawOutput, exitCode)
+					n.status.FinishAction(ActionResult{
+						Action: started,
+						Output: outputWithErrorHint,
+						Error:  err,
+						Stats: ActionResultStats{
+							UserTime:                   msg.EdgeFinished.GetUserTime(),
+							SystemTime:                 msg.EdgeFinished.GetSystemTime(),
+							MaxRssKB:                   msg.EdgeFinished.GetMaxRssKb(),
+							MinorPageFaults:            msg.EdgeFinished.GetMinorPageFaults(),
+							MajorPageFaults:            msg.EdgeFinished.GetMajorPageFaults(),
+							IOInputKB:                  msg.EdgeFinished.GetIoInputKb(),
+							IOOutputKB:                 msg.EdgeFinished.GetIoOutputKb(),
+							VoluntaryContextSwitches:   msg.EdgeFinished.GetVoluntaryContextSwitches(),
+							InvoluntaryContextSwitches: msg.EdgeFinished.GetInvoluntaryContextSwitches(),
+							Tags:                       msg.EdgeFinished.GetTags(),
+						},
+					})
+
+					n.hasAnyOutput = n.hasAnyOutput || len(rawOutput) > 0
 				}
-
-				rawOutput := msg.EdgeFinished.GetOutput()
-				outputWithErrorHint := errorHintGenerator.GetOutputWithErrorHint(rawOutput, exitCode)
-				n.status.FinishAction(ActionResult{
-					Action: started,
-					Output: outputWithErrorHint,
-					Error:  err,
-					Stats: ActionResultStats{
-						UserTime:                   msg.EdgeFinished.GetUserTime(),
-						SystemTime:                 msg.EdgeFinished.GetSystemTime(),
-						MaxRssKB:                   msg.EdgeFinished.GetMaxRssKb(),
-						MinorPageFaults:            msg.EdgeFinished.GetMinorPageFaults(),
-						MajorPageFaults:            msg.EdgeFinished.GetMajorPageFaults(),
-						IOInputKB:                  msg.EdgeFinished.GetIoInputKb(),
-						IOOutputKB:                 msg.EdgeFinished.GetIoOutputKb(),
-						VoluntaryContextSwitches:   msg.EdgeFinished.GetVoluntaryContextSwitches(),
-						InvoluntaryContextSwitches: msg.EdgeFinished.GetInvoluntaryContextSwitches(),
-						Tags:                       msg.EdgeFinished.GetTags(),
-					},
-				})
-
-				n.hasAnyOutput = n.hasAnyOutput || len(rawOutput) > 0
 			}
 		}
 		if msg.Message != nil {
@@ -317,7 +323,7 @@ func readVarInt(r *bufio.Reader) (int, error) {
 // key is pattern in stdout/stderr
 // value is error hint
 var allErrorHints = map[string]string{
-	"Read-only file system": `\nWrite to a read-only file system detected. Possible fixes include
+	"Read-only file system": `Write to a read-only file system detected. Possible fixes include
 1. Generate file directly to out/ which is ReadWrite, #recommend solution
 2. BUILD_BROKEN_SRC_DIR_RW_ALLOWLIST := <my/path/1> <my/path/2> #discouraged, subset of source tree will be RW
 3. BUILD_BROKEN_SRC_DIR_IS_WRITABLE := true #highly discouraged, entire source tree will be RW

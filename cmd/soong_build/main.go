@@ -53,7 +53,7 @@ var (
 const configCacheFile = "config.cache"
 
 type ConfigCache struct {
-	EnvDepsHash                  uint64
+	EnvDepsHash                  proptools.Hash
 	ProductVariableFileTimestamp int64
 	SoongBuildFileTimestamp      int64
 }
@@ -89,6 +89,8 @@ func init() {
 	// the time to remove them yet
 	flag.BoolVar(&cmdlineArgs.RunGoTests, "t", false, "build and run go tests during bootstrap")
 	flag.BoolVar(&cmdlineArgs.IncrementalBuildActions, "incremental-build-actions", false, "generate build actions incrementally")
+	flag.StringVar(&cmdlineArgs.PartialAnalysisTargets, "partial-analysis-targets", "", "partial analysis targets")
+	flag.BoolVar(&cmdlineArgs.IncrementalProviderTest, "incremental-provider-test", false, "test incremental providers restoring")
 	flag.StringVar(&cmdlineArgs.IncrementalDebugFile, "incremental-debug-file", "", "incremental debug file")
 
 	// Disable deterministic randomization in the protobuf package, so incremental
@@ -169,13 +171,13 @@ func writeNinjaHint(ctx *android.Context) error {
 	return nil
 }
 
-func writeMetrics(configuration android.Config, eventHandler *metrics.EventHandler, metricsDir string) {
+func writeMetrics(ctx *android.Context, configuration android.Config, eventHandler *metrics.EventHandler, metricsDir string) {
 	if len(metricsDir) < 1 {
 		fmt.Fprintf(os.Stderr, "\nMissing required env var for generating soong metrics: LOG_DIR\n")
 		os.Exit(1)
 	}
 	metricsFile := filepath.Join(metricsDir, "soong_build_metrics.pb")
-	err := android.WriteMetrics(configuration, eventHandler, metricsFile)
+	err := android.WriteMetrics(ctx, configuration, eventHandler, metricsFile)
 	maybeQuit(err, "error writing soong_build metrics %s", metricsFile)
 }
 
@@ -208,7 +210,7 @@ func incrementalValid(config android.Config, configCacheFile string) (*ConfigCac
 		}
 	}
 
-	newConfigCache.EnvDepsHash, err = proptools.CalculateHash(data)
+	newConfigCache.EnvDepsHash, err = proptools.CalculateHashReflection(data)
 	newConfigCache.ProductVariableFileTimestamp = getFileTimestamp(filepath.Join(topDir, cmdlineArgs.SoongVariables))
 	newConfigCache.SoongBuildFileTimestamp = getFileTimestamp(filepath.Join(topDir, config.HostToolDir(), "soong_build"))
 	//TODO(b/344917959): out/soong/dexpreopt.config might need to be checked as well.
@@ -223,7 +225,10 @@ func incrementalValid(config android.Config, configCacheFile string) (*ConfigCac
 	var configCache ConfigCache
 	decoder := json.NewDecoder(file)
 	err = decoder.Decode(&configCache)
-	maybeQuit(err, "")
+	if err != nil {
+		fmt.Printf("Failed to parse config cache: %s.  Continuing with non-incremental analysis.", err.Error())
+		return &newConfigCache, false
+	}
 
 	return &newConfigCache, newConfigCache == configCache
 }
@@ -323,6 +328,12 @@ func main() {
 	android.InitSandbox(topDir)
 
 	availableEnv := parseAvailableEnv()
+
+	if availableEnv["SOONG_ENFORCE_NO_REANALYSIS"] == "true" {
+		fmt.Fprintln(os.Stderr, "Reanalysis will run due to build graph or product configuration change.")
+		os.Exit(1)
+	}
+
 	configuration, err := android.NewConfig(cmdlineArgs, availableEnv)
 	maybeQuit(err, "")
 	if configuration.Getenv("ALLOW_MISSING_DEPENDENCIES") == "true" {
@@ -343,9 +354,22 @@ func main() {
 	ctx.SetIncrementalEnabled(cmdlineArgs.IncrementalBuildActions && !cmdlineArgs.KatiEnabled)
 	if ctx.GetIncrementalEnabled() {
 		configCache, incremental = incrementalValid(ctx.Config(), configFile)
+		ctx.SetIncrementalProviderTest(incremental && cmdlineArgs.IncrementalProviderTest)
 	}
 	ctx.SetIncrementalAnalysis(incremental)
+	ctx.SetPartialAnalysisTargets(cmdlineArgs.PartialAnalysisTargets)
 	ctx.SetIncrementalDebugFile(cmdlineArgs.IncrementalDebugFile)
+
+	if configuration.Getenv("SOONG_SPLIT_ALL_VARIANTS") == "true" ||
+		configuration.Getenv("RUN_BUILD_TESTS") == "true" ||
+		// Soong does not have sufficient information to determine if an androidmk module
+		// has a dependency on a non primary soong module variant.
+		// Analyze all variants in soong+make builds.
+		cmdlineArgs.KatiEnabled ||
+		// TODO (b/477627661): Enable on demand variants with AllowMissingDependencies
+		configuration.AllowMissingDependencies() {
+		ctx.SetSplitAllVariants(true)
+	}
 
 	ctx.Register()
 	finalOutputFile, ninjaDeps := runSoongOnlyBuild(ctx)
@@ -363,16 +387,18 @@ func main() {
 	if ctx.GetIncrementalEnabled() {
 		data, err := shared.EnvFileContents(configuration.EnvDeps())
 		maybeQuit(err, "")
-		configCache.EnvDepsHash, err = proptools.CalculateHash(data)
+		configCache.EnvDepsHash, err = proptools.CalculateHashReflection(data)
 		maybeQuit(err, "")
 		writeConfigCache(configCache, configFile)
 	}
 
-	writeMetrics(configuration, ctx.EventHandler, metricsDir)
+	writeMetrics(ctx, configuration, ctx.EventHandler, metricsDir)
 
 	writeUsedEnvironmentFile(configuration)
 
-	err = writeGlobFile(ctx.EventHandler, finalOutputFile, ctx.Globs(), soongStartTime)
+	ctx.EventHandler.Begin("writeGlobFile")
+	err = ctx.WriteGlobFile(shared.JoinPath(topDir, finalOutputFile), soongStartTime)
+	ctx.EventHandler.End("writeGlobFile")
 	maybeQuit(err, "")
 
 	// Touch the output file so that it's the newest file created by soong_build.
@@ -393,29 +419,6 @@ func writeUsedEnvironmentFile(configuration android.Config) {
 
 	err = pathtools.WriteFileIfChanged(path, data, 0666)
 	maybeQuit(err, "error writing used environment file '%s'", usedEnvFile)
-}
-
-func writeGlobFile(eventHandler *metrics.EventHandler, finalOutFile string, globs pathtools.MultipleGlobResults, soongStartTime time.Time) error {
-	eventHandler.Begin("writeGlobFile")
-	defer eventHandler.End("writeGlobFile")
-
-	globsFile, err := os.Create(shared.JoinPath(topDir, finalOutFile+".globs"))
-	if err != nil {
-		return err
-	}
-	defer globsFile.Close()
-	globsFileEncoder := json.NewEncoder(globsFile)
-	for _, glob := range globs {
-		if err := globsFileEncoder.Encode(glob); err != nil {
-			return err
-		}
-	}
-
-	return os.WriteFile(
-		shared.JoinPath(topDir, finalOutFile+".globs_time"),
-		[]byte(fmt.Sprintf("%d\n", soongStartTime.UnixMicro())),
-		0666,
-	)
 }
 
 func touch(path string) {

@@ -23,6 +23,31 @@ if [ ! -e "build/make/core/Makefile" ]; then
   exit 1
 fi
 
+# Check that required tools are installed before running the test.
+REQUIRED_TOOLS=(
+  grep
+  sed
+  awk
+  cut
+  sort
+  sha1sum
+)
+
+missing_tools=()
+for tool in "${REQUIRED_TOOLS[@]}"; do
+  if ! command -v "${tool}" >/dev/null 2>&1; then
+    missing_tools+=("${tool}")
+  fi
+done
+
+if [ ${#missing_tools[@]} -ne 0 ]; then
+  echo "Error: The following required commands are not found:" >&2
+  for tool in "${missing_tools[@]}"; do
+    echo "  - ${tool}" >&2
+  done
+  exit 1
+fi
+
 function setup {
   tmp_dir="$(mktemp -d tmp.XXXXXX)"
   trap 'cleanup "${tmp_dir}"' EXIT
@@ -68,7 +93,7 @@ function test_sbom_aosp_cf_x86_64_phone {
 
   # Test
   # m droid, build sbom later in case additional dependencies might be built and included in partition images.
-  run_soong "${out_dir}" "droid dump.erofs lz4"
+  run_soong "${out_dir}" "droid dump.erofs lz4 cpio"
 
   soong_sbom_out=$out_dir/soong/sbom/$target_product
   product_out=$out_dir/target/product/vsoc_x86_64
@@ -81,9 +106,12 @@ function test_sbom_aosp_cf_x86_64_phone {
 
   # Generate installed file list from .img files in PRODUCT_OUT
   dump_erofs=$out_dir/host/linux-x86/bin/dump.erofs
-  lz4=$out_dir/host/linux-x86/bin/lz4
 
   declare -A diff_excludes
+  diff_excludes[system_dlkm]="\
+    -I /system_dlkm/lib/modules/"
+  diff_excludes[vendor_dlkm]="\
+    -I /vendor_dlkm/lib/modules/"
 
   # Example output of dump.erofs is as below, and the data used in the test start
   # at line 11. Column 1 is inode id, column 2 is inode type and column 3 is name.
@@ -169,12 +197,21 @@ function test_sbom_aosp_cf_x86_64_phone {
     partition_name=$(basename $f | cut -d. -f1)
     file_list_file="${sbom_test}/sbom-${partition_name}-files.txt"
     files_in_soong_spdx_file="${sbom_test}/sbom-${partition_name}-files-in-soong-spdx.txt"
-    # lz4 decompress $f to stdout
-    # cpio list all entries like ls -l
-    # grep filter normal files and symlinks
-    # awk get entry names
-    # sed remove partition name from entry names
-    $lz4 -c -d $f | cpio -tv 2>/dev/null | grep '^[-l]' | awk -F ' ' '{print $9}' | sed "s:^:/$partition_name/:" | sort -n > "$file_list_file"
+
+    # toybox cpio does not produce detail like `ls -l`, so we extract files from the image file
+    # and use `find` to list only regular files (-type f) and symlinks (-type l).
+    #   -mindepth 1: Exclude the top-level directory itself.
+    #   -printf '%P\n': Print paths relative to extracted_files_dir.
+    #   sed: remove partition name from entry names
+    extracted_files_dir="${sbom_test}/${partition_name}-extracted"
+    mkdir ${extracted_files_dir}
+    img_filename=$(basename $f)
+    #out/target/product/vsoc_x86_64/sbom_test/ramdisk_extracted
+    (cd "${extracted_files_dir}" && ../../../../../host/linux-x86/bin/lz4 -c -d ../${img_filename} | ../../../../../host/linux-x86/bin/cpio -id 2>/dev/null)
+
+    find "$extracted_files_dir" -mindepth 1 \( -type f -o -type l \) -printf '%P\n' | \
+      sed "s:^:/$partition_name/:" | \
+      sort -n > "$file_list_file"
 
     grep "FileName: /${partition_name}/" $soong_sbom_out/sbom.spdx | sed 's/^FileName: //' | sort -n > "$files_in_soong_spdx_file"
 
@@ -239,11 +276,11 @@ function verify_packages_licenses {
   # PRODUCT and 4 prebuilt packages have "PackageLicenseDeclared: NOASSERTION"
   # All other packages have declared licenses
   num_of_packages_with_noassertion_license=$(grep 'PackageLicenseDeclared: NOASSERTION' $sbom_file | wc -l)
-  if [ $num_of_packages_with_noassertion_license -lt 10 ]
+  if [ $num_of_packages_with_noassertion_license -lt 18 ]
   then
     echo "Number of packages with NOASSERTION license is correct."
   else
-    echo "Number of packages with NOASSERTION license is WRONG."
+    echo "Number of packages with NOASSERTION license is WRONG(${num_of_packages_with_noassertion_license})."
     exit 1
   fi
 
@@ -284,7 +321,6 @@ function test_sbom_unbundled_modules {
     com.google.android.os.statsd \
     com.google.android.permission \
     com.google.android.profiling \
-    com.google.android.resolv \
     com.google.android.rkpd \
     com.google.android.scheduling \
     com.google.android.sdkext \
@@ -299,8 +335,7 @@ function test_sbom_unbundled_modules {
     DocumentsUIGoogle \
     GoogleExtServices \
     GooglePermissionController \
-    NetworkStackGoogle \
-    NetworkStackNextGoogle"
+    NetworkStackGoogle"
 
   # run_soong to build com.android.adbd.apex
   run_soong "${out_dir}" "sbom dist apex-ls deapexer debugfs fsck.erofs" "${APEXES} ${APKS}"

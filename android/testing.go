@@ -67,20 +67,22 @@ var PrepareForTestWithArchMutator = GroupFixturePreparers(
 	FixtureRegisterWithContext(func(ctx RegistrationContext) {
 		ctx.PreDepsMutators(registerArchMutator)
 	}),
+	PrepareForTestWithBuildFlag("RELEASE_SOONG_IMAGE_VARIANT_ON_DEMAND", "true"),
 )
 
 var PrepareForTestWithDefaults = FixtureRegisterWithContext(func(ctx RegistrationContext) {
-	ctx.PreArchMutators(RegisterDefaultsPreArchMutators)
+	ctx.PrePartialMutators(RegisterDefaultsPreArchMutators)
 })
 
 var PrepareForTestWithComponentsMutator = FixtureRegisterWithContext(func(ctx RegistrationContext) {
-	ctx.PreArchMutators(RegisterComponentsMutator)
+	ctx.PrePartialMutators(RegisterComponentsMutator)
 })
 
 var PrepareForTestWithPrebuilts = FixtureRegisterWithContext(RegisterPrebuiltMutators)
 
 var PrepareForTestWithOverrides = FixtureRegisterWithContext(func(ctx RegistrationContext) {
-	ctx.PostDepsMutators(RegisterOverridePostDepsMutators)
+	ctx.PostDepsMutators(RegisterOverrideDepsPostDepsMutators)
+	ctx.PostDepsMutators(RegisterReplaceDepsPostDepsMutators)
 })
 
 var PrepareForTestWithLicenses = GroupFixturePreparers(
@@ -122,7 +124,7 @@ var PrepareForTestWithLicenseDefaultModules = GroupFixturePreparers(
 
 var PrepareForTestWithNamespace = FixtureRegisterWithContext(func(ctx RegistrationContext) {
 	registerNamespaceBuildComponents(ctx)
-	ctx.PreArchMutators(RegisterNamespaceMutator)
+	ctx.PrePartialMutators(RegisterNamespaceMutator)
 })
 
 var PrepareForTestWithMakevars = FixtureRegisterWithContext(func(ctx RegistrationContext) {
@@ -174,6 +176,8 @@ var PrepareForTestWithAllowMissingDependencies = GroupFixturePreparers(
 	}),
 	FixtureModifyContext(func(ctx *TestContext) {
 		ctx.SetAllowMissingDependencies(true)
+		// TODO(b/477627661): on-demand variants is not supported with allow missing deps.
+		ctx.SetSplitAllVariants(true)
 	}),
 )
 
@@ -220,8 +224,8 @@ func NewTestArchContext(config Config) *TestContext {
 
 type TestContext struct {
 	*Context
-	preArch, preDeps, postDeps, postApex, finalDeps []RegisterMutatorFunc
-	NameResolver                                    *NameResolver
+	prePartial, preArch, preDeps, postDeps, postApex, finalDeps []RegisterMutatorFunc
+	NameResolver                                                *NameResolver
 
 	// The list of singletons registered for the test.
 	singletons sortableComponents
@@ -229,6 +233,10 @@ type TestContext struct {
 	// The order in which the mutators and singletons will be run in this test
 	// context; for debugging.
 	mutatorOrder, singletonOrder []string
+}
+
+func (ctx *TestContext) PrePartialMutators(f RegisterMutatorFunc) {
+	ctx.prePartial = append(ctx.prePartial, f)
 }
 
 func (ctx *TestContext) PreArchMutators(f RegisterMutatorFunc) {
@@ -533,7 +541,7 @@ func globallyRegisteredComponentsOrder() *registrationSorter {
 func (ctx *TestContext) Register() {
 	globalOrder := globallyRegisteredComponentsOrder()
 
-	mutators := collateRegisteredMutators(ctx.preArch, ctx.preDeps, ctx.postDeps, ctx.postApex, ctx.finalDeps)
+	mutators := collateRegisteredMutators(ctx.prePartial, ctx.preArch, ctx.preDeps, ctx.postDeps, ctx.postApex, ctx.finalDeps)
 	// Ensure that the mutators used in the test are in the same order as they are used at runtime.
 	globalOrder.mutatorOrder.enforceOrdering(mutators)
 	mutators.registerAll(ctx.Context)
@@ -561,18 +569,6 @@ func (ctx *TestContext) ParseBlueprintsFiles(rootDir string) (deps []string, err
 
 func (ctx *TestContext) RegisterModuleType(name string, factory ModuleFactory) {
 	ctx.Context.RegisterModuleType(name, ModuleFactoryAdaptor(factory))
-}
-
-func (ctx *TestContext) RegisterSingletonModuleType(name string, factory SingletonModuleFactory) {
-	s, m := SingletonModuleFactoryAdaptor(name, factory)
-	ctx.RegisterSingletonType(name, s)
-	ctx.RegisterModuleType(name, m)
-}
-
-func (ctx *TestContext) RegisterParallelSingletonModuleType(name string, factory SingletonModuleFactory) {
-	s, m := SingletonModuleFactoryAdaptor(name, factory)
-	ctx.RegisterParallelSingletonType(name, s)
-	ctx.RegisterModuleType(name, m)
 }
 
 func (ctx *TestContext) RegisterSingletonType(name string, factory SingletonFactory) {
@@ -1145,11 +1141,12 @@ func (m TestingModule) VariablesForTestsRelativeToTop() map[string]string {
 // otherwise returns the result of calling Paths.RelativeToTop
 // on the returned Paths.
 func (m TestingModule) OutputFiles(ctx *TestContext, t *testing.T, tag string) Paths {
-	outputFiles := OtherModuleProviderOrDefault(ctx.OtherModuleProviderAdaptor(), m.Module(), OutputFilesProvider)
-	if tag == "" && outputFiles.DefaultOutputFiles != nil {
-		return outputFiles.DefaultOutputFiles.RelativeToTop()
-	} else if taggedOutputFiles, hasTag := outputFiles.TaggedOutputFiles[tag]; hasTag {
-		return taggedOutputFiles.RelativeToTop()
+	if outputFiles := GetOutputFiles(ctx.OtherModuleProviderAdaptor(), m.Module()); outputFiles != nil {
+		if tag == "" && outputFiles.DefaultOutputFiles != nil {
+			return outputFiles.DefaultOutputFiles.RelativeToTop()
+		} else if taggedOutputFiles, hasTag := outputFiles.TaggedOutputFiles[tag]; hasTag {
+			return taggedOutputFiles.RelativeToTop()
+		}
 	}
 
 	t.Fatal(fmt.Errorf("No test output file has been set for tag %q", tag))
@@ -1582,4 +1579,47 @@ func AssertHasDirectDep(t *testing.T, ctx visitDirectDepsInterface, m Module, wa
 	if !found {
 		t.Errorf("Could not find a dependency from %v to %v\n", m, wantDep)
 	}
+}
+
+func newHostMockModule() Module {
+	m := &hostMockModule{}
+	InitAndroidArchModule(m, HostSupported, MultilibFirst)
+	return m
+}
+
+type hostMockModule struct {
+	ModuleBase
+}
+
+func (m *hostMockModule) GenerateAndroidBuildActions(ctx ModuleContext) {
+}
+
+var PrepareForTestWithHostMockModule = FixtureRegisterWithContext(func(ctx RegistrationContext) {
+	ctx.RegisterModuleType("host_mock_module", newHostMockModule)
+})
+
+// PrepareForTestWithHostTools adds Android.bp files with placeholder host modules with
+// the given names. The modules don't do anything. This is intended to resolve issues with
+// module types that depend on host tools for their ninja rule generation.
+func PrepareForTestWithHostTools(hostTools ...string) FixturePreparer {
+	fs := make(MockFS)
+
+	for _, hostTool := range hostTools {
+		if _, ok := commonToyboxSymlinks[hostTool]; ok {
+			prebuiltOS := prebuiltOS()
+			fs["prebuilts/build-tools/"+prebuiltOS+"/bin/toybox"] = []byte{}
+			fs["prebuilts/build-tools/path/"+prebuiltOS+"/"+hostTool] = []byte{}
+		} else {
+			fs[fmt.Sprintf("host_tools/%s/Android.bp", hostTool)] = fmt.Appendf(nil, `
+			host_mock_module {
+				name: "%s"
+			}
+			`, hostTool)
+		}
+	}
+
+	return GroupFixturePreparers(
+		PrepareForTestWithHostMockModule,
+		fs.AddToFixture(),
+	)
 }

@@ -60,6 +60,7 @@ type compiler interface {
 	cfgFlags(ctx ModuleContext, flags Flags) Flags
 	featureFlags(ctx ModuleContext, flags Flags) Flags
 	baseCompilerProps() BaseCompilerProperties
+	useExpansiveDefaultSrcs() bool
 	compilerProps() []any
 	compile(ctx ModuleContext, flags Flags, deps PathDeps) buildOutput
 	compilerDeps(ctx DepsContext, deps Deps) Deps
@@ -92,9 +93,11 @@ type compiler interface {
 
 	stdLinkage(device bool) StdLinkage
 	noStdlibs() bool
+	forceStdlibs()
 
 	unstrippedOutputFilePath() android.Path
 	strippedOutputFilePath() android.OptionalPath
+	checkJsonFilePath() android.OptionalPath
 
 	crateRootPath(ctx ModuleContext) android.Path
 	crateSources(ctx ModuleContext) android.Paths
@@ -104,6 +107,8 @@ type compiler interface {
 	moduleInfoJSON(ctx ModuleContext, moduleInfoJSON *android.ModuleInfoJSON)
 
 	emitType() string
+
+	Xom() *bool
 }
 
 func (compiler *baseCompiler) edition() string {
@@ -116,6 +121,10 @@ func (compiler *baseCompiler) setNoStdlibs() {
 
 func (compiler *baseCompiler) disableLints() {
 	compiler.Properties.Lints = proptools.StringPtr("none")
+}
+
+func (compiler *baseCompiler) Xom() *bool {
+	return compiler.Properties.Xom
 }
 
 func NewBaseCompiler(dir, dir64 string, location installLocation) *baseCompiler {
@@ -181,6 +190,9 @@ type BaseCompilerProperties struct {
 	// list of rust automatic crate dependencies.
 	// Rustlibs linkage is rlib for host targets and dylib for device targets.
 	Rustlibs proptools.Configurable[[]string] `android:"arch_variant"`
+
+	// list of no_std forced dependencies
+	No_std_rlibs proptools.Configurable[[]string] `android:"arch_variant"`
 
 	// list of rust proc_macro crate dependencies
 	Proc_macros proptools.Configurable[[]string] `android:"arch_variant"`
@@ -273,6 +285,11 @@ type BaseCompilerProperties struct {
 	// This is primarily for tracking sources for RBE purposes. Currently defaults
 	// to true, though this may change in the future.
 	Use_expansive_default_srcs *bool
+
+	// Xom controls whether or not xom should be enabled for this module. Setting
+	// this to false will disable xom for all dependents which link this module
+	// statically.
+	Xom *bool
 }
 
 type baseCompiler struct {
@@ -291,9 +308,10 @@ type baseCompiler struct {
 
 	// unstripped output file.
 	unstrippedOutputFile android.Path
-
 	// stripped output file.
 	strippedOutputFile android.OptionalPath
+	// checkJson output file.
+	checkJsonFile android.OptionalPath
 }
 
 func (compiler *baseCompiler) begin(ctx BaseModuleContext) {}
@@ -313,6 +331,10 @@ func (compiler *baseCompiler) SetDisabled() {
 
 func (compiler *baseCompiler) noStdlibs() bool {
 	return Bool(compiler.Properties.No_stdlibs)
+}
+
+func (compiler *baseCompiler) forceStdlibs() {
+	compiler.Properties.No_stdlibs = proptools.BoolPtr(false)
 }
 
 func (compiler *baseCompiler) preferRlib() bool {
@@ -437,30 +459,35 @@ func (compiler *baseCompiler) cfgFlags(ctx ModuleContext, flags Flags) Flags {
 	return flags
 }
 
+var gccSOnceKey = android.NewOnceKey("gcc_s_once")
+
 func CommonDefaultFlags(ctx android.ModuleContext, toolchain config.Toolchain, flags Flags) Flags {
-	flags.GlobalRustFlags = append(flags.GlobalRustFlags, config.GlobalRustFlags...)
-	flags.GlobalRustFlags = append(flags.GlobalRustFlags, toolchain.ToolchainRustFlags())
-	flags.GlobalLinkFlags = append(flags.GlobalLinkFlags, toolchain.ToolchainLinkFlags())
+	flags.GlobalRustFlags = flags.GlobalRustFlags.AppendNoDeps(config.GlobalRustFlags...)
+	flags.GlobalRustFlags = flags.GlobalRustFlags.Append(toolchain.ToolchainRustFlags(ctx))
+	flags.GlobalLinkFlags = flags.GlobalLinkFlags.Append(toolchain.ToolchainLinkFlags(ctx))
 	flags.EmitXrefs = ctx.Config().EmitXrefRules()
 
 	if ctx.Host() && !ctx.Windows() {
-		flags.LinkFlags = append(flags.LinkFlags, cc.RpathFlags(ctx)...)
+		flags.LinkFlags = flags.LinkFlags.AppendNoDeps(cc.RpathFlags(ctx)...)
 	}
 
 	if ctx.Os() == android.Linux {
 		// Add -lc, -lrt, -ldl, -lpthread, -lm and -lgcc_s to glibc builds to match
 		// the default behavior of device builds.
 		flags.RustFlags = append(flags.RustFlags, config.LinuxHostGlobalRustFlags...)
-		flags.LinkFlags = append(flags.LinkFlags, config.LinuxHostGlobalLinkFlags...)
+		flags.LinkFlags = flags.LinkFlags.AppendNoDeps(config.LinuxHostGlobalLinkFlags...)
 	} else if ctx.Os() == android.Darwin {
 		// Add -lc, -ldl, -lpthread and -lm to glibc darwin builds to match the default
 		// behavior of device builds.
-		flags.LinkFlags = append(flags.LinkFlags,
+		flags.LinkFlags = flags.LinkFlags.AppendNoDeps(
 			"-lc",
 			"-ldl",
 			"-lpthread",
 			"-lm",
 		)
+	}
+	if ctx.Device() {
+		flags.LinkFlags = flags.LinkFlags.AppendNoDeps(cc.XomFlags(ctx)...)
 	}
 	return flags
 }
@@ -489,13 +516,16 @@ func (compiler *baseCompiler) compilerFlags(ctx ModuleContext, flags Flags) Flag
 		if strings.HasPrefix(s, "-Clink-args=") || strings.HasPrefix(s, "-C link-args=") {
 			ctx.PropertyErrorf("flags", "'-C link-args' flag cannot be manually specified")
 		}
+		if strings.HasPrefix(s, "-Clinker-plugin-lto=") {
+			ctx.PropertyErrorf("flags", "'-Clinker-plugin-lto' cannot be specified. Use 'lto' property instead")
+		}
 	}
 
 	flags.RustFlags = append(flags.RustFlags, lintFlags)
 	flags.RustFlags = append(flags.RustFlags, compiler.Properties.Flags...)
 	flags.RustFlags = append(flags.RustFlags, "--edition="+compiler.edition())
 	flags.RustdocFlags = append(flags.RustdocFlags, "--edition="+compiler.edition())
-	flags.LinkFlags = append(flags.LinkFlags, compiler.Properties.Ld_flags...)
+	flags.LinkFlags = flags.LinkFlags.AppendNoDeps(compiler.Properties.Ld_flags...)
 
 	return flags
 }
@@ -530,9 +560,14 @@ func (compiler *baseCompiler) strippedOutputFilePath() android.OptionalPath {
 	return compiler.strippedOutputFile
 }
 
+func (compiler *baseCompiler) checkJsonFilePath() android.OptionalPath {
+	return compiler.checkJsonFile
+}
+
 func (compiler *baseCompiler) compilerDeps(ctx DepsContext, deps Deps) Deps {
 	deps.Rlibs = append(deps.Rlibs, compiler.Properties.Rlibs.GetOrDefault(ctx, nil)...)
 	deps.Rustlibs = append(deps.Rustlibs, compiler.Properties.Rustlibs.GetOrDefault(ctx, nil)...)
+	deps.NoStdRlibs = append(deps.NoStdRlibs, compiler.Properties.No_std_rlibs.GetOrDefault(ctx, nil)...)
 	deps.ProcMacros = append(deps.ProcMacros, compiler.Properties.Proc_macros.GetOrDefault(ctx, nil)...)
 	deps.StaticLibs = append(deps.StaticLibs, compiler.Properties.Static_libs.GetOrDefault(ctx, nil)...)
 	deps.WholeStaticLibs = append(deps.WholeStaticLibs, compiler.Properties.Whole_static_libs.GetOrDefault(ctx, nil)...)
@@ -668,23 +703,21 @@ func (compiler *baseCompiler) crateRootPath(ctx ModuleContext) android.Path {
 	}
 }
 
+func (compiler *baseCompiler) useExpansiveDefaultSrcs() bool {
+	return BoolDefault(compiler.Properties.Use_expansive_default_srcs, true)
+}
+
 func (compiler *baseCompiler) crateSources(ctx ModuleContext) android.Paths {
 	crateSources := android.PathsForModuleSrc(ctx, compiler.Properties.Srcs.GetOrDefault(ctx, nil))
 
 	// By default use an expansive set of required sources.
-	// Check for UseREWrapper here since this isn't necessary for local builds and can
-	// break some tests as the MockFS doesn't support globbing in all instances.
-	if BoolDefault(compiler.Properties.Use_expansive_default_srcs, true) && ctx.Config().IsEnvTrue("RBE_RUST") && ctx.Config().IsEnvTrue("USE_REWRAPPER") {
+	if compiler.useExpansiveDefaultSrcs() {
 		crateSources = append(crateSources, android.PathsForModuleSrc(ctx,
 			[]string{
 				"*.md",
 				"**/*.md",
 				"*.rs",
 				"**/*.rs",
-				"*.proto",
-				"**/*.proto",
-				"*.xml",
-				"**/*.xml",
 				"*.h",
 				"**/*.h"})...)
 	}

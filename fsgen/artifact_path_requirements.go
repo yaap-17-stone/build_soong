@@ -157,7 +157,7 @@ func (s *artifactPathRequirementsVerifierSingleton) GenerateBuildActions(ctx and
 			return
 		}
 
-		if installInfo, ok := android.OtherModuleProvider(ctx, m, android.InstallFilesProvider); ok {
+		if installInfo := info.InstallFiles; installInfo != nil {
 			for _, ps := range installInfo.TransitivePackagingSpecs.ToList() {
 				if ps.SkipInstall() || ps.Partition() == "" || ps.InstallInSanitizerDir() {
 					continue
@@ -219,7 +219,8 @@ func (s *artifactPathRequirementsVerifierSingleton) GenerateBuildActions(ctx and
 	}
 	for _, makefile := range android.SortedKeys(internalUnusedAllowedList) {
 		sort.Strings(internalUnusedAllowedList[makefile])
-		if !partitionVars.ArtifactPathRequirementsIsRelaxedOfMakefile[makefile] {
+		if !partitionVars.ArtifactPathRequirementsIsRelaxedOfMakefile[makefile] && !ctx.Config().KatiEnabled() {
+			// Skip this check for KatiEnabled build that has Android.mk
 			errMsg := fmt.Sprintf("%s includes redundant allowed entries in its artifact path requirement.\n", makefile)
 			errMsg += "If the modules are defined in Android.mk, They might be missing from the verification. Define the modules in Android.bp instead.\n"
 			errMsg += "Otherwise, remove the redundant allowed entries.\n"
@@ -245,7 +246,8 @@ func (s *artifactPathRequirementsVerifierSingleton) GenerateBuildActions(ctx and
 			errMsg += "Please define a vintf_compatibility_matrix module in Android.bp for each FCM file with 'system_ext_specific: true' or the other partition that implements the feature. Then add each of these vintf_compatibility_matrix modules to PRODUCT_PACKAGES."
 			printListAndError(ctx, externalOffendingFcms[makefile], errMsg)
 		}
-		if enforcement != "relaxed" {
+		if enforcement != "relaxed" && !ctx.Config().KatiEnabled() {
+			// Skip this check for KatiEnabled build that has Android.mk
 			for _, makefile := range android.SortedKeys(externalUnusedAllowedList) {
 				sort.Strings(externalUnusedAllowedList[makefile])
 				errMsg := fmt.Sprintf("Device makefile includes redundant artifact path requirement allowed list entries in %s.\n", makefile)

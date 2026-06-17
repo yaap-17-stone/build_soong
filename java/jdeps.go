@@ -46,7 +46,8 @@ func (j *jdepsGeneratorSingleton) GenerateBuildActions(ctx android.SingletonCont
 	moduleInfos := make(map[string]android.IdeInfo)
 
 	ctx.VisitAllModuleProxies(func(module android.ModuleProxy) {
-		if !android.OtherModulePointerProviderOrDefault(ctx, module, android.CommonModuleInfoProvider).Enabled {
+		commonInfo := android.OtherModulePointerProviderOrDefault(ctx, module, android.CommonModuleInfoProvider)
+		if !commonInfo.Enabled {
 			return
 		}
 
@@ -55,8 +56,8 @@ func (j *jdepsGeneratorSingleton) GenerateBuildActions(ctx android.SingletonCont
 			return
 		}
 
-		ideInfoProvider, ok := android.OtherModuleProvider(ctx, module, android.IdeInfoProviderKey)
-		if !ok {
+		ideInfoProvider := commonInfo.IdeInfo
+		if ideInfoProvider == nil {
 			return
 		}
 		name := ideInfoProvider.BaseModuleName
@@ -72,8 +73,8 @@ func (j *jdepsGeneratorSingleton) GenerateBuildActions(ctx android.SingletonCont
 		dpInfo.Paths = []string{ctx.ModuleDir(module)}
 		moduleInfos[name] = dpInfo
 
-		mkProvider, ok := android.OtherModuleProvider(ctx, module, android.AndroidMkDataInfoProvider)
-		if !ok {
+		mkProvider := commonInfo.AndroidMkData
+		if mkProvider == nil {
 			return
 		}
 		if mkProvider.Class != "" {
@@ -97,7 +98,7 @@ func (j *jdepsGeneratorSingleton) GenerateBuildActions(ctx android.SingletonCont
 
 	// This is necessary to satisfy the dangling rules check as this file is written by Soong rather than a rule.
 	ctx.Build(pctx, android.BuildParams{
-		Rule:   android.Touch,
+		Rule:   android.TouchRule,
 		Output: jfpath,
 	})
 	ctx.DistForGoals([]string{"general-tests", "dist_files", "module-info"}, j.outputPath)

@@ -25,6 +25,8 @@ import (
 	"android/soong/dexpreopt"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 type DexpreopterInterface interface {
 	// True if the java module is to be dexed and installed on devices.
 	// Structs that embed dexpreopter must implement this.
@@ -45,6 +47,7 @@ type DexpreopterInterface interface {
 	OutputProfilePathOnHost() android.Path
 }
 
+// @auto-generate: gob
 type DexpreopterInstall struct {
 	// The path to the dexpreopt output on host.
 	OutputPathOnHost android.Path
@@ -311,6 +314,12 @@ Please make sure that the value of PRODUCT_APEX_(SYSTEM_SERVER|STANDALONE_SYSTEM
 	d.dexpreopt(ctx, libraryName, dexJarFile)
 }
 
+// dexpreopter is not a real module, but is included in other modules. They should call this
+// DepsMutator method if they use dexpreopter.dexpreopt().
+func (d *dexpreopter) DepsMutator(ctx android.BottomUpMutatorContext) {
+	ctx.AddHostToolDependencies("cp_if_changed")
+}
+
 func (d *dexpreopter) dexpreopt(ctx android.ModuleContext, libName string, dexJarFile android.Path) {
 	global := dexpreopt.GetGlobalConfig(ctx)
 
@@ -353,7 +362,7 @@ func (d *dexpreopter) dexpreopt(ctx android.ModuleContext, libName string, dexJa
 	if len(targets) == 0 {
 		// assume this is a java library, dexpreopt for all arches for now
 		for _, target := range ctx.Config().Targets[android.Android] {
-			if target.NativeBridge == android.NativeBridgeDisabled {
+			if target.NativeBridge == android.NativeBridgeDisabled && !target.LFI {
 				targets = append(targets, target)
 			}
 		}
@@ -472,19 +481,21 @@ func (d *dexpreopter) dexpreopt(ctx android.ModuleContext, libName string, dexJa
 	productPackagesRule := android.NewRuleBuilder(pctx, ctx)
 	if len(clcNames) > 0 {
 		productPackagesRule.Command().
-			Text("grep -F -x").
+			BuiltTool("grep").
+			Text("-F -x").
 			FlagForEachArg("-e ", clcNames).
 			Input(productPackages).
 			FlagWithOutput("> ", appProductPackagesStaging).
 			Text("|| true")
 	} else {
 		productPackagesRule.Command().
-			Text("rm -f").Output(appProductPackagesStaging).
+			BuiltTool("rm").
+			Flag("-f").Output(appProductPackagesStaging).
 			Text("&&").
-			Text("touch").Output(appProductPackagesStaging)
+			BuiltTool("touch").Output(appProductPackagesStaging)
 	}
 	productPackagesRule.Command().
-		Text("rsync --checksum").
+		BuiltTool("cp_if_changed").
 		Input(appProductPackagesStaging).
 		Output(appProductPackages)
 	productPackagesRule.Restat().Build("product_packages."+dexJarStem, "dexpreopt product_packages")

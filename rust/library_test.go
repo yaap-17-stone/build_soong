@@ -29,11 +29,13 @@ func TestLibraryVariants(t *testing.T) {
 			name: "libfoo",
 			srcs: ["foo.rs"],
 			crate_name: "foo",
+			split_all_variants: true,
 		}
 		rust_ffi {
 			name: "libfoo.ffi",
 			srcs: ["foo.rs"],
-			crate_name: "foo"
+			crate_name: "foo",
+			split_all_variants: true,
 		}
 		rust_ffi_static {
 			name: "libfoo.ffi_static",
@@ -198,6 +200,7 @@ func TestNativeDependencyOfRlib(t *testing.T) {
 			srcs: ["foo.rs"],
 			shared_libs: ["libshared_cc_dep"],
 			static_libs: ["libstatic_cc_dep"],
+			split_all_variants: true,
 		}
 		cc_library_shared {
 			name: "libshared_cc_dep",
@@ -265,6 +268,7 @@ func TestAutoDeps(t *testing.T) {
 				"libbar",
 				"librlib_only",
 			],
+			split_all_variants: true,
 		}
 		rust_ffi {
 			name: "libfoo.ffi",
@@ -274,6 +278,7 @@ func TestAutoDeps(t *testing.T) {
 				"libbar",
 				"librlib_only",
 			],
+			split_all_variants: true,
 		}
 		rust_ffi_static {
 			name: "libfoo.ffi.static",
@@ -351,12 +356,14 @@ func TestLibstdLinkage(t *testing.T) {
 			name: "libfoo",
 			srcs: ["foo.rs"],
 			crate_name: "foo",
+			split_all_variants: true,
 		}
 		rust_ffi {
 			name: "libbar",
 			srcs: ["foo.rs"],
 			crate_name: "bar",
 			rustlibs: ["libfoo"],
+			split_all_variants: true,
 		}
 		rust_ffi_static {
 			name: "libbar_static",
@@ -432,7 +439,6 @@ func TestRustFFIExportedIncludes(t *testing.T) {
 // define a rust_ffi module which can't be done in soong-cc to avoid the
 // circular dependency.
 func TestCCRustlibsForMake(t *testing.T) {
-	t.Parallel()
 	result := testRust(t, `
 		rust_ffi_static {
 			name: "libbar",
@@ -472,6 +478,7 @@ func TestRustVersionScript(t *testing.T) {
 		srcs: ["bar.rs"],
 		crate_name: "rs",
 		extra_exported_symbols: "librs.map.txt",
+		split_all_variants: true,
 	}
 	rust_ffi {
 		name: "libffi",
@@ -511,6 +518,7 @@ func TestRustVersionScriptPropertyErrors(t *testing.T) {
 			srcs: ["bar.rs"],
 			crate_name: "rs",
 			version_script: "libbar.map.txt",
+			split_all_variants: true,
 		}`)
 	testRustError(t, "version_script and extra_exported_symbols", `
 		rust_ffi {
@@ -519,6 +527,7 @@ func TestRustVersionScriptPropertyErrors(t *testing.T) {
 			crate_name: "rs",
 			version_script: "libbar.map.txt",
 			extra_exported_symbols: "libbar.map.txt",
+			split_all_variants: true,
 		}`)
 }
 
@@ -551,30 +560,6 @@ func TestStubsVersions(t *testing.T) {
 	}
 }
 
-func TestStubsVersions_NotSorted(t *testing.T) {
-	t.Parallel()
-	bp := `
-	rust_ffi_shared {
-		name: "libfoo",
-		crate_name: "foo",
-		srcs: ["foo.rs"],
-		stubs: {
-				versions: ["29", "current", "R"],
-			},
-		}
-	`
-	fixture := android.GroupFixturePreparers(
-		prepareForRustTest,
-		android.PrepareForTestWithVisibility,
-		rustMockedFiles.AddToFixture(),
-
-		android.FixtureModifyConfigAndContext(func(config android.Config, ctx *android.TestContext) {
-			config.TestProductVariables.Platform_version_active_codenames = []string{"R"}
-		}))
-
-	fixture.ExtendWithErrorHandler(android.FixtureExpectsOneErrorPattern(`"libfoo" .*: versions: not sorted`)).RunTestWithBp(t, bp)
-}
-
 func TestStubsVersions_ParseError(t *testing.T) {
 	t.Parallel()
 	bp := `
@@ -596,7 +581,7 @@ func TestStubsVersions_ParseError(t *testing.T) {
 			config.TestProductVariables.Platform_version_active_codenames = []string{"R"}
 		}))
 
-	fixture.ExtendWithErrorHandler(android.FixtureExpectsOneErrorPattern(`"libfoo" .*: versions: "X" could not be parsed as an integer and is not a recognized codename`)).RunTestWithBp(t, bp)
+	fixture.ExtendWithErrorHandler(android.FixtureExpectsAtLeastOneErrorMatchingPattern(`"libfoo" .*: versions: "X" could not be parsed as an integer and is not a recognized codename`)).RunTestWithBp(t, bp)
 }
 
 func TestVersionedStubs(t *testing.T) {
@@ -623,6 +608,7 @@ func TestVersionedStubs(t *testing.T) {
 		crate_name: "bar_rs",
 		srcs: ["bar.rs"],
 		shared_libs: ["libFoo#1"],
+		split_all_variants: true,
 	}
 	rust_ffi {
 		name: "libbar_ffi_rs",
@@ -857,8 +843,19 @@ func TestNoStdLib(t *testing.T) {
 
 func TestNoStdVariant(t *testing.T) {
 	ctx := testRust(t, `
+	rust_defaults {
+		name: "no_std_override",
+		arch: {
+			arm64: {
+				no_std: {
+					flags: ["-C target-feature=-sve2"],
+				}
+			},
+		},
+	}
 	rust_library_rlib {
 		name: "libmaybe_std",
+		defaults: ["no_std_override"],
 		srcs: ["foo.rs"],
 		crate_name: "maybe_std",
 		no_std: {
@@ -899,6 +896,11 @@ func TestNoStdVariant(t *testing.T) {
 		t.Errorf("unexpected dependency on libstd")
 	}
 
+	maybe_std_core_rustc := ctx.ModuleForTests(t, "libmaybe_std", "android_arm64_armv8-a_rlib_rlib-core").Rule("rustc")
+	if !strings.Contains(maybe_std_core_rustc.Args["rustcFlags"], "-C target-feature=-sve2") {
+		t.Errorf("Defaults did not correctly apply to no_std variant: %v", maybe_std_core_rustc.Args["rustcFlags"])
+	}
+
 	// The nostd library should select the nostd variant
 	no_std := ctx.ModuleForTests(t, "libno_std", "android_arm64_armv8-a_rlib_rlib-core").Module().(*Module)
 	if !android.InList("libmaybe_std.rlib-core", no_std.Properties.AndroidMkRlibs) {
@@ -934,6 +936,7 @@ func TestLibraryFeatureAndRustlibOverrides(t *testing.T) {
 				features: ["a", "b"],
 				rustlibs: ["libbar"],
 			},
+			split_all_variants: true,
 		}
 		rust_library {
 			name: "libbar",

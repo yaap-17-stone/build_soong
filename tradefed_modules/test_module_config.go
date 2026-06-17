@@ -104,7 +104,7 @@ func (m *testModuleConfigModule) DepsMutator(ctx android.BottomUpMutatorContext)
 func (m *testModuleConfigModule) fixTestConfig(ctx android.ModuleContext, baseTestConfig android.Path) android.OutputPath {
 	// Test safe to do when no test_runner_options, but check for that earlier?
 	fixedConfig := android.PathForModuleOut(ctx, "test_config_fixer", ctx.ModuleName()+".config")
-	rule := android.NewRuleBuilder(pctx, ctx)
+	rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	command := rule.Command().BuiltTool("test_config_fixer").Input(baseTestConfig).Output(fixedConfig)
 	options := m.composeOptions()
 	if len(options) == 0 {
@@ -366,7 +366,7 @@ func (m *testModuleConfigModule) validateBase(ctx android.ModuleContext, depTag 
 //  4. New Module.config / AndroidTest.xml file with our options.
 func (m *testModuleConfigModule) generateManifestAndConfig(ctx android.ModuleContext) {
 	// Keep before early returns.
-	android.SetProvider(ctx, android.TestOnlyProviderKey, android.TestModuleInformation{
+	ctx.SetTestModuleInfo(&android.TestModuleInformation{
 		TestOnly:       true,
 		TopLevelTarget: true,
 	})

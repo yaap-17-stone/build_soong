@@ -17,6 +17,7 @@ package java
 import (
 	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 
 	"android/soong/android"
@@ -291,6 +292,45 @@ func TestR8Flags(t *testing.T) {
 		appR8.Args["r8Flags"], "-ignorewarnings")
 	android.AssertStringDoesContain(t, "expected --android-platform-build in app r8 flags",
 		appR8.Args["r8Flags"], "--android-platform-build")
+}
+
+func TestR8DefaultAppFlags(t *testing.T) {
+	for _, optimizeDefault := range []bool{true, false} {
+		t.Run(fmt.Sprintf("optimize_by_default=%t", optimizeDefault), func(t *testing.T) {
+			t.Parallel()
+			result := android.GroupFixturePreparers(
+				PrepareForTestWithJavaDefaultModules,
+				android.PrepareForTestWithBuildFlag("RELEASE_R8_OPTIMIZE_BY_DEFAULT", strconv.FormatBool(optimizeDefault)),
+			).RunTestWithBp(t, `
+				android_app {
+					name: "app",
+					srcs: ["foo.java"],
+					platform_apis: true,
+				}
+			`)
+
+			app := result.ModuleForTests(t, "app", "android_common")
+			appR8 := app.Rule("r8")
+
+			// R8's shrink and obfuscate flags are on by default for apps unless explicitly disabled.
+			android.AssertStringDoesNotContain(t, "expected no -dontshrink in app r8 flags",
+				appR8.Args["r8Flags"], "-dontshrink")
+			android.AssertStringDoesContain(t, "expected -dontobfuscate in app r8 flags",
+				appR8.Args["r8Flags"], "-dontobfuscate")
+
+			if optimizeDefault {
+				android.AssertStringDoesNotContain(t, "expected no -dontoptimize in app r8 flags",
+					appR8.Args["r8Flags"], "-dontoptimize")
+				android.AssertStringDoesNotContain(t, "expected no -ignorewarnings in app r8 flags",
+					appR8.Args["r8Flags"], "-ignorewarnings")
+			} else {
+				android.AssertStringDoesContain(t, "expected -dontoptimize in app r8 flags",
+					appR8.Args["r8Flags"], "-dontoptimize")
+				android.AssertStringDoesContain(t, "expected -ignorewarnings in app r8 flags",
+					appR8.Args["r8Flags"], "-ignorewarnings")
+			}
+		})
+	}
 }
 
 func TestD8(t *testing.T) {
@@ -910,4 +950,92 @@ func TestTraceReferences(t *testing.T) {
 		libJar.String(), libTraceRefs.Input.String())
 	android.AssertStringDoesContain(t, "expected trace reference proguard flags in lib r8 flags",
 		libR8.Args["r8Flags"], "trace_references.flags")
+}
+
+type testBuildProguardZipsModule struct {
+	android.ModuleBase
+}
+
+func (t *testBuildProguardZipsModule) DepsMutator(ctx android.BottomUpMutatorContext) {
+	ctx.AddDependency(ctx.Module(), nil, "app")
+}
+
+func (t *testBuildProguardZipsModule) GenerateAndroidBuildActions(ctx android.ModuleContext) {
+	var modules []android.ModuleProxy
+	ctx.VisitDirectDepsProxy(func(m android.ModuleProxy) {
+		modules = append(modules, m)
+	})
+	// Manually add duplicates for testing.
+	modules = append(modules, modules...)
+	BuildProguardZips(ctx, modules)
+}
+
+func TestBuildProguardZipsDeduplication(t *testing.T) {
+	t.Parallel()
+	result := android.GroupFixturePreparers(
+		PrepareForTestWithJavaDefaultModules,
+		android.FixtureRegisterWithContext(func(ctx android.RegistrationContext) {
+			ctx.RegisterModuleType("build_proguard_zips_test", func() android.Module {
+				m := &testBuildProguardZipsModule{}
+				android.InitAndroidArchModule(m, android.DeviceSupported, android.MultilibCommon)
+				return m
+			})
+		}),
+	).RunTestWithBp(t, `
+		android_app {
+			name: "app",
+			srcs: ["foo.java"],
+			platform_apis: true,
+			optimize: {
+				enabled: true,
+			},
+		}
+
+		build_proguard_zips_test {
+			name: "test",
+		}
+	`)
+
+	command := result.ModuleForTests(t, "test", "android_common").Rule("proguard_dict_zip").RuleParams.Command
+	dictionaryFakePath := "out/target/common/obj/APPS/app_intermediates/proguard_dictionary"
+
+	if count := strings.Count(command, dictionaryFakePath); count != 1 {
+		t.Errorf("Expected dictionary path %q to appear exactly once in command, but found %d times. Command: %q", dictionaryFakePath, count, command)
+	}
+}
+
+func TestSdkDepProguardFlags(t *testing.T) {
+	t.Parallel()
+	result := PrepareForTestWithJavaDefaultModules.RunTestWithBp(t, `
+		android_app {
+			name: "platform_app",
+			srcs: ["foo.java"],
+			platform_apis: true,
+			optimize: {
+				enabled: true,
+				shrink: true,
+			},
+		}
+
+		android_app {
+			name: "stable_app",
+			srcs: ["foo.java"],
+			sdk_version: "current",
+			optimize: {
+				enabled: true,
+				shrink: true,
+			},
+		}
+	`)
+
+	platformApp := result.ModuleForTests(t, "platform_app", "android_common")
+	stableApp := result.ModuleForTests(t, "stable_app", "android_common")
+
+	platformR8 := platformApp.Rule("r8")
+	android.AssertStringDoesContain(t, "expected framework-private-proguard flags in platform_app r8 flags",
+		platformR8.Args["r8Flags"], "framework-private.flags")
+
+	stableR8 := stableApp.Rule("r8")
+	android.AssertStringDoesNotContain(t, "expected no framework-private-proguard flags in stable_app r8 flags",
+		stableR8.Args["r8Flags"], "framework-private.flags")
 }

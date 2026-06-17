@@ -23,12 +23,18 @@ import (
 
 var (
 	riscv64Cflags = []string{
-		// Help catch common 32/64-bit errors. (This is duplicated in all 64-bit
-		// architectures' cflags.)
+		// Help catch common 32/64-bit errors.
+		// Common to all LP64 architectures.
 		"-Werror=implicit-function-declaration",
+
+		// For stack allocations larger than a page, touch each page immediately
+		// to ensure we hit the guard page on stack overflow.
+		// Common to all LP64 architectures.
+		"-fstack-clash-protection",
+
 		// This is already the driver's Android default, but duplicated here (and
 		// below) for ease of experimentation with additional extensions.
-		"-march=rv64gcv_zba_zbb_zbs",
+		"-march=rv64gcv_zba_zbb_zbs_zvbb",
 		// TODO: remove when qemu V works (https://gitlab.com/qemu-project/qemu/-/issues/1976)
 		// (Note that we'll probably want to wait for berberis to be good enough
 		// that most people don't care about qemu's V performance either!)
@@ -40,7 +46,7 @@ var (
 	riscv64Ldflags = []string{
 		// This is already the driver's Android default, but duplicated here (and
 		// above) for ease of experimentation with additional extensions.
-		"-march=rv64gcv_zba_zbb_zbs",
+		"-march=rv64gcv_zba_zbb_zbs_zvbb",
 		"-Wl,-z,max-page-size=4096",
 	}
 
@@ -95,8 +101,10 @@ func (t *toolchainRiscv64) Cppflags() string {
 	return "${config.Riscv64Cppflags}"
 }
 
-func (t *toolchainRiscv64) Ldflags() string {
-	return t.ldflags
+func (t *toolchainRiscv64) Ldflags(ctx ToolchainFlagsContext) FlagsWithDeps {
+	return FlagsWithDeps{
+		Flags: t.ldflags,
+	}
 }
 
 func (t *toolchainRiscv64) ToolchainCflags() string {

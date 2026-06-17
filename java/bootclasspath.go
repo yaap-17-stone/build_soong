@@ -23,6 +23,8 @@ import (
 	"github.com/google/blueprint/proptools"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 // Contains code that is common to both platform_bootclasspath and bootclasspath_fragment.
 
 // addDependencyOntoApexVariants adds dependencies onto the appropriate apex specific variants of
@@ -202,6 +204,7 @@ func gatherApexModulePairDepsWithTag(ctx android.BaseModuleContext,
 }
 
 // ApexVariantReference specifies a particular apex variant of a module.
+// @auto-generate: gob
 type ApexVariantReference struct {
 	android.BpPrintableBase
 
@@ -228,6 +231,31 @@ type BootclasspathFragmentsDepsProperties struct {
 // structure.
 func (p *BootclasspathFragmentsDepsProperties) addDependenciesOntoFragments(ctx android.BottomUpMutatorContext) {
 	addDependencyOntoApexVariants(ctx, "fragments", p.Fragments, fragment)
+}
+
+// filterForSdkSnapshot filters out all dependencies on fragments whose min_sdk_version is greater
+// than the API level the generated SDK targets, because they won't exist in that SDK.
+func (p *BootclasspathFragmentsDepsProperties) filterForSdkSnapshot(ctx android.ModuleContext, fragmentsMap map[string]android.ModuleProxy) []ApexVariantReference {
+	// Get the ApiLevel associated with SOONG_SDK_SNAPSHOT_TARGET_BUILD_RELEASE, defaulting to current
+	// if not set.
+	config := ctx.Config()
+	targetApiLevel := android.ApiLevelOrPanic(ctx,
+		config.GetenvWithDefault("SOONG_SDK_SNAPSHOT_TARGET_BUILD_RELEASE", "current"))
+
+	var filteredFragmentProperties []ApexVariantReference
+	for _, ref := range p.Fragments {
+		apex := proptools.StringDefault(ref.Apex, "platform")
+		if fragment, ok := fragmentsMap[apex]; ok {
+			commonInfo := android.OtherModulePointerProviderOrDefault(ctx, fragment, android.CommonModuleInfoProvider)
+			fragmentMinApiLevel := android.MinApiLevelForSdkSnapshot(commonInfo)
+
+			if fragmentMinApiLevel.LessThanOrEqualTo(targetApiLevel) {
+				filteredFragmentProperties = append(filteredFragmentProperties, ref)
+			}
+		}
+	}
+
+	return filteredFragmentProperties
 }
 
 // bootclasspathDependencyTag defines dependencies from/to bootclasspath_fragment,

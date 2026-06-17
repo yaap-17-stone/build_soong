@@ -27,7 +27,7 @@ type buildContext interface {
 
 func CopyFileToOutputPathRule(pctx android.PackageContext, ctx buildContext, path android.Path, outPath android.OutputPath) {
 	ctx.Build(pctx, android.BuildParams{
-		Rule:        android.Cp,
+		Rule:        android.CpRule,
 		Input:       path,
 		Output:      outPath,
 		Description: "copy " + path.String() + " -> " + outPath.String(),
@@ -48,7 +48,7 @@ func zipSnapshot(ctx android.SingletonContext, dir string, baseName string, snap
 	zipPath := android.PathForOutput(
 		ctx, dir, baseName+".zip")
 
-	zipRule := android.NewRuleBuilder(pctx, ctx)
+	zipRule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	rspFile := android.PathForOutput(
 		ctx, dir, baseName+"_list.rsp")
 

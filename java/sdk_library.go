@@ -33,6 +33,8 @@ import (
 	"android/soong/dexpreopt"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 // A tag to associated a dependency with a specific api scope.
 type scopeDependencyTag struct {
 	blueprint.BaseDependencyTag
@@ -659,6 +661,12 @@ type sdkLibraryProperties struct {
 // OptionalPaths are always set by java_sdk_library but may not be set by
 // java_sdk_library_import as not all instances provide that information.
 type scopePaths struct {
+	//' Determines whether this is for StubsType.Exportable paths or
+	// StubsType.Everything paths. This is false for
+	// commonToSdkLibraryAndImport.scopePaths and true for
+	// commonToSdkLibraryAndImport.exportableScopePaths.
+	stubsType StubsType
+
 	// The path (represented as Paths for convenience when returning) to the stubs header jar.
 	//
 	// That is the jar that is created by turbine.
@@ -816,7 +824,7 @@ func (paths *scopePaths) extractStubsSourceInfoFromApiStubsProviders(provider *S
 }
 
 func (paths *scopePaths) extractStubsSourceInfoFromDep(ctx android.ModuleContext, dep android.ModuleProxy) error {
-	stubsType := Everything
+	stubsType := paths.stubsType
 	if ctx.Config().ReleaseHiddenApiExportableStubs() {
 		stubsType = Exportable
 	}
@@ -826,7 +834,7 @@ func (paths *scopePaths) extractStubsSourceInfoFromDep(ctx android.ModuleContext
 }
 
 func (paths *scopePaths) extractStubsSourceAndApiInfoFromApiStubsProvider(ctx android.ModuleContext, dep android.ModuleProxy) error {
-	stubsType := Everything
+	stubsType := paths.stubsType
 	if ctx.Config().ReleaseHiddenApiExportableStubs() {
 		stubsType = Exportable
 	}
@@ -839,8 +847,8 @@ func (paths *scopePaths) extractStubsSourceAndApiInfoFromApiStubsProvider(ctx an
 
 func extractOutputPaths(ctx android.ModuleContext, dep android.ModuleProxy) (android.Paths, error) {
 	var paths android.Paths
-	if sourceFileProducer, ok := android.OtherModuleProvider(ctx, dep, android.SourceFilesInfoProvider); ok {
-		paths = sourceFileProducer.Srcs
+	if commonInfo, ok := android.OtherModuleProvider(ctx, dep, android.CommonModuleInfoProvider); ok && commonInfo.SourceFiles != nil {
+		paths = commonInfo.SourceFiles.Srcs
 		return paths, nil
 	} else {
 		return nil, fmt.Errorf("module %q does not produce source files", dep)
@@ -965,7 +973,13 @@ func (m *SdkLibraryImport) RootLibraryName() string {
 type commonToSdkLibraryAndImport struct {
 	module commonSdkLibraryAndImportModule
 
+	// Default paths for each scope. Usually uses the Everything files but can
+	// sometimes use Exportable files.
 	scopePaths map[*apiScope]*scopePaths
+
+	// Paths to Exportable files for each scope.
+	// Includes unflagged apis and flagged apis enabled by release configurations.
+	exportableScopePaths map[*apiScope]*scopePaths
 
 	commonSdkLibraryProperties commonToSdkLibraryAndImportProperties
 
@@ -1025,7 +1039,7 @@ func (c *commonToSdkLibraryAndImport) generateCommonBuildActions(ctx android.Mod
 		everythingStubPath := makeUnsetDexJarPath()
 		exportableStubPath := makeUnsetDexJarPath()
 		removedApiFilePath := android.OptionalPath{}
-		if scopePath := c.findClosestScopePath(sdkKindToApiScope(kind)); scopePath != nil {
+		if scopePath := c.findClosestScopePath(sdkKindToApiScope(kind), Everything); scopePath != nil {
 			everythingStubPath = scopePath.stubsDexJarPath
 			exportableStubPath = scopePath.exportableStubsDexJarPath
 			removedApiFilePath = scopePath.removedApiFilePath
@@ -1070,8 +1084,17 @@ func (module *commonToSdkLibraryAndImport) setOutputFiles(ctx android.ModuleCont
 	if module.doctagPaths != nil {
 		ctx.SetOutputFiles(module.doctagPaths, ".doctags")
 	}
+
+	// Add exportable and default scope paths to the output files.
+	module.addScopePathsToOutputFiles(ctx, Everything)
+	module.addScopePathsToOutputFiles(ctx, Exportable)
+}
+
+// addScopePathsToOutputFiles adds StubsType specific paths to the output files.
+func (module *commonToSdkLibraryAndImport) addScopePathsToOutputFiles(ctx android.ModuleContext, stubsType StubsType) {
+	stubsTypeTagPrefix := stubsType.OutputTagPrefix()
 	for _, scopeName := range android.SortedKeys(scopeByName) {
-		paths := module.findScopePaths(scopeByName[scopeName])
+		paths := module.findScopePaths(scopeByName[scopeName], stubsType)
 		if paths == nil {
 			continue
 		}
@@ -1085,38 +1108,54 @@ func (module *commonToSdkLibraryAndImport) setOutputFiles(ctx android.ModuleCont
 		}
 		for _, component := range android.SortedKeys(componentToOutput) {
 			if componentToOutput[component].Valid() {
-				ctx.SetOutputFiles(android.Paths{componentToOutput[component].Path()}, "."+scopeName+"."+component)
+				ctx.SetOutputFiles(android.Paths{componentToOutput[component].Path()}, stubsTypeTagPrefix+"."+scopeName+"."+component)
 			}
 		}
 	}
 }
 
-func (c *commonToSdkLibraryAndImport) getScopePathsCreateIfNeeded(scope *apiScope) *scopePaths {
-	if c.scopePaths == nil {
-		c.scopePaths = make(map[*apiScope]*scopePaths)
+func (c *commonToSdkLibraryAndImport) scopePathsPtr(stubsType StubsType) *map[*apiScope]*scopePaths {
+	if stubsType == Exportable {
+		return &c.exportableScopePaths
+	} else {
+		return &c.scopePaths
 	}
-	paths := c.scopePaths[scope]
+}
+
+func (c *commonToSdkLibraryAndImport) getScopePathsCreateIfNeeded(scope *apiScope, stubsType StubsType) *scopePaths {
+	scopeToPathsPtr := c.scopePathsPtr(stubsType)
+
+	// Get map from scope to paths suitable for exportablePaths, creating if needed.
+	scopeToPaths := *scopeToPathsPtr
+	if scopeToPaths == nil {
+		scopeToPaths = make(map[*apiScope]*scopePaths)
+		*scopeToPathsPtr = scopeToPaths
+	}
+
+	// Get scope specific paths, creating if needed.
+	paths := scopeToPaths[scope]
 	if paths == nil {
-		paths = &scopePaths{}
-		c.scopePaths[scope] = paths
+		paths = &scopePaths{stubsType: stubsType}
+		scopeToPaths[scope] = paths
 	}
 
 	return paths
 }
 
-func (c *commonToSdkLibraryAndImport) findScopePaths(scope *apiScope) *scopePaths {
-	if c.scopePaths == nil {
+func (c *commonToSdkLibraryAndImport) findScopePaths(scope *apiScope, stubsType StubsType) *scopePaths {
+	scopeToPaths := *c.scopePathsPtr(stubsType)
+	if scopeToPaths == nil {
 		return nil
 	}
 
-	return c.scopePaths[scope]
+	return scopeToPaths[scope]
 }
 
 // If this does not support the requested api scope then find the closest available
 // scope it does support. Returns nil if no such scope is available.
-func (c *commonToSdkLibraryAndImport) findClosestScopePath(scope *apiScope) *scopePaths {
+func (c *commonToSdkLibraryAndImport) findClosestScopePath(scope *apiScope, stubsType StubsType) *scopePaths {
 	for s := scope; s != nil; s = s.canAccess {
-		if paths := c.findScopePaths(s); paths != nil {
+		if paths := c.findScopePaths(s, stubsType); paths != nil {
 			return paths
 		}
 	}
@@ -1202,6 +1241,7 @@ func (e *EmbeddableSdkLibraryComponent) SdkLibraryName() *string {
 
 var SdkLibraryComponentDependencyInfoProvider = blueprint.NewMutatorProvider[SdkLibraryComponentDependencyInfo]("deps")
 
+// @auto-generate: gob
 type SdkLibraryComponentDependencyInfo struct {
 	// For shared libraries, this is the same as the SDK library name. If a Java library or app
 	// depends on a component library (e.g. a stub library) it still needs to know the name of the
@@ -1223,6 +1263,7 @@ func (e *EmbeddableSdkLibraryComponent) setComponentDependencyInfoProvider(ctx a
 	})
 }
 
+// @auto-generate: gob
 type ApiScopePathsInfo struct {
 	StubsImplPath      android.Paths
 	CurrentApiFilePath android.OptionalPath
@@ -1231,10 +1272,12 @@ type ApiScopePathsInfo struct {
 	AnnotationsZip     android.OptionalPath
 }
 
+// @auto-generate: gob
 type ApiScopePropsInfo struct {
 	SdkVersion *string
 }
 
+// @auto-generate: gob
 type SdkLibraryInfo struct {
 	// GeneratingLibs is the names of the library modules that this sdk library
 	// generates. Note that this only includes the name of the modules that other modules can
@@ -1484,7 +1527,7 @@ func (module *SdkLibrary) DepsMutator(ctx android.BottomUpMutatorContext) {
 	module.usesLibrary.deps(ctx, false)
 
 	module.EmbeddableSdkLibraryComponent.setComponentDependencyInfoProvider(ctx)
-	libDeps := ctx.AddVariationDependencies(nil, usesLibStagingTag, module.properties.Libs...)
+	libDeps := ctx.AddVariationDependencies(nil, usesLibStagingTag, module.properties.Libs.GetOrDefault(ctx, nil)...)
 	libDeps = append(libDeps, ctx.AddVariationDependencies(nil, usesLibStagingTag, module.sdkLibraryProperties.Impl_only_libs...)...)
 	module.usesLibrary.depsFromLibs(ctx, libDeps)
 }
@@ -1515,11 +1558,16 @@ func (module *SdkLibrary) GenerateAndroidBuildActions(ctx android.ModuleContext)
 		// Extract information from any of the scope specific dependencies.
 		if scopeTag, ok := tag.(scopeDependencyTag); ok {
 			apiScope := scopeTag.apiScope
-			scopePaths := module.getScopePathsCreateIfNeeded(apiScope)
+			scopePaths := module.getScopePathsCreateIfNeeded(apiScope, Everything)
 
 			// Extract information from the dependency. The exact information extracted
 			// is determined by the nature of the dependency which is determined by the tag.
 			scopeTag.extractDepInfo(ctx, to, scopePaths)
+
+			exportableScopePaths := module.getScopePathsCreateIfNeeded(apiScope, Exportable)
+			// Extract exportable information from the dependency. The exact information extracted
+			// is determined by the nature of the dependency which is determined by the tag.
+			scopeTag.extractDepInfo(ctx, to, exportableScopePaths)
 
 			exportedComponents[ctx.OtherModuleName(to)] = struct{}{}
 
@@ -1571,11 +1619,21 @@ func (module *SdkLibrary) GenerateAndroidBuildActions(ctx android.ModuleContext)
 			android.SetProvider(ctx, LintProvider, lintInfo)
 		}
 
+		if module.dexer.proguardDictionary.Valid() {
+			android.SetProvider(ctx, ProguardProvider, ProguardInfos{{
+				ModuleName:         android.ModuleNameWithPossibleOverride(ctx),
+				Class:              "JAVA_LIBRARIES",
+				ProguardDictionary: module.dexer.proguardDictionary.Path(),
+				ProguardUsageZip:   module.dexer.proguardUsageZip.Path(),
+				ClassesJar:         module.implementationAndResourcesJar,
+			}})
+		}
+
 		if !module.Host() {
 			module.hostdexInstallFile = module.implLibraryInfo.HostdexInstallFile
 		}
 
-		if buildTargetsInfo, ok := android.OtherModuleProvider(ctx, implLib, android.ModuleBuildTargetsProvider); ok {
+		if buildTargetsInfo := android.GetModuleBuildTargets(ctx, implLib); buildTargetsInfo != nil {
 			if buildTargetsInfo.CheckbuildTarget != nil {
 				ctx.CheckbuildFile(buildTargetsInfo.CheckbuildTarget)
 			}
@@ -1587,25 +1645,32 @@ func (module *SdkLibrary) GenerateAndroidBuildActions(ctx android.ModuleContext)
 	android.SetProvider(ctx, android.ExportedComponentsInfoProvider, exportedComponentInfo)
 
 	// Provide additional information for inclusion in an sdk's generated .info file.
-	additionalSdkInfo := map[string]interface{}{}
-	additionalSdkInfo["dist_stem"] = module.distStem()
+	additionalSdkInfo := android.AdditionalSdkInfoProperties{
+		Nested:     make(map[string]android.AdditionalSdkInfoProperties),
+		Properties: make(map[string]string),
+	}
+	additionalSdkInfo.Properties["dist_stem"] = module.distStem()
 	baseModuleName := module.distStem()
-	scopes := map[string]interface{}{}
-	additionalSdkInfo["scopes"] = scopes
+	scopes := android.AdditionalSdkInfoProperties{
+		Nested: make(map[string]android.AdditionalSdkInfoProperties),
+	}
+	additionalSdkInfo.Nested["scopes"] = scopes
 	for scope, scopePaths := range module.scopePaths {
-		scopeInfo := map[string]interface{}{}
-		scopes[scope.name] = scopeInfo
-		scopeInfo["current_api"] = scope.snapshotRelativeCurrentApiTxtPath(baseModuleName)
-		scopeInfo["removed_api"] = scope.snapshotRelativeRemovedApiTxtPath(baseModuleName)
+		scopeInfo := android.AdditionalSdkInfoProperties{
+			Properties: make(map[string]string),
+		}
+		scopes.Nested[scope.name] = scopeInfo
+		scopeInfo.Properties["current_api"] = scope.snapshotRelativeCurrentApiTxtPath(baseModuleName)
+		scopeInfo.Properties["removed_api"] = scope.snapshotRelativeRemovedApiTxtPath(baseModuleName)
 		if p := scopePaths.latestApiPaths; len(p) > 0 {
 			// The last path in the list is the one that applies to this scope, the
 			// preceding ones, if any, are for the scope(s) that it extends.
-			scopeInfo["latest_api"] = p[len(p)-1].String()
+			scopeInfo.Properties["latest_api"] = p[len(p)-1].String()
 		}
 		if p := scopePaths.latestRemovedApiPaths; len(p) > 0 {
 			// The last path in the list is the one that applies to this scope, the
 			// preceding ones, if any, are for the scope(s) that it extends.
-			scopeInfo["latest_removed_api"] = p[len(p)-1].String()
+			scopeInfo.Properties["latest_removed_api"] = p[len(p)-1].String()
 		}
 	}
 	android.SetProvider(ctx, android.AdditionalSdkInfoProvider, android.AdditionalSdkInfo{additionalSdkInfo})
@@ -1828,6 +1893,7 @@ func (m *SdkLibrary) GetDepInSameApexChecker() android.DepInSameApexChecker {
 	return SdkLibraryDepInSameApexChecker{}
 }
 
+// @auto-generate: gob
 type SdkLibraryDepInSameApexChecker struct {
 	android.BaseDepInSameApexChecker
 }
@@ -1957,7 +2023,7 @@ func (module *SdkLibrary) CreateInternalModules(mctx android.DefaultableHookCont
 	}
 
 	// Add the impl_only_libs and impl_only_static_libs *after* we're done using them in submodules.
-	module.properties.Libs = append(module.properties.Libs, module.sdkLibraryProperties.Impl_only_libs...)
+	module.properties.Libs.AppendSimpleValue(module.sdkLibraryProperties.Impl_only_libs)
 	module.properties.Static_libs.AppendSimpleValue(module.sdkLibraryProperties.Impl_only_static_libs)
 }
 
@@ -2270,6 +2336,7 @@ func (m *SdkLibraryImport) GetDepInSameApexChecker() android.DepInSameApexChecke
 	return SdkLibraryImportDepIsInSameApexChecker{}
 }
 
+// @auto-generate: gob
 type SdkLibraryImportDepIsInSameApexChecker struct {
 	android.BaseDepInSameApexChecker
 }
@@ -2311,7 +2378,7 @@ func (module *SdkLibraryImport) GenerateAndroidBuildActions(ctx android.ModuleCo
 		// Extract information from any of the scope specific dependencies.
 		if scopeTag, ok := tag.(scopeDependencyTag); ok {
 			apiScope := scopeTag.apiScope
-			scopePaths := module.getScopePathsCreateIfNeeded(apiScope)
+			scopePaths := module.getScopePathsCreateIfNeeded(apiScope, Everything)
 
 			// Extract information from the dependency. The exact information extracted
 			// is determined by the nature of the dependency which is determined by the tag.
@@ -2333,12 +2400,15 @@ func (module *SdkLibraryImport) GenerateAndroidBuildActions(ctx android.ModuleCo
 			continue
 		}
 
-		paths := module.getScopePathsCreateIfNeeded(apiScope)
-		paths.annotationsZip = android.OptionalPathForModuleSrc(ctx, scopeProperties.Annotations)
-		paths.currentApiFilePath = android.OptionalPathForModuleSrc(ctx, scopeProperties.Current_api)
-		paths.checkedInCurrentApiFilePath = android.OptionalPathForModuleSrc(ctx, scopeProperties.Current_api)
-		paths.removedApiFilePath = android.OptionalPathForModuleSrc(ctx, scopeProperties.Removed_api)
-		paths.checkedInRemovedApiFilePath = android.OptionalPathForModuleSrc(ctx, scopeProperties.Removed_api)
+		// Store the information in default and exportable paths.
+		for _, stubsType := range []StubsType{Everything, Exportable} {
+			paths := module.getScopePathsCreateIfNeeded(apiScope, stubsType)
+			paths.annotationsZip = android.OptionalPathForModuleSrc(ctx, scopeProperties.Annotations)
+			paths.currentApiFilePath = android.OptionalPathForModuleSrc(ctx, scopeProperties.Current_api)
+			paths.checkedInCurrentApiFilePath = android.OptionalPathForModuleSrc(ctx, scopeProperties.Current_api)
+			paths.removedApiFilePath = android.OptionalPathForModuleSrc(ctx, scopeProperties.Removed_api)
+			paths.checkedInRemovedApiFilePath = android.OptionalPathForModuleSrc(ctx, scopeProperties.Removed_api)
+		}
 	}
 
 	if ctx.Device() {
@@ -2349,7 +2419,7 @@ func (module *SdkLibraryImport) GenerateAndroidBuildActions(ctx android.ModuleCo
 		ai, _ := android.ModuleProvider(ctx, android.ApexInfoProvider)
 		if ai.ForPrebuiltApex {
 			module.dexJarFile = makeDexJarPathFromPath(android.PathForModuleInstall(ctx, "intentionally_no_longer_supported"))
-			module.initHiddenAPI(ctx, module.dexJarFile, module.findScopePaths(apiScopePublic).stubsImplPath[0], nil)
+			module.initHiddenAPI(ctx, module.dexJarFile, module.findScopePaths(apiScopePublic, Everything).stubsImplPath[0], nil)
 		}
 	}
 

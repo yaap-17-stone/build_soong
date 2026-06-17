@@ -28,6 +28,8 @@ import (
 	"github.com/google/blueprint/proptools"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 func init() {
 	registerBpfBuildComponents(android.InitRegistrationContext)
 	pctx.Import("android/soong/cc/config")
@@ -37,21 +39,25 @@ func init() {
 var (
 	pctx = android.NewPackageContext("android/soong/bpf")
 
-	ccRule = pctx.AndroidRemoteStaticRule("ccRule", android.RemoteRuleSupports{},
+	ccRule = pctx.AndroidStaticRule("ccRule",
 		blueprint.RuleParams{
-			Depfile:     "${out}.d",
-			Deps:        blueprint.DepsGCC,
-			Command:     "$relPwd $ccCmd --target=bpf -mcpu=v1 -c $cFlags -MD -MF ${out}.d -o $out $in",
-			CommandDeps: []string{"$ccCmd"},
+			Depfile:         "${out}.d",
+			Deps:            blueprint.DepsGCC,
+			Command:         "$relPwd $ccCmd --target=bpf -mcpu=v1 -c $cFlags -MD -MF ${out}.d -o $out $in",
+			CommandDeps:     []string{"$ccCmd"},
+			SandboxDisabled: true,
 		},
 		"ccCmd", "cFlags")
 
 	stripRule = pctx.AndroidStaticRule("stripRule",
 		blueprint.RuleParams{
-			Command:     `$stripCmd -g $in -o $out`,
-			CommandDeps: []string{"$stripCmd"},
-		},
-		"stripCmd")
+			Command: `${config.ClangBin}/llvm-strip -g $in -o $out`,
+			CommandDeps: []string{
+				"${config.ClangBin}/llvm-strip",
+				// llvm-strip is a symlink to llvm-objcopy
+				"${config.ClangBin}/llvm-objcopy",
+			},
+		})
 )
 
 func registerBpfBuildComponents(ctx android.RegistrationContext) {
@@ -59,6 +65,7 @@ func registerBpfBuildComponents(ctx android.RegistrationContext) {
 	ctx.RegisterModuleType("bpf", BpfFactory)
 }
 
+// @auto-generate: gob
 type BpfInfo struct {
 	SubDir string
 }
@@ -217,9 +224,6 @@ func (bpf *bpf) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 				Rule:   stripRule,
 				Input:  obj,
 				Output: objStripped,
-				Args: map[string]string{
-					"stripCmd": "${config.ClangBin}/llvm-strip",
-				},
 			})
 			bpf.objs = append(bpf.objs, objStripped.WithoutRel())
 		} else {

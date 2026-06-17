@@ -18,24 +18,26 @@ import (
 	"github.com/google/blueprint"
 )
 
-//go:generate go run ../../blueprint/gobtools/codegen/gob_gen.go
+//go:generate go run ../../blueprint/gobtools/codegen
 
 func init() {
 	pctx.HostBinToolVariable("symbols_map", "symbols_map")
 }
 
 var zipFiles = pctx.AndroidStaticRule("SnapshotZipFiles", blueprint.RuleParams{
-	Command:        `${SoongZipCmd}  -r $out.rsp -o $out`,
-	CommandDeps:    []string{"${SoongZipCmd}"},
-	Rspfile:        "$out.rsp",
-	RspfileContent: "$in",
+	Command:         `${SoongZipCmd}  -r $out.rsp -o $out`,
+	CommandDeps:     []string{"${SoongZipCmd}"},
+	Rspfile:         "$out.rsp",
+	RspfileContent:  "$in",
+	SandboxDisabled: true,
 })
 
 var mergeSymbolsMapProtos = pctx.AndroidStaticRule("merge_symbol_map_protos", blueprint.RuleParams{
-	Command:        `${symbols_map} -merge $out @$out.rsp`,
-	CommandDeps:    []string{"${symbols_map}"},
-	Rspfile:        "$out.rsp",
-	RspfileContent: "$in",
+	Command:         `${symbols_map} -merge $out @$out.rsp`,
+	CommandDeps:     []string{"${symbols_map}"},
+	Rspfile:         "$out.rsp",
+	RspfileContent:  "$in",
+	SandboxDisabled: true,
 })
 
 // Provider for generating symbols.zip
@@ -48,9 +50,6 @@ type SymbolicOutputInfo struct {
 
 // @auto-generate: gob
 type SymbolicOutputInfos []*SymbolicOutputInfo
-
-// SymbolInfosProvider provides necessary information to generate the symbols.zip
-var SymbolInfosProvider = blueprint.NewProvider[SymbolicOutputInfos]()
 
 func (s *SymbolicOutputInfos) SortedUniqueSymbolicOutputPaths() Paths {
 	ret := make(Paths, len(*s))
@@ -75,15 +74,16 @@ type symbolsContext interface {
 }
 
 // Defines the build rules to generate the symbols.zip file and the merged elf mapping textproto
-// file. Modules in depModules that provide [SymbolInfosProvider] and are exported to make
+// file. Modules in depModules that provide [SymbolInfos] and are exported to make
 // will be listed in the symbols.zip and the merged proto file.
 func BuildSymbolsZip(ctx symbolsContext, depModules []ModuleProxy, extraSymbols *SymbolicOutputInfos, symbolsZipFile, mergedMappingProtoFile WritablePath) (Paths, Paths) {
 	var allSymbolicOutputPaths, allElfMappingProtoPaths Paths
 	for _, mod := range depModules {
-		if commonInfo, _ := OtherModuleProvider(ctx, mod, CommonModuleInfoProvider); commonInfo.SkipAndroidMkProcessing {
+		commonInfo, _ := OtherModuleProvider(ctx, mod, CommonModuleInfoProvider)
+		if commonInfo.SkipAndroidMkProcessing {
 			continue
 		}
-		if symbolInfos, ok := OtherModuleProvider(ctx, mod, SymbolInfosProvider); ok {
+		if symbolInfos := commonInfo.SymbolicOutput; symbolInfos != nil {
 			allSymbolicOutputPaths = append(allSymbolicOutputPaths, symbolInfos.SortedUniqueSymbolicOutputPaths()...)
 			allElfMappingProtoPaths = append(allElfMappingProtoPaths, symbolInfos.SortedUniqueElfMappingProtoPaths()...)
 		}

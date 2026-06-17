@@ -19,6 +19,8 @@ import (
 	"github.com/google/blueprint/proptools"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 func init() {
 	RegisterPackageBuildComponents(InitRegistrationContext)
 }
@@ -30,6 +32,7 @@ func RegisterPackageBuildComponents(ctx RegistrationContext) {
 	ctx.RegisterModuleType("package", PackageFactory)
 }
 
+// @auto-generate: gob
 type packageProperties struct {
 	// Specifies the default visibility for all modules defined in this package.
 	Default_visibility []string
@@ -38,13 +41,12 @@ type packageProperties struct {
 	Default_team                *string `android:"path"`
 }
 
+// @auto-generate: gob
 type PackageInfo struct {
 	Properties packageProperties
 	// The primary licenses, may be empty, records license metadata for the module.
 	PrimaryLicenses []string
 }
-
-var PackageInfoProvider = blueprint.NewProvider[PackageInfo]()
 
 type packageModule struct {
 	ModuleBase
@@ -66,11 +68,10 @@ func (p *packageModule) DepsMutator(ctx BottomUpMutatorContext) {
 func (p *packageModule) GenerateBuildActions(ctx blueprint.ModuleContext) {
 	ctx.SetProvider(CommonModuleInfoProvider, &CommonModuleInfo{
 		Enabled: true,
-	})
-
-	ctx.SetProvider(PackageInfoProvider, PackageInfo{
-		Properties:      p.properties,
-		PrimaryLicenses: p.primaryLicensesProperty.getStrings(),
+		PackageInfo: &PackageInfo{
+			Properties:      p.properties,
+			PrimaryLicenses: p.primaryLicensesProperty.getStrings(),
+		},
 	})
 }
 

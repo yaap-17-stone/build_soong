@@ -37,6 +37,7 @@ import (
 	prebuilt_etc "android/soong/etc"
 	"android/soong/filesystem"
 	"android/soong/java"
+	"android/soong/kernel"
 	"android/soong/rust"
 	"android/soong/sh"
 )
@@ -119,6 +120,7 @@ var prepareForApexTest = android.GroupFixturePreparers(
 	// General preparers in alphabetical order as test infrastructure will enforce correct
 	// registration order.
 	android.PrepareForTestWithAndroidBuildComponents,
+	android.PrepareForTestWithHostTools("kernel_modules_builder", "zipsync", "soong_zip", "merge_zips", "depmod"),
 	bpf.PrepareForTestWithBpf,
 	cc.PrepareForTestWithCcBuildComponents,
 	java.PrepareForTestWithDexpreopt,
@@ -126,6 +128,7 @@ var prepareForApexTest = android.GroupFixturePreparers(
 	rust.PrepareForTestWithRustDefaultModules,
 	sh.PrepareForTestWithShBuildComponents,
 	codegen.PrepareForTestWithAconfigBuildComponents,
+	kernel.PrepareForTestWithPrebuiltKernelModules,
 
 	PrepareForTestWithApexBuildComponents,
 
@@ -571,7 +574,7 @@ func TestBasicApex(t *testing.T) {
 	found_foo_link_64 := false
 	found_foo := false
 	for _, cmd := range strings.Split(copyCmds, " && ") {
-		if strings.HasPrefix(cmd, "ln -sfn foo64") {
+		if strings.Contains(cmd, "ln -sfn foo64") {
 			if strings.HasSuffix(cmd, "bin/foo") {
 				found_foo = true
 			} else if strings.HasSuffix(cmd, "bin/foo_link_64") {
@@ -1487,6 +1490,7 @@ func TestApex_PlatformUsesLatestStubFromApex(t *testing.T) {
 				"libstub",
 				"libstub_rust",
 			],
+			split_all_variants: true,
 		}
 	`,
 		android.FixtureModifyProductVariables(func(variables android.FixtureProductVariables) {
@@ -2021,6 +2025,7 @@ func TestApexWithSystemLibsStubs(t *testing.T) {
 			srcs: ["mylib.cpp"],
 			stl: "none",
 			bootstrap: true,
+			split_all_variants: true,
 		}
 
 		rust_ffi {
@@ -2419,169 +2424,6 @@ func TestApexMinSdkVersion_InVendorApex(t *testing.T) {
 	android.AssertStringDoesContain(t, "cflags", cflags, "-target aarch64-linux-android29")
 }
 
-func TestTrackAllowedDepsForAndroidApex(t *testing.T) {
-	t.Parallel()
-	ctx := testApex(t, `
-		apex {
-			name: "com.android.myapex",
-			key: "myapex.key",
-			updatable: true,
-			native_shared_libs: [
-				"mylib",
-				"yourlib",
-			],
-			min_sdk_version: "29",
-		}
-
-		apex {
-			name: "myapex2",
-			key: "myapex.key",
-			updatable: false,
-			native_shared_libs: ["yourlib"],
-		}
-
-		apex_key {
-			name: "myapex.key",
-			public_key: "testkey.avbpubkey",
-			private_key: "testkey.pem",
-		}
-
-		cc_library {
-			name: "mylib",
-			srcs: ["mylib.cpp"],
-			shared_libs: ["libbar", "libbar_rs"],
-			min_sdk_version: "29",
-			apex_available: ["com.android.myapex"],
-		}
-
-		cc_library {
-			name: "libbar",
-			stubs: { versions: ["29", "30"] },
-		}
-
-		rust_ffi {
-			name: "libbar_rs",
-			crate_name: "bar_rs",
-			srcs: ["bar.rs"],
-			stubs: { versions: ["29", "30"] },
-		}
-
-		cc_library {
-			name: "yourlib",
-			srcs: ["mylib.cpp"],
-			min_sdk_version: "29",
-			apex_available: ["com.android.myapex", "myapex2", "//apex_available:platform"],
-		}
-	`, withFiles(android.MockFS{
-		"packages/modules/common/build/allowed_deps.txt": nil,
-	}),
-		android.FixtureMergeMockFs(android.MockFS{
-			"system/sepolicy/apex/com.android.myapex-file_contexts": nil,
-		}))
-
-	depsinfo := ctx.SingletonForTests(t, "apex_depsinfo_singleton")
-	inputs := depsinfo.Rule("generateApexDepsInfoFilesRule").BuildParams.Inputs.Strings()
-	android.AssertStringListContains(t, "updatable com.android.myapex should generate depsinfo file", inputs,
-		"out/soong/.intermediates/com.android.myapex/android_common_com.android.myapex/depsinfo/flatlist.txt")
-	android.AssertStringListDoesNotContain(t, "non-updatable myapex2 should not generate depsinfo file", inputs,
-		"out/soong/.intermediates/myapex2/android_common_myapex2/depsinfo/flatlist.txt")
-
-	myapex := ctx.ModuleForTests(t, "com.android.myapex", "android_common_com.android.myapex")
-	flatlist := strings.Split(android.ContentFromFileRuleForTests(t, ctx,
-		myapex.Output("depsinfo/flatlist.txt")), "\n")
-	android.AssertStringListContains(t, "deps with stubs should be tracked in depsinfo as external dep",
-		flatlist, "libbar(minSdkVersion:(no version)) (external)")
-	android.AssertStringListContains(t, "deps with stubs should be tracked in depsinfo as external dep",
-		flatlist, "libbar_rs(minSdkVersion:(no version)) (external)")
-	android.AssertStringListDoesNotContain(t, "do not track if not available for platform",
-		flatlist, "mylib:(minSdkVersion:29)")
-	android.AssertStringListContains(t, "track platform-available lib",
-		flatlist, "yourlib(minSdkVersion:29)")
-}
-
-func TestNotTrackAllowedDepsForNonAndroidApex(t *testing.T) {
-	t.Parallel()
-	ctx := testApex(t, `
-		apex {
-			name: "myapex",
-			key: "myapex.key",
-			updatable: true,
-			native_shared_libs: [
-				"mylib",
-				"yourlib",
-			],
-			min_sdk_version: "29",
-		}
-
-		apex {
-			name: "myapex2",
-			key: "myapex.key",
-			updatable: false,
-			native_shared_libs: ["yourlib"],
-		}
-
-		apex_key {
-			name: "myapex.key",
-			public_key: "testkey.avbpubkey",
-			private_key: "testkey.pem",
-		}
-
-		cc_library {
-			name: "mylib",
-			srcs: ["mylib.cpp"],
-			shared_libs: ["libbar"],
-			min_sdk_version: "29",
-			apex_available: ["myapex"],
-		}
-
-		cc_library {
-			name: "libbar",
-			stubs: { versions: ["29", "30"] },
-		}
-
-		cc_library {
-			name: "yourlib",
-			srcs: ["mylib.cpp"],
-			min_sdk_version: "29",
-			apex_available: ["myapex", "myapex2", "//apex_available:platform"],
-		}
-	`, withFiles(android.MockFS{
-		"packages/modules/common/build/allowed_deps.txt": nil,
-	}))
-
-	depsinfo := ctx.SingletonForTests(t, "apex_depsinfo_singleton")
-	inputs := depsinfo.Rule("generateApexDepsInfoFilesRule").BuildParams.Inputs.Strings()
-	android.AssertStringListDoesNotContain(t, "updatable myapex should generate depsinfo file", inputs,
-		"out/soong/.intermediates/myapex/android_common_myapex/depsinfo/flatlist.txt")
-	android.AssertStringListDoesNotContain(t, "non-updatable myapex2 should not generate depsinfo file", inputs,
-		"out/soong/.intermediates/myapex2/android_common_myapex2/depsinfo/flatlist.txt")
-}
-
-func TestTrackAllowedDeps_SkipWithoutAllowedDepsTxt(t *testing.T) {
-	t.Parallel()
-	ctx := testApex(t, `
-		apex {
-			name: "com.android.myapex",
-			key: "myapex.key",
-			updatable: true,
-			min_sdk_version: "29",
-		}
-
-		apex_key {
-			name: "myapex.key",
-			public_key: "testkey.avbpubkey",
-			private_key: "testkey.pem",
-		}
-	`,
-		android.FixtureMergeMockFs(android.MockFS{
-			"system/sepolicy/apex/com.android.myapex-file_contexts": nil,
-		}))
-	depsinfo := ctx.SingletonForTests(t, "apex_depsinfo_singleton")
-	if nil != depsinfo.MaybeRule("generateApexDepsInfoFilesRule").Output {
-		t.Error("apex_depsinfo_singleton shouldn't run when allowed_deps.txt doesn't exist")
-	}
-}
-
 func TestPlatformUsesLatestStubsFromApexes(t *testing.T) {
 	t.Parallel()
 	ctx := testApex(t, `
@@ -2623,6 +2465,7 @@ func TestPlatformUsesLatestStubsFromApexes(t *testing.T) {
 			shared_libs: ["libx", "libx_rs",],
 			system_shared_libs: [],
 			stl: "none",
+			split_all_variants: true,
 		}
 	`)
 
@@ -3550,6 +3393,36 @@ func TestApex_withPrebuiltFirmware(t *testing.T) {
 	}
 }
 
+func TestApex_withPrebuiltKernelModules(t *testing.T) {
+	t.Parallel()
+	ctx := testApex(t, `
+		apex {
+			name: "myapex",
+			key: "myapex.key",
+			kernel_modules: ["mykernelmodules"],
+			updatable: false,
+			vendor: true,
+		}
+		apex_key {
+			name: "myapex.key",
+			public_key: "testkey.avbpubkey",
+			private_key: "testkey.pem",
+		}
+		prebuilt_kernel_modules {
+			name: "mykernelmodules",
+			srcs: ["*.ko"],
+		}
+	`,
+		withFiles(android.MockFS{
+			"mod1.ko": nil,
+			"mod2.ko": nil,
+		}))
+	ensureExactContents(t, ctx, "myapex", "android_common_myapex", []string{
+		"lib/modules/modules.load",
+		"installs.zip unzips to lib/modules",
+	})
+}
+
 func TestAndroidMk_VendorApexRequired(t *testing.T) {
 	t.Parallel()
 	ctx := testApex(t, `
@@ -3917,6 +3790,7 @@ func TestMacro(t *testing.T) {
 			static_libs: ["mylib3"],
 			recovery_available: true,
 			min_sdk_version: "29",
+			split_all_variants: true,
 		}
 		cc_library {
 			name: "mylib3",
@@ -3929,6 +3803,7 @@ func TestMacro(t *testing.T) {
 			],
 			recovery_available: true,
 			min_sdk_version: "29",
+			split_all_variants: true,
 		}
 	`)
 
@@ -4020,13 +3895,36 @@ type fileInApex struct {
 	path   string // path in apex
 	src    string // src path
 	isLink bool
+	isZip  bool
+	isRm   bool
 }
 
 func (f fileInApex) String() string {
+	if f.isZip {
+		return f.src + " unzips to " + f.path
+	}
+	if f.isRm {
+		return "remove " + f.path
+	}
 	return f.src + ":" + f.path
 }
 
 func (f fileInApex) match(expectation string) bool {
+	if f.isZip {
+		if before, after, found := strings.Cut(expectation, " unzips to "); found {
+			matchSrc, _ := path.Match(before, f.src)
+			matchDst, _ := path.Match(after, f.path)
+			return matchSrc && matchDst
+		}
+		return false
+	}
+	if f.isRm {
+		if strings.HasPrefix(expectation, "remove ") {
+			match, _ := path.Match(strings.TrimPrefix(expectation, "remove "), f.path)
+			return match
+		}
+		return false
+	}
 	parts := strings.Split(expectation, ":")
 	if len(parts) == 1 {
 		match, _ := path.Match(parts[0], f.path)
@@ -4054,17 +3952,17 @@ func getFiles(t *testing.T, ctx *android.TestContext, moduleName, variant string
 		}
 		terms := strings.Split(cmd, " ")
 		var dst, src string
-		var isLink bool
-		switch terms[0] {
-		case "mkdir":
-		case "cp":
+		var isLink, isZip, isRm bool
+		switch {
+		case strings.HasSuffix(terms[0], "mkdir"):
+		case strings.HasSuffix(terms[0], "cp"):
 			if len(terms) != 3 && len(terms) != 4 {
 				t.Fatal("copyCmds contains invalid cp command", cmd)
 			}
 			dst = terms[len(terms)-1]
 			src = terms[len(terms)-2]
 			isLink = false
-		case "ln":
+		case strings.HasSuffix(terms[0], "ln"):
 			if len(terms) != 3 && len(terms) != 4 {
 				// ln LINK TARGET or ln -s LINK TARGET
 				t.Fatal("copyCmds contains invalid ln command", cmd)
@@ -4072,6 +3970,22 @@ func getFiles(t *testing.T, ctx *android.TestContext, moduleName, variant string
 			dst = terms[len(terms)-1]
 			src = terms[len(terms)-2]
 			isLink = true
+		case strings.HasSuffix(terms[0], "zipsync"):
+			if len(terms) != 4 {
+				t.Fatal("copyCmds contains invalid zipsync command", cmd)
+			}
+			dst = terms[len(terms)-2]
+			src = path.Base(terms[len(terms)-1])
+			isZip = true
+		case strings.HasSuffix(terms[0], "rm"):
+			if len(terms) != 3 {
+				t.Fatal("copyCmds contains invalid rm command", cmd)
+			}
+			if terms[1] != "-rf" {
+				t.Fatal("copyCmds contains invalid rm command", cmd)
+			}
+			dst = terms[len(terms)-1]
+			isRm = true
 		default:
 			t.Fatalf("copyCmds should contain mkdir/cp commands only: %q", cmd)
 		}
@@ -4081,7 +3995,7 @@ func getFiles(t *testing.T, ctx *android.TestContext, moduleName, variant string
 				t.Fatal("copyCmds should copy a file to "+apexDir, cmd)
 			}
 			dstFile := dst[index+len(apexDir):]
-			ret = append(ret, fileInApex{path: dstFile, src: src, isLink: isLink})
+			ret = append(ret, fileInApex{path: dstFile, src: src, isLink: isLink, isZip: isZip, isRm: isRm})
 		}
 	}
 	return ret
@@ -4851,6 +4765,7 @@ func TestApexWithTarget(t *testing.T) {
 				"//apex_available:platform",
 				"myapex",
 			],
+			split_all_variants: true,
 		}
 
 		cc_library {
@@ -4859,6 +4774,7 @@ func TestApexWithTarget(t *testing.T) {
 			system_shared_libs: [],
 			stl: "none",
 			compile_multilib: "first",
+			split_all_variants: true,
 		}
 	`)
 
@@ -6233,6 +6149,7 @@ func TestApexWithApps(t *testing.T) {
 			system_modules: "none",
 			privileged: true,
 			privapp_allowlist: "privapp_allowlist_com.android.AppFooPriv.xml",
+			preinstall_allowlist: "preinstall_allowlist_com.android.AppFooPriv.xml",
 			stl: "none",
 			apex_available: [ "myapex" ],
 		}
@@ -6263,6 +6180,7 @@ func TestApexWithApps(t *testing.T) {
 	ensureContains(t, copyCmds, "image.apex/app/AppFoo@TEST.BUILD_ID/AppFoo.apk")
 	ensureContains(t, copyCmds, "image.apex/priv-app/AppFooPriv@TEST.BUILD_ID/AppFooPriv.apk")
 	ensureContains(t, copyCmds, "image.apex/etc/permissions/privapp_allowlist_com.android.AppFooPriv.xml")
+	ensureContains(t, copyCmds, "image.apex/etc/sysconfig/preinstall_allowlist_com.android.AppFooPriv.xml")
 
 	appZipRule := ctx.ModuleForTests(t, "AppFoo", "android_common_apex10000").Description("zip jni libs")
 	// JNI libraries are uncompressed
@@ -6289,6 +6207,7 @@ func TestApexWithApps(t *testing.T) {
 	ensureMatches(t, androidMk, "LOCAL_SOONG_INSTALLED_MODULE := \\S+AppFoo.apk")
 	ensureMatches(t, androidMk, "LOCAL_SOONG_INSTALL_PAIRS := \\S+AppFooPriv.apk")
 	ensureContains(t, androidMk, "LOCAL_SOONG_INSTALL_PAIRS := privapp_allowlist_com.android.AppFooPriv.xml:$(PRODUCT_OUT)/apex/myapex/etc/permissions/privapp_allowlist_com.android.AppFooPriv.xml")
+	ensureContains(t, androidMk, "LOCAL_SOONG_INSTALL_PAIRS := preinstall_allowlist_com.android.AppFooPriv.xml:$(PRODUCT_OUT)/apex/myapex/etc/sysconfig/preinstall_allowlist_com.android.AppFooPriv.xml")
 }
 
 func TestApexWithAppImportBuildId(t *testing.T) {
@@ -6524,7 +6443,7 @@ func TestApexAvailable_DirectDep(t *testing.T) {
 	}`)
 
 	// 'apex_available' check is bypassed for /product apex with a specific prefix.
-	// TODO: b/352818241 - Remove below two cases after APEX availability is enforced for /product APEXes.
+	// TODO: b/352818241 - Remove below three cases after APEX availability is enforced for /product APEXes.
 	testApex(t, `
 	apex {
 		name: "com.sdv.myapex",
@@ -6563,6 +6482,46 @@ func TestApexAvailable_DirectDep(t *testing.T) {
 		android.FixtureMergeMockFs(android.MockFS{
 			"system/sepolicy/apex/com.sdv.myapex-file_contexts":    nil,
 			"system/sepolicy/apex/com.any.otherapex-file_contexts": nil,
+		}))
+
+	testApex(t, `
+	apex {
+		name: "com.any.sdv.myapex",
+		key: "myapex.key",
+		native_shared_libs: ["libfoo"],
+		updatable: false,
+		product_specific: true,
+	}
+
+	apex_key {
+		name: "myapex.key",
+		public_key: "testkey.avbpubkey",
+		private_key: "testkey.pem",
+	}
+
+	apex {
+		name: "com.any.otherapex",
+		key: "otherapex.key",
+		native_shared_libs: ["libfoo"],
+		updatable: false,
+	}
+
+	apex_key {
+		name: "otherapex.key",
+		public_key: "testkey.avbpubkey",
+		private_key: "testkey.pem",
+	}
+
+	cc_library {
+		name: "libfoo",
+		stl: "none",
+		system_shared_libs: [],
+		apex_available: ["com.any.otherapex"],
+		product_specific: true,
+	}`,
+		android.FixtureMergeMockFs(android.MockFS{
+			"system/sepolicy/apex/com.any.sdv.myapex-file_contexts": nil,
+			"system/sepolicy/apex/com.any.otherapex-file_contexts":  nil,
 		}))
 
 	// 'apex_available' check is not bypassed for non-product apex with a specific prefix.
@@ -7166,6 +7125,7 @@ func TestApexAvailable_CheckForPlatform(t *testing.T) {
 		system_shared_libs: [],
 		shared_libs: ["libbar"],
 		apex_available: ["//apex_available:platform"],
+		split_all_variants: true,
 	}
 
 	cc_library {
@@ -7174,6 +7134,7 @@ func TestApexAvailable_CheckForPlatform(t *testing.T) {
 		system_shared_libs: [],
 		shared_libs: ["libbaz"],
 		apex_available: ["//apex_available:platform"],
+		split_all_variants: true,
 	}
 
 	cc_library {
@@ -7257,6 +7218,15 @@ func TestApexAvailable_PrefixMatch(t *testing.T) {
 			apexAvailable: "com.foo.*",
 		},
 		{
+			name:          "wildcard ? matches single segment",
+			apexAvailable: "?.foo.*",
+		},
+		{
+			name:          "wildcard ? cannot match two segments",
+			apexAvailable: "com.?",
+			expectedError: `requires \"libfoo\" that doesn't list the APEX`,
+		},
+		{
 			name:          "prefix doesn't match",
 			apexAvailable: "com.bar.*",
 			expectedError: `Consider .* "com.foo\.\*"`,
@@ -7280,6 +7250,16 @@ func TestApexAvailable_PrefixMatch(t *testing.T) {
 			name:          "hint with prefix pattern",
 			apexAvailable: "//apex_available:platform",
 			expectedError: "Consider adding \"com.foo.bar\" or \"com.foo.*\"",
+		},
+		{
+			name:          "wildcard ? without dot on left",
+			apexAvailable: "com?.foo.*",
+			expectedError: "should be surrounded by dot",
+		},
+		{
+			name:          "wildcard ? without dot on right",
+			apexAvailable: "com.?foo.*",
+			expectedError: "should be surrounded by dot",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -8558,15 +8538,11 @@ func TestAppSetBundle(t *testing.T) {
 	bundleConfigRule := mod.Output("bundle_config.json")
 	content := android.ContentFromFileRuleForTests(t, ctx, bundleConfigRule)
 	ensureContains(t, content, `"compression":{"uncompressed_glob":["apex_payload.img","apex_manifest.*"]}`)
-	s := mod.Rule("apexRule").Args["copy_commands"]
-	copyCmds := regexp.MustCompile(" *&& *").Split(s, -1)
-	if len(copyCmds) != 4 {
-		t.Fatalf("Expected 4 commands, got %d in:\n%s", len(copyCmds), s)
-	}
-	ensureMatches(t, copyCmds[0], "^rm -rf .*/app/AppSet@TEST.BUILD_ID$")
-	ensureMatches(t, copyCmds[1], "^mkdir -p .*/app/AppSet@TEST.BUILD_ID$")
-	ensureMatches(t, copyCmds[2], "^cp -f .*/app/AppSet@TEST.BUILD_ID/AppSet.apk$")
-	ensureMatches(t, copyCmds[3], "^unzip .*-d .*/app/AppSet@TEST.BUILD_ID .*/AppSet.zip$")
+	ensureExactContents(t, ctx, "myapex", "android_common_myapex", []string{
+		"remove app/AppSet@TEST.BUILD_ID",
+		"app/AppSet@TEST.BUILD_ID/AppSet.apk",
+		"AppSet.zip unzips to app/AppSet@TEST.BUILD_ID",
+	})
 
 	// Ensure that canned_fs_config has an entry for the app set zip file
 	generateFsRule := mod.Rule("generateFsConfig")
@@ -8673,7 +8649,6 @@ func testDexpreoptWithApexes(t *testing.T, bp, errmsg string, preparer android.F
 		// Dexpreopt for boot jars requires the ART boot image profile.
 		java.PrepareApexBootJarModule("com.android.art", "core-oj"),
 		dexpreopt.FixtureSetArtBootJars("com.android.art:core-oj"),
-		dexpreopt.FixtureSetBootImageProfiles("art/build/boot/boot-image-profile.txt"),
 	).
 		ExtendWithErrorHandler(errorHandler).
 		RunTestWithBp(t, bp)
@@ -9347,7 +9322,7 @@ func TestApexSet_ShouldRespectCompressedApexFlag(t *testing.T) {
 
 			build := ctx.ModuleForTests(t, "com.company.android.myapex", "android_common_prebuilt_com.android.myapex").Output("com.company.android.myapex.apex")
 			if compressionEnabled {
-				ensureEquals(t, build.Rule.String(), "android/soong/android.Cp")
+				ensureEquals(t, build.Rule.String(), "android/soong/android.CpRule")
 			} else {
 				ensureEquals(t, build.Rule.String(), "android/apex.decompressApex")
 			}
@@ -10385,7 +10360,9 @@ func TestCannedFsConfig(t *testing.T) {
 	generateFsRule := mod.Rule("generateFsConfig")
 	cmd := generateFsRule.RuleParams.Command
 
-	ensureContains(t, cmd, `( echo '/ 1000 1000 0755'; echo '/apex_manifest.json 1000 1000 0644'; echo '/apex_manifest.pb 1000 1000 0644'; ) >`)
+	ensureContains(t, cmd, `echo '/ 1000 1000 0755';`)
+	ensureContains(t, cmd, `echo '/apex_manifest.json 1000 1000 0644';`)
+	ensureContains(t, cmd, `echo '/apex_manifest.pb 1000 1000 0644'; ) >`)
 }
 
 func TestCannedFsConfig_HasCustomConfig(t *testing.T) {
@@ -10408,7 +10385,10 @@ func TestCannedFsConfig_HasCustomConfig(t *testing.T) {
 	cmd := generateFsRule.RuleParams.Command
 
 	// Ensure that canned_fs_config has "cat my_config" at the end
-	ensureContains(t, cmd, `( echo '/ 1000 1000 0755'; echo '/apex_manifest.json 1000 1000 0644'; echo '/apex_manifest.pb 1000 1000 0644'; cat my_config ) >`)
+	ensureContains(t, cmd, `echo '/ 1000 1000 0755';`)
+	ensureContains(t, cmd, `echo '/apex_manifest.json 1000 1000 0644';`)
+	ensureContains(t, cmd, `echo '/apex_manifest.pb 1000 1000 0644';`)
+	ensureContains(t, cmd, `cat my_config ) >`)
 }
 
 func TestStubLibrariesMultipleApexViolation(t *testing.T) {
@@ -10639,11 +10619,11 @@ func TestAconfigFilesJavaDeps(t *testing.T) {
 		t.Fatalf("Expected 14 commands, got %d in:\n%s", len(copyCmds), s)
 	}
 
-	ensureListContainsMatch(t, copyCmds, "^cp -f .*/aconfig_flags.pb .*/image.apex/etc/aconfig_flags.pb")
-	ensureListContainsMatch(t, copyCmds, "^cp -f .*/package.map .*/image.apex/etc/package.map")
-	ensureListContainsMatch(t, copyCmds, "^cp -f .*/flag.map .*/image.apex/etc/flag.map")
-	ensureListContainsMatch(t, copyCmds, "^cp -f .*/flag.val .*/image.apex/etc/flag.val")
-	ensureListContainsMatch(t, copyCmds, "^cp -f .*/flag.info.*/image.apex/etc/flag.info")
+	ensureListContainsMatch(t, copyCmds, "cp -f .*/aconfig_flags.pb .*/image.apex/etc/aconfig_flags.pb")
+	ensureListContainsMatch(t, copyCmds, "cp -f .*/package.map .*/image.apex/etc/package.map")
+	ensureListContainsMatch(t, copyCmds, "cp -f .*/flag.map .*/image.apex/etc/flag.map")
+	ensureListContainsMatch(t, copyCmds, "cp -f .*/flag.val .*/image.apex/etc/flag.val")
+	ensureListContainsMatch(t, copyCmds, "cp -f .*/flag.info.*/image.apex/etc/flag.info")
 
 	inputs := []string{
 		"my_aconfig_declarations_foo/aconfig-cache.pb",
@@ -10778,11 +10758,11 @@ func TestAconfigFilesJavaAndCcDeps(t *testing.T) {
 		t.Fatalf("Expected 18 commands, got %d in:\n%s", len(copyCmds), s)
 	}
 
-	ensureListContainsMatch(t, copyCmds, "^cp -f .*/aconfig_flags.pb .*/image.apex/etc/aconfig_flags.pb")
-	ensureListContainsMatch(t, copyCmds, "^cp -f .*/package.map .*/image.apex/etc/package.map")
-	ensureListContainsMatch(t, copyCmds, "^cp -f .*/flag.map .*/image.apex/etc/flag.map")
-	ensureListContainsMatch(t, copyCmds, "^cp -f .*/flag.val .*/image.apex/etc/flag.val")
-	ensureListContainsMatch(t, copyCmds, "^cp -f .*/flag.info .*/image.apex/etc/flag.info")
+	ensureListContainsMatch(t, copyCmds, "cp -f .*/aconfig_flags.pb .*/image.apex/etc/aconfig_flags.pb")
+	ensureListContainsMatch(t, copyCmds, "cp -f .*/package.map .*/image.apex/etc/package.map")
+	ensureListContainsMatch(t, copyCmds, "cp -f .*/flag.map .*/image.apex/etc/flag.map")
+	ensureListContainsMatch(t, copyCmds, "cp -f .*/flag.val .*/image.apex/etc/flag.val")
+	ensureListContainsMatch(t, copyCmds, "cp -f .*/flag.info .*/image.apex/etc/flag.info")
 
 	inputs := []string{
 		"my_aconfig_declarations_foo/aconfig-cache.pb",
@@ -10940,11 +10920,11 @@ func TestAconfigFilesRustDeps(t *testing.T) {
 		t.Fatalf("Expected 32 commands, got %d in:\n%s", len(copyCmds), s)
 	}
 
-	ensureListContainsMatch(t, copyCmds, "^cp -f .*/aconfig_flags.pb .*/image.apex/etc/aconfig_flags.pb")
-	ensureListContainsMatch(t, copyCmds, "^cp -f .*/package.map .*/image.apex/etc/package.map")
-	ensureListContainsMatch(t, copyCmds, "^cp -f .*/flag.map .*/image.apex/etc/flag.map")
-	ensureListContainsMatch(t, copyCmds, "^cp -f .*/flag.val .*/image.apex/etc/flag.val")
-	ensureListContainsMatch(t, copyCmds, "^cp -f .*/flag.info .*/image.apex/etc/flag.info")
+	ensureListContainsMatch(t, copyCmds, "cp -f .*/aconfig_flags.pb .*/image.apex/etc/aconfig_flags.pb")
+	ensureListContainsMatch(t, copyCmds, "cp -f .*/package.map .*/image.apex/etc/package.map")
+	ensureListContainsMatch(t, copyCmds, "cp -f .*/flag.map .*/image.apex/etc/flag.map")
+	ensureListContainsMatch(t, copyCmds, "cp -f .*/flag.val .*/image.apex/etc/flag.val")
+	ensureListContainsMatch(t, copyCmds, "cp -f .*/flag.info .*/image.apex/etc/flag.info")
 
 	inputs := []string{
 		"my_aconfig_declarations_foo/aconfig-cache.pb",
@@ -11744,9 +11724,7 @@ func TestMultiplePrebuiltsWithSameBase(t *testing.T) {
 			src: "myprebuilt",
 			filename: "myfilename",
 		}
-	`, withFiles(android.MockFS{
-		"packages/modules/common/build/allowed_deps.txt": nil,
-	}))
+	`)
 
 	ab := ctx.ModuleForTests(t, "myapex", "android_common_myapex").Module().(*apexBundle)
 	data := android.AndroidMkDataForTest(t, ctx, ab)
@@ -11877,6 +11855,92 @@ func TestUpdatableApexMinSdkVersionCurrent(t *testing.T) {
 	`)
 }
 
+func TestErofsApexGlobalDefaults(t *testing.T) {
+	t.Parallel()
+	ctx := testApex(t, `
+		apex {
+			name: "myapex",
+			key: "myapex.key",
+			updatable: false,
+			payload_fs_type: "erofs",
+		}
+
+		apex_key {
+			name: "myapex.key",
+			public_key: "testkey.avbpubkey",
+			private_key: "testkey.pem",
+		}
+	`, android.FixtureModifyProductVariables(func(variables android.FixtureProductVariables) {
+		variables.DefaultApexPayloadErofsCompressor = proptools.StringPtr("lz")
+		variables.DefaultApexPayloadErofsCompressHints = proptools.StringPtr("sub/hints.txt")
+		variables.DefaultApexPayloadErofsPclusterSize = 4096
+	}))
+	apexRule := ctx.ModuleForTests(t, "myapex", "android_common_myapex").Rule("apexRule")
+	optFlags := apexRule.Args["opt_flags"]
+	android.AssertStringDoesContain(t, "--erofs_compressor", optFlags, "--erofs_compressor lz")
+	android.AssertStringDoesContain(t, "--erofs_compress_hints", optFlags, "--erofs_compress_hints sub/hints.txt")
+	android.AssertStringDoesContain(t, "--erofs_pcluster_size", optFlags, "--erofs_pcluster_size 4096")
+}
+
+func TestExt4ApexDoesntGetGlobalDefaults(t *testing.T) {
+	t.Parallel()
+	ctx := testApex(t, `
+		apex {
+			name: "myapex",
+			key: "myapex.key",
+			updatable: false,
+			payload_fs_type: "ext4",
+		}
+
+		apex_key {
+			name: "myapex.key",
+			public_key: "testkey.avbpubkey",
+			private_key: "testkey.pem",
+		}
+	`, android.FixtureModifyProductVariables(func(variables android.FixtureProductVariables) {
+		variables.DefaultApexPayloadErofsCompressor = proptools.StringPtr("lz")
+		variables.DefaultApexPayloadErofsCompressHints = proptools.StringPtr("sub/hints.txt")
+		variables.DefaultApexPayloadErofsPclusterSize = 4096
+	}))
+	apexRule := ctx.ModuleForTests(t, "myapex", "android_common_myapex").Rule("apexRule")
+	optFlags := apexRule.Args["opt_flags"]
+	android.AssertStringDoesNotContain(t, "--erofs_compressor", optFlags, "--erofs_compressor lz")
+	android.AssertStringDoesNotContain(t, "--erofs_compress_hints", optFlags, "--erofs_compress_hints sub/hints.txt")
+	android.AssertStringDoesNotContain(t, "--erofs_pcluster_size", optFlags, "--erofs_pcluster_size 4096")
+}
+
+func TestErofsApexOverridingGlobalDefaults(t *testing.T) {
+	t.Parallel()
+	ctx := testApex(t, `
+		apex {
+			name: "myapex",
+			key: "myapex.key",
+			updatable: false,
+			payload_fs_type: "erofs",
+			erofs: {
+				compressor: "lz4hc",
+				compress_hints: "own_hints.txt",
+				pcluster_size: 16384,
+			},
+		}
+
+		apex_key {
+			name: "myapex.key",
+			public_key: "testkey.avbpubkey",
+			private_key: "testkey.pem",
+		}
+	`, android.FixtureModifyProductVariables(func(variables android.FixtureProductVariables) {
+		variables.DefaultApexPayloadErofsCompressor = proptools.StringPtr("lz")
+		variables.DefaultApexPayloadErofsCompressHints = proptools.StringPtr("sub/hints.txt")
+		variables.DefaultApexPayloadErofsPclusterSize = 4096
+	}))
+	apexRule := ctx.ModuleForTests(t, "myapex", "android_common_myapex").Rule("apexRule")
+	optFlags := apexRule.Args["opt_flags"]
+	android.AssertStringDoesContain(t, "--erofs_compressor", optFlags, "--erofs_compressor lz4hc")
+	android.AssertStringDoesContain(t, "--erofs_compress_hints", optFlags, "--erofs_compress_hints own_hints.txt")
+	android.AssertStringDoesContain(t, "--erofs_pcluster_size", optFlags, "--erofs_pcluster_size 16384")
+}
+
 func TestPrebuiltStubNoinstall(t *testing.T) {
 	t.Parallel()
 	testFunc := func(t *testing.T, expectLibfooOnSystemLib bool, fs android.MockFS) {
@@ -11954,6 +12018,7 @@ func TestPrebuiltStubNoinstall(t *testing.T) {
 		cc_library {
 			name: "installedlib",
 			shared_libs: ["libfoo"],
+			split_all_variants: true,
 		}
 	`)
 

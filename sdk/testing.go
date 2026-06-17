@@ -79,7 +79,12 @@ var prepareForSdkTest = android.GroupFixturePreparers(
 		// Add windows as a default disable OS to test behavior when some OS variants
 		// are disabled.
 		config.Targets[android.Windows] = []android.Target{
-			{android.Windows, android.Arch{ArchType: android.X86_64}, android.NativeBridgeDisabled, "", "", true},
+			{
+				Os:           android.Windows,
+				Arch:         android.Arch{ArchType: android.X86_64},
+				NativeBridge: android.NativeBridgeDisabled,
+				HostCross:    true,
+			},
 		}
 	}),
 
@@ -143,7 +148,7 @@ func getSdkSnapshotBuildInfo(t *testing.T, result *android.TestResult, sdk *sdk)
 	seenBuildNumberFile := false
 	for _, bp := range buildParams {
 		switch bp.Rule.String() {
-		case android.Cp.String(), android.CpWithBash.String():
+		case android.CpRule.String(), android.CpWithBash.String():
 			output := bp.Output
 			// Get destination relative to the snapshot root
 			dest := output.Rel()
@@ -334,6 +339,20 @@ func checkAndroidBpContents(expected string) snapshotBuildInfoChecker {
 	return func(info *snapshotBuildInfo) {
 		info.t.Helper()
 		android.AssertTrimmedStringEquals(info.t, "Android.bp contents do not match", expected, info.androidBpContents)
+	}
+}
+
+func checkAndroidBpDoesContain(expected string) snapshotBuildInfoChecker {
+	return func(info *snapshotBuildInfo) {
+		info.t.Helper()
+		android.AssertStringDoesContain(info.t, "Android.bp contents do not match", info.androidBpContents, expected)
+	}
+}
+
+func checkAndroidBpDoesNotContain(unexpected string) snapshotBuildInfoChecker {
+	return func(info *snapshotBuildInfo) {
+		info.t.Helper()
+		android.AssertStringDoesNotContain(info.t, "Android.bp contents do not match", info.androidBpContents, unexpected)
 	}
 }
 

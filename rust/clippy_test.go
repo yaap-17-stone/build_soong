@@ -21,13 +21,14 @@ import (
 )
 
 func TestClippy(t *testing.T) {
-
+	t.Parallel()
 	bp := `
 		// foo uses the default value of clippy_lints
 		rust_library {
 			name: "libfoo",
 			srcs: ["foo.rs"],
 			crate_name: "foo",
+			split_all_variants: true,
 		}
 		// bar forces the use of the "android" lint set
 		rust_library {
@@ -35,6 +36,7 @@ func TestClippy(t *testing.T) {
 			srcs: ["foo.rs"],
 			crate_name: "bar",
 			clippy_lints: "android",
+			split_all_variants: true,
 		}
 		// foobar explicitly disable clippy
 		rust_library {
@@ -42,6 +44,7 @@ func TestClippy(t *testing.T) {
 			srcs: ["foo.rs"],
 			crate_name: "foobar",
 			clippy_lints: "none",
+			split_all_variants: true,
 		}`
 
 	var clippyLintTests = []struct {
@@ -50,7 +53,7 @@ func TestClippy(t *testing.T) {
 	}{
 		{"", "${config.ClippyDefaultLints}"},
 		{"external/", ""},
-		{"hardware/", "${config.ClippyVendorLints}"},
+		{"hardware/", ""},
 	}
 
 	for _, tc := range clippyLintTests {

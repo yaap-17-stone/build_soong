@@ -550,8 +550,8 @@ func dex2oatPathFromDep(ctx android.ModuleContext) android.Path {
 		panic(fmt.Sprintf("Failed to lookup %s dependency", dex2oatBin))
 	}
 
-	dex2oatPath, ok := android.OtherModuleProvider(ctx, dex2oatModule, android.HostToolProviderInfoProvider)
-	if !ok || !dex2oatPath.HostToolPath.Valid() {
+	dex2oatPath := android.GetHostToolInfo(ctx, dex2oatModule)
+	if dex2oatPath == nil || !dex2oatPath.HostToolPath.Valid() {
 		panic(fmt.Sprintf("Failed to find host tool path in %s", dex2oatModule))
 	}
 
@@ -753,7 +753,7 @@ func buildUffdGcFlag(ctx android.BuilderContext, global *GlobalConfig) {
 		kernelVersionFile := android.PathForOutput(ctx, "dexpreopt/kernel_version_for_uffd_gc.txt")
 
 		// Determine the UFFD GC flag by the kernel version file.
-		rule := android.NewRuleBuilder(pctx, ctx)
+		rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 		rule.Command().
 			Tool(ctx.Config().HostToolPath(ctx, "construct_uffd_gc_flag")).
 			Input(kernelVersionFile).
@@ -769,14 +769,14 @@ func buildAssumedValues(ctx android.BuilderContext, global *GlobalConfig, global
 
 	if global.PlatformSdkVersion != "" {
 		maybeAssumedValues := fmt.Sprintf(`'--assume-value=Landroid/os/Build$VERSION;->SDK_INT:%s'`, global.PlatformSdkVersion)
-		rule := android.NewRuleBuilder(pctx, ctx)
+		rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 		cmd := rule.Command()
 		// First check dex2oat to see if it supports `--assume-value=` arguments.
 		// If it does, stash the assumed value args in a reusable output file for compilation.
 		// Otherwise, just create an empty placeholder file that becomes a no-op.
 		// TODO(b/204924812): Remove the args check after prebuilt ART modules are updated from source.
 		cmd.Text("if (").Tool(globalSoong.Dex2oat).Text("--help 2>&1 | grep -q -- --assume-value)").
-			Text("; then echo").Text(maybeAssumedValues).Text(">").Output(assumeValueFlags).
+			Text("; then echo -n").Text(maybeAssumedValues).Text(">").Output(assumeValueFlags).
 			Text("; else >").Output(assumeValueFlags).
 			Text("; fi")
 		rule.Restat().Build("dexpreopt_assume_value_flags", "dexpreopt_assume_value_flags")
@@ -789,14 +789,14 @@ func buildAllowProfileCode(ctx android.BuilderContext, global *GlobalConfig, glo
 	profileCodeFlag := getProfileCodeFlagPath(ctx)
 
 	if global.AllowProfileCode {
-		rule := android.NewRuleBuilder(pctx, ctx)
+		rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 		cmd := rule.Command()
 		// First check dex2oat to see if it supports `--allow-profile-code` arguments.
 		// If it does, stash the assumed value args in a reusable output file for compilation.
 		// Otherwise, just create an empty placeholder file that becomes a no-op.
 		// TODO(b/204924812): Remove the args check after prebuilt ART modules are updated from source.
 		cmd.Text("if (").Tool(globalSoong.Dex2oat).Text("--help 2>&1 | grep -q -- --allow-profile-code)").
-			Text("; then echo --allow-profile-code >").Output(profileCodeFlag).
+			Text("; then echo -n --allow-profile-code  >").Output(profileCodeFlag).
 			Text("; else >").Output(profileCodeFlag).
 			Text("; fi")
 		rule.Restat().Build("dexpreopt_profile_code_flag", "dexpreopt_profile_code_flag")

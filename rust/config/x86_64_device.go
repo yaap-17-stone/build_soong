@@ -38,6 +38,7 @@ var (
 		"goldmont-without-sha-xsaves": []string{"-C target-cpu=goldmont", "-C target-feature=-sha,-xsaves"},
 		"haswell":                     []string{"-C target-cpu=haswell"},
 		"ivybridge":                   []string{"-C target-cpu=ivybridge"},
+		"pantherlake":                 []string{"-C target-cpu=pantherlake"},
 		"sandybridge":                 []string{"-C target-cpu=sandybridge"},
 		"silvermont":                  []string{"-C target-cpu=silvermont"},
 		"skylake":                     []string{"-C target-cpu=skylake"},
@@ -63,20 +64,30 @@ func init() {
 type toolchainX86_64 struct {
 	toolchain64Bit
 	toolchainRustFlags string
-	ldflags            string
+	cc_toolchain       cc_config.Toolchain
 }
 
 func (t *toolchainX86_64) RustTriple() string {
 	return "x86_64-linux-android"
 }
 
-func (t *toolchainX86_64) ToolchainLinkFlags() string {
+func (t *toolchainX86_64) ToolchainLinkFlags(ctx ToolchainFlagsContext) cc_config.FlagsWithDeps {
 	// Prepend the lld flags from cc_config so we stay in sync with cc
-	return "${config.DeviceGlobalLinkFlags} " + t.ldflags + " ${config.X86_64ToolchainLinkFlags}"
+	deviceGlobalLinkFlags := cc_config.FlagsWithDeps{
+		Flags: "${config.DeviceGlobalLinkFlags}",
+	}
+	x8664ToolchainLinkFlags := cc_config.FlagsWithDeps{
+		Flags: "${config.X86_64ToolchainLinkFlags}",
+	}
+	ccFlags := t.cc_toolchain.Ldflags(ctx)
+	ccFlags.Flags = strings.ReplaceAll(ccFlags.Flags, "${config.", "${cc_config.")
+	return deviceGlobalLinkFlags.Append(ccFlags).Append(x8664ToolchainLinkFlags)
 }
 
-func (t *toolchainX86_64) ToolchainRustFlags() string {
-	return t.toolchainRustFlags
+func (t *toolchainX86_64) ToolchainRustFlags(ctx ToolchainFlagsContext) cc_config.FlagsWithDeps {
+	return cc_config.FlagsWithDeps{
+		Flags: t.toolchainRustFlags,
+	}
 }
 
 func (t *toolchainX86_64) RustFlags() string {
@@ -103,10 +114,9 @@ func x86_64ToolchainFactory(arch android.Arch) Toolchain {
 		toolchainRustFlags = append(toolchainRustFlags, x86_64ArchFeatureRustFlags[feature]...)
 	}
 
-	cc_toolchain := cc_config.FindToolchain(android.Android, arch)
-
+	cc_toolchain := cc_config.FindToolchain(android.Android, arch, false)
 	return &toolchainX86_64{
 		toolchainRustFlags: strings.Join(toolchainRustFlags, " "),
-		ldflags:            strings.ReplaceAll(cc_toolchain.Ldflags(), "${config.", "${cc_config."),
+		cc_toolchain:       cc_toolchain,
 	}
 }

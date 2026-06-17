@@ -198,6 +198,7 @@ func TestVendorProductVariantGenrule(t *testing.T) {
 		out: ["out"],
 		vendor_available: true,
 		product_available: true,
+		split_all_variants: true,
 	}
 	`
 	t.Helper()
@@ -292,5 +293,34 @@ func TestGenruleToolWithSymlinks(t *testing.T) {
 	// We may want to change genrules to include symlinks later
 	if symlinkFound {
 		t.Errorf("Symlinks found")
+	}
+}
+
+func TestGenruleDefaults(t *testing.T) {
+	bp := `
+	cc_genrule_defaults {
+	    name: "defaults",
+		tool_files: ["tool"],
+		cmd: "$(location tool) $(in) $(out)",
+		out: ["out"],
+		vendor_available: true,
+		product_available: true,
+		split_all_variants: true,
+	}
+
+	cc_genrule {
+		name: "gen",
+		defaults: ["defaults"],
+	}
+	`
+	t.Helper()
+	ctx := PrepareForIntegrationTestWithCc.RunTestWithBp(t, bp)
+
+	variants := ctx.ModuleVariantsForTests("gen")
+	if !slices.Contains(variants, "android_vendor_arm64_armv8-a") {
+		t.Errorf(`expected vendor variant, but does not exist in %v`, variants)
+	}
+	if !slices.Contains(variants, "android_product_arm64_armv8-a") {
+		t.Errorf(`expected product variant, but does not exist in %v`, variants)
 	}
 }

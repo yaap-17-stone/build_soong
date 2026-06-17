@@ -18,7 +18,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
 
 	"github.com/google/blueprint"
 )
@@ -152,9 +151,19 @@ type SingletonContext interface {
 	OtherModuleDependencyTag(module ModuleOrProxy) blueprint.DependencyTag
 
 	GetIncrementalAnalysis() bool
+	GetIncrementalEnabled() bool
 
 	// OtherModuleNamespace returns the namespace of the module.
 	OtherModuleNamespace(module ModuleOrProxy) *Namespace
+
+	// GetModuleProxy returns a module with the given name and variations, from the root namespace.
+	// It may return a nil ModuleProxy if the module doesn't exist.
+	GetModuleProxy(moduleName string, variant []blueprint.Variation) ModuleProxy
+
+	// addSubninja adds a ninja file to include with subninja. This should
+	// only ever be used inside bootstrap or the android package to handle
+	// phony, dist or glob rules.
+	addSubninja(file string)
 }
 
 type singletonAdaptor struct {
@@ -167,11 +176,15 @@ type singletonAdaptor struct {
 var _ testBuildProvider = (*singletonAdaptor)(nil)
 var _ blueprint.Singleton = (*singletonAdaptor)(nil)
 
+type incrementalSingleton interface {
+	IncrementalSupported() bool
+}
+
 func (s *singletonAdaptor) IncrementalSupported() bool {
-	if im, ok := s.Singleton.(blueprint.Incremental); ok {
+	if im, ok := s.Singleton.(incrementalSingleton); ok {
 		return im.IncrementalSupported()
 	}
-	return false
+	return true
 }
 
 func (s *singletonAdaptor) GenerateBuildActions(ctx blueprint.SingletonContext) {
@@ -189,10 +202,9 @@ func (s *singletonAdaptor) GenerateBuildActions(ctx blueprint.SingletonContext) 
 	s.ruleParams = sctx.ruleParams
 
 	if len(sctx.dists) > 0 {
-		dists := getSingletonDists(sctx.Config())
-		dists.lock.Lock()
-		defer dists.lock.Unlock()
-		dists.dists = append(dists.dists, sctx.dists...)
+		SetSingletonProvider(sctx, SingletonDistInfoProvider, DistInfo{
+			Dists: sctx.dists,
+		})
 	}
 
 	if len(sctx.phonies) > 0 {
@@ -206,19 +218,6 @@ func (s *singletonAdaptor) BuildParamsForTests() []BuildParams {
 
 func (s *singletonAdaptor) RuleParamsForTests() map[blueprint.Rule]blueprint.RuleParams {
 	return s.ruleParams
-}
-
-var singletonDistsKey = NewOnceKey("singletonDistsKey")
-
-type singletonDistsAndLock struct {
-	dists []dist
-	lock  sync.Mutex
-}
-
-func getSingletonDists(config Config) *singletonDistsAndLock {
-	return config.Once(singletonDistsKey, func() interface{} {
-		return &singletonDistsAndLock{}
-	}).(*singletonDistsAndLock)
 }
 
 type Singleton interface {
@@ -251,7 +250,7 @@ func (s *singletonContextAdaptor) Variable(pctx PackageContext, name, value stri
 }
 
 func (s *singletonContextAdaptor) Rule(pctx PackageContext, name string, params blueprint.RuleParams, argNames ...string) blueprint.Rule {
-	if s.Config().UseRemoteBuild() {
+	if s.Config().REWrapperRemoteBuild() {
 		if params.Pool == nil {
 			// When USE_REWRAPPER=true is set and the rule is not supported by RBE,
 			// restrict jobs to the local parallelism value
@@ -498,8 +497,20 @@ func (s *singletonContextAdaptor) GetIncrementalAnalysis() bool {
 	return s.SingletonContext.GetIncrementalAnalysis()
 }
 
+func (s *singletonContextAdaptor) GetIncrementalEnabled() bool {
+	return s.SingletonContext.GetIncrementalEnabled()
+}
+
 func (s *singletonContextAdaptor) OtherModuleNamespace(module ModuleOrProxy) *Namespace {
 	return s.SingletonContext.OtherModuleNamespace(module).(*Namespace)
+}
+
+func (s *singletonContextAdaptor) GetModuleProxy(moduleName string, variant []blueprint.Variation) ModuleProxy {
+	return ModuleProxy{s.SingletonContext.GetModuleProxy(moduleName, variant)}
+}
+
+func (s *singletonContextAdaptor) addSubninja(file string) {
+	s.SingletonContext.AddSubninja(file)
 }
 
 func SetSingletonProvider[K any](ctx SingletonContext, provider blueprint.ProviderKey[K], value K) {

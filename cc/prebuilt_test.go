@@ -44,6 +44,7 @@ func TestPrebuilt(t *testing.T) {
 	bp := `
 		cc_library {
 			name: "liba",
+			split_all_variants: true,
 		}
 
 		cc_prebuilt_library_shared {
@@ -82,6 +83,7 @@ func TestPrebuilt(t *testing.T) {
 
 		cc_library {
 			name: "libf",
+			split_all_variants: true,
 		}
 
 		cc_prebuilt_library {
@@ -170,6 +172,7 @@ func TestPrebuiltLibraryShared(t *testing.T) {
 	cc_prebuilt_library_shared {
 		name: "libtest",
 		srcs: ["libf.so"],
+		split_all_variants: true,
     strip: {
         none: true,
     },
@@ -206,6 +209,7 @@ func TestPrebuiltLibrary(t *testing.T) {
 		shared: {
 			srcs: ["libf.so"],
 		},
+		split_all_variants: true,
     strip: {
         none: true,
     },
@@ -236,6 +240,7 @@ func TestPrebuiltLibraryStem(t *testing.T) {
 		strip: {
 			none: true,
 		},
+		split_all_variants: true,
 	}
 	`, map[string][]byte{
 		"libfoo.a":  nil,
@@ -258,6 +263,7 @@ func TestPrebuiltLibrarySharedStem(t *testing.T) {
 		strip: {
 			none: true,
 		},
+		split_all_variants: true,
 	}
 	`, map[string][]byte{
 		"libfoo.so": nil,
@@ -267,7 +273,7 @@ func TestPrebuiltLibrarySharedStem(t *testing.T) {
 	assertString(t, shared.OutputFile().Path().Base(), "libbar.so")
 }
 
-func TestPrebuiltSymlinkedHostBinary(t *testing.T) {
+func TestPrebuiltHostBinary(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skipf("Skipping host prebuilt testing that is only supported on linux not %s", runtime.GOOS)
 	}
@@ -300,18 +306,9 @@ func TestPrebuiltSymlinkedHostBinary(t *testing.T) {
 		"foo":       nil,
 	})
 
-	fooRule := ctx.ModuleForTests(t, "foo", "linux_glibc_x86_64").Rule("Symlink")
+	fooRule := ctx.ModuleForTests(t, "foo", "linux_glibc_x86_64").Rule("CpExecutable")
 	assertString(t, fooRule.Output.String(), "out/soong/.intermediates/foo/linux_glibc_x86_64/foo")
-	assertString(t, fooRule.Args["fromPath"], "$$PWD/linux_glibc_x86_64/bin/foo")
-
-	var libfooDep android.Path
-	for _, dep := range fooRule.Implicits {
-		if dep.Base() == "libfoo.so" {
-			libfooDep = dep
-			break
-		}
-	}
-	assertString(t, libfooDep.String(), "out/soong/.intermediates/libfoo/linux_glibc_x86_64_shared/libfoo.so")
+	assertString(t, fooRule.Input.String(), "linux_glibc_x86_64/bin/foo")
 }
 
 func TestPrebuiltLibrarySanitized(t *testing.T) {
@@ -323,14 +320,17 @@ func TestPrebuiltLibrarySanitized(t *testing.T) {
 		shared: {
                         sanitized: { none: { srcs: ["libf.so"], }, hwaddress: { srcs: ["hwasan/libf.so"], }, },
 		},
+		split_all_variants: true,
 	}
 	cc_prebuilt_library_static {
 		name: "libtest_static",
                 sanitized: { none: { srcs: ["libf.a"], }, hwaddress: { srcs: ["libf.hwasan.a"], }, },
+		split_all_variants: true,
 	}
 	cc_prebuilt_library_shared {
 		name: "libtest_shared",
                 sanitized: { none: { srcs: ["libf.so"], }, hwaddress: { srcs: ["hwasan/libf.so"], }, },
+		split_all_variants: true,
 	}`
 
 	fs := map[string][]byte{
@@ -401,12 +401,14 @@ func TestMultiplePrebuilts(t *testing.T) {
 		cc_library {
 			name: "libfoo",
 			shared_libs: ["libbar"],
+			split_all_variants: true,
 		}
 
 		// multiple variations of dep
 		// source
 		cc_library {
 			name: "libbar",
+			split_all_variants: true,
 		}
 		// prebuilt "v1"
 		cc_prebuilt_library_shared {
@@ -566,6 +568,7 @@ func TestMissingVariantInModuleSdk(t *testing.T) {
 		cc_library {
 			name: "libfoo",
 			static_libs: ["libbar"],
+			split_all_variants: true,
 		}
 
 		// source

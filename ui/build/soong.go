@@ -15,19 +15,16 @@
 package build
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"android/soong/ui/tracer"
@@ -40,7 +37,6 @@ import (
 
 	"github.com/google/blueprint"
 	"github.com/google/blueprint/bootstrap"
-	"github.com/google/blueprint/microfactory"
 	"github.com/google/blueprint/pathtools"
 
 	"google.golang.org/protobuf/proto"
@@ -107,6 +103,7 @@ type BlueprintConfig struct {
 	debugCompilation          bool
 	subninjas                 []string
 	primaryBuilderInvocations []bootstrap.PrimaryBuilderInvocation
+	isActionSandboxedBuild    bool
 }
 
 func (c BlueprintConfig) HostToolDir() string {
@@ -139,6 +136,14 @@ func (c BlueprintConfig) PrimaryBuilderInvocations() []bootstrap.PrimaryBuilderI
 
 func (c BlueprintConfig) IsBootstrap() bool {
 	return true
+}
+
+func (c BlueprintConfig) IsActionSandboxedBuild() bool {
+	return c.isActionSandboxedBuild
+}
+
+func (c BlueprintConfig) ActionSandboxMetrics() *blueprint.SandboxMetrics {
+	return nil
 }
 
 func environmentArgs(config Config, tag string) []string {
@@ -180,22 +185,6 @@ type PrimaryBuilderFactory struct {
 	output       string
 	specificArgs []string
 	debugPort    string
-}
-
-func getGlobPathName(config Config) string {
-	globPathName, ok := config.TargetProductOrErr()
-	if ok != nil {
-		globPathName = soongBuildTag
-	}
-	return globPathName
-}
-
-func getGlobPathNameFromPrimaryBuilderFactory(config Config, pb PrimaryBuilderFactory) string {
-	if pb.name == soongBuildTag {
-		// Glob path for soong build would be separated per product target
-		return getGlobPathName(config)
-	}
-	return pb.name
 }
 
 func (pb PrimaryBuilderFactory) primaryBuilderInvocation(config Config) bootstrap.PrimaryBuilderInvocation {
@@ -328,6 +317,12 @@ func bootstrapBlueprint(ctx Context, config Config) {
 	if config.incrementalBuildActions {
 		mainSoongBuildExtraArgs = append(mainSoongBuildExtraArgs, "--incremental-build-actions")
 	}
+	if len(config.partialAnalysisTargets) > 0 {
+		mainSoongBuildExtraArgs = append(mainSoongBuildExtraArgs, fmt.Sprintf("%s=\"%s\"", "--partial-analysis-targets", config.partialAnalysisTargets))
+	}
+	if config.incrementalProviderTest {
+		mainSoongBuildExtraArgs = append(mainSoongBuildExtraArgs, "--incremental-provider-test")
+	}
 
 	pbfs := []PrimaryBuilderFactory{
 		{
@@ -413,6 +408,7 @@ func bootstrapBlueprint(ctx Context, config Config) {
 		// If we want to debug soong_build, we need to compile it for debugging
 		debugCompilation:          delvePort != "",
 		primaryBuilderInvocations: invocations,
+		isActionSandboxedBuild:    config.IsActionSandboxedBuild(),
 	}
 
 	// since `bootstrap.ninja` is regenerated unconditionally, we ignore the deps, i.e. little
@@ -432,14 +428,31 @@ func bootstrapBlueprint(ctx Context, config Config) {
 	}
 }
 
-func checkEnvironmentFile(ctx Context, currentEnv *Environment, envFile string) {
+func checkEnvironmentFile(ctx Context, config Config, currentEnv *Environment, envFile string) {
 	getenv := func(k string) string {
 		v, _ := currentEnv.Get(k)
 		return v
 	}
 
 	// Log the changed environment variables to ChangedEnvironmentVariable field
-	if stale, changedEnvironmentVariableList, _ := shared.StaleEnvFile(envFile, getenv); stale {
+
+	if stale, changedEnvironmentVariableList, err := shared.StaleEnvFile(envFile, getenv); stale {
+		if config.EnforceNoReanalysis() {
+			if exists, _ := fileExists(envFile); exists {
+				if err != nil {
+					msg := fmt.Sprintf("Reanalysis will run due to missing or invalid environment file: %s. Changed TARGET_PRODUCT?", err)
+					// Both Error and Fatalf are used because Fatalf cannot write the error message to
+					// error.log.
+					ctx.Status.Error(msg)
+					ctx.Fatalf(msg)
+				}
+				msg := fmt.Sprintf("Reanalysis will run due to environment change. Changed environment variables: %v", changedEnvironmentVariableList)
+				// Both Error and Fatalf are used because Fatalf cannot write the error message to
+				// error.log.
+				ctx.Status.Error(msg)
+				ctx.Fatalf(msg)
+			}
+		}
 		for _, changedEnvironmentVariable := range changedEnvironmentVariableList {
 			ctx.Metrics.AddChangedEnvironmentVariable(changedEnvironmentVariable)
 		}
@@ -598,6 +611,19 @@ func runSoong(ctx Context, config Config, enforceNoSoongOutput bool) {
 		soongBuildEnv.Set("ALLOW_MISSING_DEPENDENCIES", "true")
 	}
 
+	// Only inject the SOONG_ENFORCE_NO_REANALYSIS variable if it's not a clean build.
+	// Clean build should not fail even if SOONG_ENFORCE_NO_REANALYSIS is set.
+	cleanBuild := false
+	if exists, _ := fileExists(config.UsedEnvFile(soongBuildTag)); !exists {
+		cleanBuild = true
+	}
+
+	if config.EnforceNoReanalysis() && !cleanBuild {
+		soongBuildEnv.Set("SOONG_ENFORCE_NO_REANALYSIS", "true")
+	} else {
+		soongBuildEnv.Unset("SOONG_ENFORCE_NO_REANALYSIS")
+	}
+
 	err := writeEnvironmentFile(ctx, envFile, soongBuildEnv.AsMap())
 	if err != nil {
 		ctx.Fatalf("failed to write environment file %s: %s", envFile, err)
@@ -607,14 +633,14 @@ func runSoong(ctx Context, config Config, enforceNoSoongOutput bool) {
 		e := ctx.BeginTrace(metrics.RunSoong, "environment check")
 		defer e.End()
 
-		checkEnvironmentFile(ctx, soongBuildEnv, config.UsedEnvFile(soongBuildTag))
+		checkEnvironmentFile(ctx, config, soongBuildEnv, config.UsedEnvFile(soongBuildTag))
 
 		if config.JsonModuleGraph() {
-			checkEnvironmentFile(ctx, soongBuildEnv, config.UsedEnvFile(jsonModuleGraphTag))
+			checkEnvironmentFile(ctx, config, soongBuildEnv, config.UsedEnvFile(jsonModuleGraphTag))
 		}
 
 		if config.SoongDocs() {
-			checkEnvironmentFile(ctx, soongBuildEnv, config.UsedEnvFile(soongDocsTag))
+			checkEnvironmentFile(ctx, config, soongBuildEnv, config.UsedEnvFile(soongDocsTag))
 		}
 	}()
 
@@ -623,9 +649,10 @@ func runSoong(ctx Context, config Config, enforceNoSoongOutput bool) {
 		defer e.End()
 
 		fifo := filepath.Join(config.OutDir(), ".ninja_fifo")
-		nr := status.NewNinjaReader(ctx, ctx.Status.StartTool(), fifo)
+		nr := status.NewNinjaReader(ctx, ctx.Status.StartTool(), fifo, ctx.SigNumFunc)
 		func() {
 			defer nr.Close()
+			var ninjaEnv Environment
 			var ninjaCmd string
 			var ninjaArgs []string
 			switch config.ninjaCommand {
@@ -646,22 +673,51 @@ func runSoong(ctx Context, config Config, enforceNoSoongOutput bool) {
 					"-f", filepath.Join(config.SoongOutDir(), "bootstrap.ninja"),
 				}
 			case NINJA_SISO:
+				sisoLogDir := filepath.Join(config.LogsDir(), "bootstrap")
+				// create log dir, otherwise glog will use /tmp instead.
+				err := os.MkdirAll(sisoLogDir, 0777)
+				if err != nil {
+					ctx.Fatalf("Failed to create siso log dir: %v\n", err)
+				}
 				ninjaCmd = config.SisoBin()
 				ninjaArgs = []string{
+					"--log_dir", sisoLogDir, // for glog, e.g. siso.*INFO*
 					"ninja",
+					"-d", "keepdepfile",
 					// TODO: implement these features, or remove them.
-					//"-d", "keepdepfile",
 					//"-d", "stats",
 					//"-o", "usesphonyoutputs=yes",
 					//"-o", "preremoveoutputs=yes",
 					//"-w", "dupbuild=err",
 					//"-w", "outputdir=err",
 					//"-w", "missingoutfile=err",
-					"-v",
-					"-j", strconv.Itoa(config.Parallel()),
-					//"--frontend-file", fifo,
-					"--log_dir", config.SoongOutDir(),
+					"--local_jobs", strconv.Itoa(config.Parallel()),
+					//"--remote_jobs", strconv.Itoa(config.RemoteParallel()),
+					"--frontend_file", fifo,
 					"-f", filepath.Join(config.SoongOutDir(), "bootstrap.ninja"),
+				}
+				if value := config.SisoConfigDir(); value != "" {
+					value = createSisoConfigDir(ctx, config, value)
+					ninjaArgs = append(ninjaArgs, fmt.Sprintf("--config_repo_dir=%s", value))
+				}
+				sisoExperiments := []string{
+					"ignore-missing-out-in-depfile",
+					"fallback-on-exec-error",
+				}
+				if exps, ok := ninjaEnv.Get("SISO_EXPERIMENTS"); ok {
+					sisoExperiments = append(sisoExperiments, exps)
+				}
+				ninjaEnv.Set("SISO_EXPERIMENTS", strings.Join(sisoExperiments, ","))
+
+				if config.IsVerbose() {
+					// Output `siso version`.
+					vcmd := Command(ctx, config, nil, "siso version",
+						config.SisoBin(), "version")
+					versionOutput, err := vcmd.CombinedOutput()
+					if err != nil {
+						ctx.Fatalf("Failed to run siso version: %s\n", err)
+					}
+					ctx.Verbosef("%s", versionOutput)
 				}
 			default:
 				// NINJA_NINJA is the default.
@@ -689,8 +745,6 @@ func runSoong(ctx Context, config Config, enforceNoSoongOutput bool) {
 
 			cmd := Command(ctx, config, e, "soong bootstrap",
 				ninjaCmd, ninjaArgs...)
-
-			var ninjaEnv Environment
 
 			// This is currently how the command line to invoke soong_build finds the
 			// root of the source tree and the output root
@@ -727,7 +781,7 @@ func runSoong(ctx Context, config Config, enforceNoSoongOutput bool) {
 	installCleanIfNecessary(ctx, config)
 
 	for _, target := range targets {
-		if err := checkGlobs(ctx, target); err != nil {
+		if err := checkGlobs(ctx, config, target); err != nil {
 			ctx.Fatalf("Error checking globs: %s", err.Error())
 		}
 	}
@@ -739,22 +793,33 @@ func runSoong(ctx Context, config Config, enforceNoSoongOutput bool) {
 	loadSoongBuildMetrics(ctx, config, beforeSoongTimestamp)
 
 	soongNinjaFile := config.SoongNinjaFile()
-	distGzipFile(ctx, config, soongNinjaFile, "soong")
+	distGzipFile(ctx, config, soongNinjaFile, "soong_ui/soong")
 	for _, file := range blueprint.GetNinjaShardFiles(soongNinjaFile) {
 		if ok, _ := fileExists(file); ok {
-			distGzipFile(ctx, config, file, "soong")
+			distGzipFile(ctx, config, file, "soong_ui/soong")
 		}
 	}
-	distFile(ctx, config, config.SoongVarsFile(), "soong")
-	distFile(ctx, config, config.SoongExtraVarsFile(), "soong")
+	distFile(ctx, config, config.SoongVarsFile(), "soong_ui/soong")
+	distFile(ctx, config, config.SoongExtraVarsFile(), "soong_ui/soong")
 
 	if !config.SkipKati() {
-		distGzipFile(ctx, config, config.SoongAndroidMk(), "soong")
-		distGzipFile(ctx, config, config.SoongMakeVarsMk(), "soong")
+		distGzipFile(ctx, config, config.SoongAndroidMk(), "soong_ui/soong")
+		distGzipFile(ctx, config, config.SoongMakeVarsMk(), "soong_ui/soong")
+	} else {
+		distGzipFile(ctx, config, config.SoongPhonyNinjaFile(), "soong_ui/soong")
+		distGzipFile(ctx, config, config.SoongDistNinjaFile(), "soong_ui/soong")
+		distGzipFile(ctx, config, config.SoongNoDistNinjaFile(), "soong_ui/soong")
 	}
 
 	if config.JsonModuleGraph() {
-		distGzipFile(ctx, config, config.ModuleGraphFile(), "soong")
+		distGzipFile(ctx, config, config.ModuleGraphFile(), "soong_ui/soong")
+	}
+
+	if config.ninjaCommand == NINJA_SISO {
+		distFile(ctx, config, config.SisoConfigFile(true), "soong_ui/bootstrap")
+		distFile(ctx, config, config.SisoDepsFile(true), "soong_ui/bootstrap")
+		distFile(ctx, config, config.SisoFsStateFile(true), "soong_ui/bootstrap")
+		distFile(ctx, config, config.SisoFilegroupsFile(true), "soong_ui/bootstrap")
 	}
 }
 
@@ -772,7 +837,7 @@ func runSoong(ctx Context, config Config, enforceNoSoongOutput bool) {
 // with the time that they ran at every build. When soong_ui checks
 // globs, it only reruns globs whose dependencies are newer than the
 // time in the ".globs_time" file.
-func checkGlobs(ctx Context, finalOutFile string) error {
+func checkGlobs(ctx Context, config Config, finalOutFile string) error {
 	e := ctx.BeginTrace(metrics.RunSoong, "check_globs")
 	defer e.End()
 	st := ctx.Status.StartTool()
@@ -780,142 +845,59 @@ func checkGlobs(ctx Context, finalOutFile string) error {
 	defer st.Finish()
 
 	globsFile, err := os.Open(finalOutFile + ".globs")
-	if errors.Is(err, fs.ErrNotExist) {
+	if errors.Is(err, os.ErrNotExist) {
 		// if the glob file doesn't exist, make sure the glob_results file exists and is empty.
 		if err := os.MkdirAll(filepath.Dir(finalOutFile), 0777); err != nil {
 			return err
 		}
-		f, err := os.Create(finalOutFile + ".glob_results")
-		if err != nil {
-			return err
-		}
-		return f.Close()
+		return os.WriteFile(finalOutFile+".glob_results", nil, 0666)
 	} else if err != nil {
 		return err
 	}
 	defer globsFile.Close()
-	globsFileDecoder := json.NewDecoder(globsFile)
 
 	globsTimeBytes, err := os.ReadFile(finalOutFile + ".globs_time")
-	if err != nil {
+	if errors.Is(err, os.ErrNotExist) {
+		globsTimeBytes = []byte("0")
+	} else if err != nil {
 		return err
 	}
+
 	globsTimeMicros, err := strconv.ParseInt(strings.TrimSpace(string(globsTimeBytes)), 10, 64)
 	if err != nil {
 		return err
 	}
 	globCheckStartTime := time.Now().UnixMicro()
 
-	globsChan := make(chan pathtools.GlobResult)
-	errorsChan := make(chan error)
-	wg := sync.WaitGroup{}
-
-	hasChangedGlobs := false
-	var changedGlobNameMutex sync.Mutex
-	var changedGlobName string
-
-	for i := 0; i < runtime.NumCPU()*2; i++ {
-		wg.Add(1)
-		go func() {
-			for cachedGlob := range globsChan {
-				// If we've already determined we have changed globs, just finish consuming
-				// the channel without doing any more checks.
-				if hasChangedGlobs {
-					continue
-				}
-				// First, check if any of the deps are newer than the last time globs were checked.
-				// If not, we don't need to rerun the glob.
-				hasNewDep := false
-				for _, dep := range cachedGlob.Deps {
-					info, err := os.Stat(dep)
-					if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
-						hasNewDep = true
-						break
-					} else if err != nil {
-						errorsChan <- err
-						continue
-					}
-					if info.ModTime().UnixMicro() > globsTimeMicros {
-						hasNewDep = true
-						break
-					}
-				}
-				if !hasNewDep {
-					continue
-				}
-
-				// Then rerun the glob and check if we got the same result as before.
-				result, err := pathtools.Glob(cachedGlob.Pattern, cachedGlob.Excludes, pathtools.FollowSymlinks)
-				if err != nil {
-					errorsChan <- err
-				} else {
-					if !slices.Equal(result.Matches, cachedGlob.Matches) {
-						hasChangedGlobs = true
-
-						changedGlobNameMutex.Lock()
-						defer changedGlobNameMutex.Unlock()
-						changedGlobName = result.Pattern
-						if len(result.Excludes) > 2 {
-							changedGlobName += fmt.Sprintf(" (excluding %d other patterns)", len(result.Excludes))
-						} else if len(result.Excludes) > 0 {
-							changedGlobName += " (excluding " + strings.Join(result.Excludes, " and ") + ")"
-						}
-					}
-				}
-			}
-			wg.Done()
-		}()
-	}
-	go func() {
-		wg.Wait()
-		close(errorsChan)
-	}()
-
-	errorsWg := sync.WaitGroup{}
-	errorsWg.Add(1)
-	var errFromGoRoutines error
-	go func() {
-		for result := range errorsChan {
-			if errFromGoRoutines == nil {
-				errFromGoRoutines = result
-			}
-		}
-		errorsWg.Done()
-	}()
-
-	var cachedGlob pathtools.GlobResult
-	for globsFileDecoder.More() {
-		if err := globsFileDecoder.Decode(&cachedGlob); err != nil {
-			return err
-		}
-		// Need to clone the GlobResult because the json decoder will
-		// reuse the same slice allocations.
-		globsChan <- cachedGlob.Clone()
-	}
-	close(globsChan)
-	errorsWg.Wait()
-	if errFromGoRoutines != nil {
-		return errFromGoRoutines
-	}
-
-	// Update the globs_time file whether or not we found changed globs,
-	// so that we don't rerun globs in the future that we just saw didn't change.
-	err = os.WriteFile(
-		finalOutFile+".globs_time",
-		[]byte(fmt.Sprintf("%d\n", globCheckStartTime)),
-		0666,
-	)
+	hasChangedGlobs, err := pathtools.CheckForChangedGlobs(pathtools.OsFs, globsFile, globsTimeMicros)
 	if err != nil {
-		return err
+		if config.EnforceNoReanalysis() {
+			msg := fmt.Sprintf("Reanalysis will run due to glob error: %s", err.Error())
+			// Both Error and Fatalf are used because Fatalf cannot write the error message to
+			// error.log.
+			ctx.Status.Error(msg)
+			ctx.Fatalf(msg)
+		}
+		fmt.Fprintf(os.Stdout, "\nGlobs changed, rerunning soong...\n")
+		fmt.Fprintf(os.Stdout, "%s\n", err.Error())
 	}
 
 	if hasChangedGlobs {
-		fmt.Fprintf(os.Stdout, "Globs changed, rerunning soong...\n")
-		fmt.Fprintf(os.Stdout, "One culprit glob (may be more): %s\n", changedGlobName)
 		// Write the current time to the glob_results file. We just need
 		// some unique value to trigger a rerun, it doesn't matter what it is.
 		err = os.WriteFile(
 			finalOutFile+".glob_results",
+			[]byte(fmt.Sprintf("%d\n", globCheckStartTime)),
+			0666,
+		)
+		if err != nil {
+			return err
+		}
+	} else {
+		// Update the globs_time file if there were no changed globs so that we don't
+		// rerun globs in the future that we just saw didn't change.
+		err = os.WriteFile(
+			finalOutFile+".globs_time",
 			[]byte(fmt.Sprintf("%d\n", globCheckStartTime)),
 			0666,
 		)
@@ -972,23 +954,5 @@ func loadSoongBuildMetrics(ctx Context, config Config, oldTimestamp time.Time) {
 			}
 			ctx.Tracer.CountersAtTime(group.GetName(), ctx.Thread, timestamp, counters)
 		}
-	}
-}
-
-func runMicrofactory(ctx Context, config Config, name string, pkg string, mapping map[string]string) {
-	e := ctx.BeginTrace(metrics.RunSoong, name)
-	defer e.End()
-	cfg := microfactory.Config{TrimPath: absPath(ctx, ".")}
-	for pkgPrefix, pathPrefix := range mapping {
-		cfg.Map(pkgPrefix, pathPrefix)
-	}
-
-	exePath := filepath.Join(config.SoongOutDir(), name)
-	dir := filepath.Dir(exePath)
-	if err := os.MkdirAll(dir, 0777); err != nil {
-		ctx.Fatalf("cannot create %s: %s", dir, err)
-	}
-	if _, err := microfactory.Build(&cfg, exePath, pkg); err != nil {
-		ctx.Fatalf("failed to build %s: %s", name, err)
 	}
 }

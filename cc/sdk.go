@@ -26,8 +26,12 @@ import (
 // variants that enforce backwards compatibility.
 type sdkTransitionMutator struct{}
 
-func (sdkTransitionMutator) Split(ctx android.BaseModuleContext) []string {
+func (sdkTransitionMutator) split(ctx android.BaseModuleContext) []string {
 	if ctx.Os() != android.Android {
+		return []string{""}
+	}
+
+	if ctx.Target().LFI {
 		return []string{""}
 	}
 
@@ -51,9 +55,36 @@ func (sdkTransitionMutator) Split(ctx android.BaseModuleContext) []string {
 				return []string{""}
 			}
 		}
+	// AllArtlessBlockedSymbolFiles is an arch-variant file group that "wraps" a
+	// list of cc_library targets' tagged outputs. Unlike normal filegroups, it
+	// it is OS and arch-variant, and would otherwise get a sdk:"" split that
+	// prevents usage from CTS (which is always sdk:"sdk").
+	//
+	// The list of symbols is a part of API contract and effectively AlwaysSDK,
+	// so treat it as such here.
+	case *AllArtlessBlockedSymbolFiles:
+		return []string{"sdk"}
 	}
 
 	return []string{""}
+}
+
+func (s sdkTransitionMutator) Split(ctx android.BaseModuleContext) []string {
+	allSplits := s.split(ctx)
+	if ctx.Config().GetBuildFlagBool("RELEASE_SOONG_SDK_VARIANT_ON_DEMAND") {
+		return allSplits[0:1]
+	} else {
+		return allSplits
+	}
+}
+
+func (s sdkTransitionMutator) SplitOnDemand(ctx android.BaseModuleContext) []string {
+	allSplits := s.split(ctx)
+	if len(allSplits) <= 1 || !ctx.Config().GetBuildFlagBool("RELEASE_SOONG_SDK_VARIANT_ON_DEMAND") {
+		return nil
+	} else {
+		return allSplits[1:]
+	}
 }
 
 func (sdkTransitionMutator) OutgoingTransition(ctx android.OutgoingTransitionContext, sourceVariation string) string {
@@ -80,6 +111,8 @@ func (sdkTransitionMutator) IncomingTransition(ctx android.IncomingTransitionCon
 				return incomingVariation
 			}
 		}
+	case *AllArtlessBlockedSymbolFiles:
+		return "sdk"
 	}
 	_, usesUnbundledVariantDepTag := ctx.DepTag().(android.UsesUnbundledVariantDepTag)
 	// If we've reached this point, the module doesn't have an sdk variant. If we're adding

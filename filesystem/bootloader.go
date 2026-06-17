@@ -21,6 +21,9 @@ import (
 	"android/soong/android"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
+// @auto-generate: gob
 type bootloaderInfo struct {
 	bootloaderImg android.Path
 }
@@ -42,6 +45,9 @@ type PrebuiltBootloaderProperties struct {
 
 	// Tool for unpacking bootloader.img
 	Unpack_tool *string `android:"path"`
+
+	// Additional files needed to run unpack_tool
+	Unpack_tool_deps []string `android:"path"`
 }
 
 // TODO(soong-team): This module should be registered with the name
@@ -55,15 +61,19 @@ func PrebuiltBootloaderFactory() android.Module {
 	return module
 }
 
+func (p *prebuiltBootloader) DepsMutator(ctx android.BottomUpMutatorContext) {
+	ctx.AddHostToolDependencies("avbtool", "avb_openssl")
+}
+
 func (p *prebuiltBootloader) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	if p.properties.Src == nil {
 		ctx.PropertyErrorf("src", "Source cannot be empty")
 	}
 	bootloader := android.PathForModuleSrc(ctx, proptools.String(p.properties.Src))
-	bootloaderFiles := append(android.Paths{}, bootloader)
-	bootloaderFiles = append(bootloaderFiles, p.partitionFilesBootloader(ctx)...)
+	ctx.SetOutputFiles([]android.Path{bootloader}, "")
+	bootloaderPartitionFiles := p.partitionFilesBootloader(ctx)
+	ctx.SetOutputFiles(bootloaderPartitionFiles, "bootloader_partitions")
 
-	ctx.SetOutputFiles(bootloaderFiles, "")
 	android.SetProvider(ctx, vbmetaPartitionsProvider, p.vbmetaPartitions)
 	android.SetProvider(ctx, bootloaderInfoProvider, bootloaderInfo{
 		bootloaderImg: bootloader,
@@ -87,6 +97,7 @@ func (p *prebuiltBootloader) partitionFilesBootloader(ctx android.ModuleContext)
 		unpackedImg := unpackedDir.Join(ctx, partition+".img")
 		cmd := builder.Command()
 		cmd.Input(android.PathForModuleSrc(ctx, proptools.String(p.properties.Unpack_tool))).
+			Implicits(android.PathsForModuleSrc(ctx, p.properties.Unpack_tool_deps)).
 			Flag(" unpack ").
 			Flag("-o ").
 			Textf("%s ", cmd.PathForOutput(unpackedDir)).
@@ -110,10 +121,11 @@ func (p *prebuiltBootloader) partitionFilesBootloader(ctx android.ModuleContext)
 
 func (p *prebuiltBootloader) avbAddHash(ctx android.ModuleContext, builder *android.RuleBuilder, partitionName string, unpackedPartition android.OutputPath) android.Path {
 	output := unpackedPartition.InSameDir(ctx, partitionName+"_vbfooted.img")
-	builder.Command().Text("cp").Input(unpackedPartition).Output(output)
+	builder.Command().BuiltTool("cp").Input(unpackedPartition).Output(output)
 
 	cmd := builder.Command()
 	cmd.BuiltTool("avbtool").
+		ImplicitTool(ctx.Config().HostToolPath(ctx, "avb_openssl")).
 		Text("add_hash_footer").
 		FlagWithOutput("--image ", output).
 		FlagWithArg("--partition_name ", partitionName).

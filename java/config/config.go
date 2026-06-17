@@ -95,14 +95,12 @@ func init() {
 	}, dexerJavaVmFlagsList...), " "))
 
 	pctx.VariableFunc("R8Flags", func(ctx android.PackageVarContext) string {
-		r8flags := append([]string{
+		r8flags := []string{
 			"-JXmx4096M",
 			"-JDcom.android.tools.r8.emitRecordAnnotationsInDex",
 			"-JDcom.android.tools.r8.emitPermittedSubclassesAnnotationsInDex",
-		}, dexerJavaVmFlagsList...)
-		if r8DumpDir := ctx.Config().Getenv("R8_DUMP_DIRECTORY"); r8DumpDir != "" {
-			r8flags = append(r8flags, "-JDcom.android.tools.r8.dumpinputtodirectory="+r8DumpDir)
 		}
+		r8flags = append(r8flags, dexerJavaVmFlagsList...)
 		return strings.Join(r8flags, " ")
 
 	})
@@ -131,6 +129,9 @@ func init() {
 
 	pctx.VariableConfigMethod("hostPrebuiltTag", android.Config.PrebuiltOS)
 
+	pctx.VariableFunc("UsePartialCompileFile", func(ctx android.PackageVarContext) string {
+		return ctx.Config().UsePartialCompileFile(ctx).String()
+	})
 	pctx.VariableFunc("JavaHome", func(ctx android.PackageVarContext) string {
 		// This is set up and guaranteed by soong_ui
 		return ctx.Config().Getenv("ANDROID_JAVA_HOME")
@@ -167,7 +168,6 @@ func init() {
 	pctx.HostBinToolVariable("DependencyMapperJavacCmd", "dependency-mapper")
 
 	pctx.SourcePathVariable("JarArgsCmd", "build/soong/scripts/jar-args.sh")
-	pctx.SourcePathVariable("PackageCheckCmd", "build/soong/scripts/package-check.sh")
 	pctx.HostBinToolVariable("ExtractJarPackagesCmd", "extract_jar_packages")
 	pctx.HostBinToolVariable("SoongZipCmd", "soong_zip")
 	pctx.HostBinToolVariable("MergeZipsCmd", "merge_zips")
@@ -231,6 +231,18 @@ func init() {
 	// TODO(ccross): this should come from the signapk dependencies, but we don't have any way
 	// to express host JNI dependencies yet.
 	hostJNIToolVariableWithSdkToolsPrebuilt("SignapkJniLibrary", "libconscrypt_openjdk_jni")
+
+	pctx.VariableFunc("ResourceProcessorBusyBoxSuppressJDKWarnings", func(ctx android.PackageVarContext) string {
+		suppressWarningsFlags := []string{}
+
+		if ctx.Config().BuildWithJdk25() {
+			suppressWarningsFlags = append(suppressWarningsFlags,
+				// deprecated sun.misc.Unsafe::objectFieldOffset
+				"--sun-misc-unsafe-memory-access=allow", // b/447118055
+			)
+		}
+		return strings.Join(suppressWarningsFlags, " ")
+	})
 }
 
 func hostBinToolVariableWithSdkToolsPrebuilt(name, tool string) {
@@ -288,29 +300,21 @@ func JavadocCmd(ctx android.PathContext) android.SourcePath {
 }
 
 func javaTool(ctx android.PathContext, tool string) android.SourcePath {
-	type javaToolKey string
-
-	key := android.NewCustomOnceKey(javaToolKey(tool))
-
-	return ctx.Config().OnceSourcePath(key, func() android.SourcePath {
-		return javaToolchain(ctx).Join(ctx, tool)
-	})
-
+	return javaToolchain(ctx).Join(ctx, tool)
 }
 
 var javaToolchainKey = android.NewOnceKey("javaToolchain")
 
 func javaToolchain(ctx android.PathContext) android.SourcePath {
-	return ctx.Config().OnceSourcePath(javaToolchainKey, func() android.SourcePath {
-		return javaHome(ctx).Join(ctx, "bin")
-	})
+	return javaHome(ctx).Join(ctx, "bin")
 }
 
 var javaHomeKey = android.NewOnceKey("javaHome")
 
 func javaHome(ctx android.PathContext) android.SourcePath {
-	return ctx.Config().OnceSourcePath(javaHomeKey, func() android.SourcePath {
+	path := ctx.Config().Once(javaHomeKey, func() interface{} {
 		// This is set up and guaranteed by soong_ui
-		return android.PathForSource(ctx, ctx.Config().Getenv("ANDROID_JAVA_HOME"))
-	})
+		return ctx.Config().Getenv("ANDROID_JAVA_HOME")
+	}).(string)
+	return android.PathForSource(ctx, path)
 }

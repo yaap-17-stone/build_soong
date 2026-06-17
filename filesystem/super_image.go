@@ -28,6 +28,8 @@ import (
 	"github.com/google/blueprint/proptools"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 func init() {
 	android.RegisterModuleType("super_image", SuperImageFactory)
 }
@@ -119,6 +121,7 @@ type SuperImagePartitionNameProperties struct {
 	Odm_dlkm_partition *string
 }
 
+// @auto-generate: gob
 type SuperImageInfo struct {
 	// The built super.img file, which contains the sub-partitions
 	SuperImage android.Path
@@ -132,6 +135,8 @@ type SuperImageInfo struct {
 	SuperEmptyImage android.Path
 
 	AbUpdate bool
+
+	SuperImageInUpdatePackage bool
 }
 
 var SuperImageProvider = blueprint.NewProvider[SuperImageInfo]()
@@ -178,7 +183,7 @@ func (s *superImage) DepsMutator(ctx android.BottomUpMutatorContext) {
 
 func (s *superImage) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	miscInfo, deps, subImageInfos := s.buildMiscInfo(ctx, false)
-	builder := android.NewRuleBuilder(pctx, ctx)
+	builder := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	output := android.PathForModuleOut(ctx, s.installFileName())
 	lpMake := ctx.Config().HostToolPath(ctx, "lpmake")
 	lpMakeDir := filepath.Dir(lpMake.String())
@@ -192,7 +197,7 @@ func (s *superImage) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	builder.Build("build_super_image", fmt.Sprintf("Creating super image %s", s.BaseModuleName()))
 	var superEmptyImage android.WritablePath
 	if proptools.Bool(s.properties.Create_super_empty) {
-		superEmptyImageBuilder := android.NewRuleBuilder(pctx, ctx)
+		superEmptyImageBuilder := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 		superEmptyImage = android.PathForModuleOut(ctx, "super_empty.img")
 		superEmptyMiscInfo, superEmptyDeps, _ := s.buildMiscInfo(ctx, true)
 		if superEmptyDeps != nil {
@@ -207,14 +212,36 @@ func (s *superImage) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 		superEmptyImageBuilder.Build("build_super_empty_image", fmt.Sprintf("Creating super empty image %s", s.BaseModuleName()))
 	}
 	android.SetProvider(ctx, SuperImageProvider, SuperImageInfo{
-		SuperImage:            output,
-		SubImageInfo:          subImageInfos,
-		DynamicPartitionsInfo: s.generateDynamicPartitionsInfo(ctx),
-		SuperEmptyImage:       superEmptyImage,
-		AbUpdate:              proptools.Bool(s.properties.Ab_update),
+		SuperImage:                output,
+		SubImageInfo:              subImageInfos,
+		DynamicPartitionsInfo:     s.generateDynamicPartitionsInfo(ctx),
+		SuperEmptyImage:           superEmptyImage,
+		AbUpdate:                  proptools.Bool(s.properties.Ab_update),
+		SuperImageInUpdatePackage: proptools.Bool(s.properties.Super_image_in_update_package),
 	})
 	ctx.SetOutputFiles([]android.Path{output}, "")
 	ctx.CheckbuildFile(output)
+
+	var installedApexKeys android.Paths
+	ctx.VisitDirectDepsProxy(func(m android.ModuleProxy) {
+		if info, ok := android.OtherModuleProvider(ctx, m, ApexKeyPathInfoProvider); ok {
+			installedApexKeys = append(installedApexKeys, info.ApexKeyPath)
+		}
+	})
+
+	if len(installedApexKeys) > 0 {
+		apexKeys := android.PathForModuleOut(ctx, "apexkeys.txt")
+		ctx.Build(pctx, android.BuildParams{
+			Rule:        android.CatRule,
+			Inputs:      installedApexKeys,
+			Output:      apexKeys,
+			Description: "generating apexkeys.txt for " + ctx.ModuleName(),
+		})
+
+		android.SetProvider(ctx, ApexKeyPathInfoProvider, ApexKeyPathInfo{
+			ApexKeyPath: apexKeys,
+		})
+	}
 
 	buildComplianceMetadata(ctx, subImageDepTag)
 }
@@ -312,7 +339,7 @@ func (s *superImage) buildMiscInfo(ctx android.ModuleContext, superEmpty bool) (
 		android.ErrorRule(ctx, missingPartitionErrorMessageFile, missingPartitionErrorMessage)
 	} else {
 		ctx.Build(pctx, android.BuildParams{
-			Rule:   android.Touch,
+			Rule:   android.TouchRule,
 			Output: missingPartitionErrorMessageFile,
 		})
 	}

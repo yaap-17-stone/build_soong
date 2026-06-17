@@ -38,6 +38,8 @@ var prepareForRustTest = android.GroupFixturePreparers(
 	genrule.PrepareForTestWithGenRuleBuildComponents,
 
 	PrepareForIntegrationTestWithRust,
+
+	android.PrepareForTestWithBuildFlag("RELEASE_SOONG_RUST_VARIANT_ON_DEMAND", "true"),
 )
 
 var rustMockedFiles = android.MockFS{
@@ -60,6 +62,7 @@ var rustMockedFiles = android.MockFS{
 // testRust returns a TestContext in which a basic environment has been setup.
 // This environment contains a few mocked files. See rustMockedFiles for the list of these files.
 func testRust(t *testing.T, bp string, preparers ...android.FixturePreparer) *android.TestContext {
+	t.Parallel()
 	t.Helper()
 	skipTestIfOsNotSupported(t)
 	result := android.GroupFixturePreparers(
@@ -89,6 +92,8 @@ const (
 // testRustCov returns a TestContext in which a basic environment has been
 // setup. This environment explicitly enables coverage.
 func testRustCov(t *testing.T, bp string) *android.TestContext {
+	t.Parallel()
+	t.Helper()
 	skipTestIfOsNotSupported(t)
 	result := android.GroupFixturePreparers(
 		prepareForRustTest,
@@ -252,6 +257,7 @@ func TestSourceProviderDeps(t *testing.T) {
 			],
 			rlibs: ["libbindings"],
 			crate_name: "foo",
+			split_all_variants: true,
 		}
 		genrule {
 			name: "my_generator",
@@ -384,24 +390,11 @@ func TestMultilib(t *testing.T) {
 			name: "libfoo",
 			srcs: ["foo.rs"],
 			crate_name: "foo",
+			split_all_variants: true,
 		}`)
 
 	_ = ctx.ModuleForTests(t, "libfoo", "android_arm64_armv8-a_rlib_dylib-std")
 	_ = ctx.ModuleForTests(t, "libfoo", "android_arm_armv7-a-neon_rlib_dylib-std")
-}
-
-// Test that library size measurements are generated.
-func TestLibrarySizes(t *testing.T) {
-	ctx := testRust(t, `
-		rust_library_dylib {
-			name: "libwaldo",
-			srcs: ["foo.rs"],
-			crate_name: "waldo",
-		}`)
-
-	m := ctx.SingletonForTests(t, "file_metrics")
-	m.Output("unstripped/libwaldo.dylib.so.bloaty.csv")
-	m.Output("libwaldo.dylib.so.bloaty.csv")
 }
 
 // Test that aliases are respected.
@@ -530,6 +523,7 @@ func TestRustFFIRlibs(t *testing.T) {
 			srcs:["src/foo.rs"],
 			crate_name: "rs",
 			rustlibs: ["librs"],
+			split_all_variants: true,
 		}
 
 		rust_binary {
@@ -691,6 +685,7 @@ func TestStdLinkMismatch(t *testing.T) {
 				"foo.rs",
 			],
 			rlibs: ["libbar"],
+			split_all_variants: true,
 		}
 		rust_library {
 			name: "libbar",
@@ -797,6 +792,7 @@ func TestRustLinkPropagation(t *testing.T) {
 		crate_name: "rlib3",
 		srcs: ["src/lib.rs"],
 		rlibs: ["librlib2"],
+		split_all_variants: true,
 	}
 
 	rust_library_dylib {
@@ -874,4 +870,74 @@ func TestRustLinkPropagation(t *testing.T) {
 		t.Errorf("indirect dependency whole static lib not propagating from dylib to dylib: linkFlags %#v",
 			libdylib3.Args["linkFlags"])
 	}
+}
+
+func TestNoStdRlibsWithStdVariant(t *testing.T) {
+	ctx := testRust(t, `
+		rust_library {
+			name: "libfoo",
+			crate_name: "foo",
+			srcs: ["foo.rs"],
+			no_std: {
+				enabled: true,
+			},
+		}
+		rust_binary {
+			name: "foobar",
+			srcs: ["foo.rs"],
+			no_std_rlibs: ["libfoo"],
+		}
+	`)
+	module := ctx.ModuleForTests(t, "foobar", "android_arm64_armv8-a").Module().(*Module)
+	if !android.InList("libfoo.rlib-core", module.Properties.AndroidMkRlibs) {
+		t.Errorf("no_std_rlibs dependency not detected: %v", module.Properties.AndroidMkRlibs)
+	}
+}
+
+func TestNoStdFallback(t *testing.T) {
+	ctx := testRust(t, `
+		rust_library {
+			name: "libfoo",
+			crate_name: "foo",
+			srcs: ["foo.rs"],
+		}
+		rust_binary {
+			name: "foobar",
+			srcs: ["foo.rs"],
+			rlibs: ["libfoo_nostd"],
+		}
+	`)
+	module := ctx.ModuleForTests(t, "foobar", "android_arm64_armv8-a").Module().(*Module)
+	if !android.InList("libfoo", module.Properties.AndroidMkRlibs) {
+		t.Errorf("nostd fallback dependency not detected (dependency missing from AndroidMkRlibs)")
+	}
+}
+
+// Checks that we can have libfoo.dylib-std -> libcbar -> libbang -> libfoo.core-std without a loop
+func TestVariantCycle(t *testing.T) {
+	// We don't need to do anything with this, just loading it will crash if broken
+	testRust(t, `
+		rust_library {
+			name: "libfoo",
+			crate_name: "foo",
+			srcs: ["foo.rs"],
+			static_libs: ["libcbar"],
+			no_std: {
+				enabled: true,
+				static_libs: [],
+			}
+		}
+		rust_library_rlib {
+			name: "libbang",
+			crate_name: "bang",
+			srcs: ["foo.rs"],
+			rustlibs: ["libfoo"],
+			no_stdlibs: true,
+		}
+		cc_library {
+			name: "libcbar",
+			static_libs: ["libbang"],
+			srcs: ["foo.c"],
+		}
+	`)
 }

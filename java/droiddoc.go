@@ -16,7 +16,6 @@ package java
 
 import (
 	"fmt"
-	"path"
 	"path/filepath"
 	"strings"
 
@@ -26,6 +25,8 @@ import (
 	"android/soong/android"
 	"android/soong/java/config"
 )
+
+//go:generate go run ../../blueprint/gobtools/codegen
 
 func init() {
 	RegisterDocsBuildComponents(android.InitRegistrationContext)
@@ -122,6 +123,9 @@ type ApiToCheck struct {
 
 	// Arguments to the apicheck tool.
 	Args *string
+
+	// If true, checkapi will run by default when building `droid` for this module.
+	Default_in_droid *bool
 }
 
 type DroiddocProperties struct {
@@ -166,9 +170,6 @@ type DroiddocProperties struct {
 
 	// Compat config XML. Generates compat change documentation if set.
 	Compat_config *string `android:"path"`
-
-	// The directory name to publish the generated documentation under out/target/common/docs.
-	Publish_dir *string
 }
 
 // Common flags passed down to build rule
@@ -391,8 +392,9 @@ func (j *Javadoc) collectDeps(ctx android.ModuleContext) deps {
 				deps.classpath = append(deps.classpath, dep.HeaderJars...)
 				deps.aidlIncludeDirs = append(deps.aidlIncludeDirs, dep.AidlIncludeDirs...)
 				deps.aconfigProtoFiles = append(deps.aconfigProtoFiles, dep.AconfigIntermediateCacheOutputPaths...)
-			} else if dep, ok := android.OtherModuleProvider(ctx, module, android.SourceFilesInfoProvider); ok {
-				checkProducesJars(ctx, dep, module)
+			} else if commonInfo, ok := android.OtherModuleProvider(ctx, module, android.CommonModuleInfoProvider); ok && commonInfo.SourceFiles != nil {
+				dep := commonInfo.SourceFiles
+				checkProducesJars(ctx, *dep, module)
 				deps.classpath = append(deps.classpath, dep.Srcs...)
 			} else {
 				ctx.ModuleErrorf("depends on non-java module %q", otherName)
@@ -555,7 +557,7 @@ func (j *Javadoc) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 
 	j.stubsSrcJar = nil
 
-	rule := android.NewRuleBuilder(pctx, ctx)
+	rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 
 	rule.Command().Text("rm -rf").Text(outDir.String())
 	rule.Command().Text("mkdir -p").Text(outDir.String())
@@ -630,6 +632,7 @@ func (d *Droiddoc) DepsMutator(ctx android.BottomUpMutatorContext) {
 
 func (d *Droiddoc) doclavaDocsFlags(ctx android.ModuleContext, cmd *android.RuleBuilderCommand, docletPath classpath) {
 	buildNumberFile := ctx.Config().BuildNumberFile(ctx)
+	buildDateFile := ctx.Config().BuildDateFile(ctx)
 	// Droiddoc always gets "-source 1.8" because it doesn't support 1.9 sources.  For modules with 1.9
 	// sources, droiddoc will get sources produced by metalava which will have already stripped out the
 	// 1.9 language features.
@@ -650,7 +653,7 @@ func (d *Droiddoc) doclavaDocsFlags(ctx android.ModuleContext, cmd *android.Rule
 		Flag("-J--add-exports=jdk.compiler/com.sun.tools.javac.tree=ALL-UNNAMED").
 		Flag("-J--add-exports=jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED").
 		FlagWithArg("-hdf page.build ", ctx.Config().BuildId()+"-$(cat "+buildNumberFile.String()+")").OrderOnly(buildNumberFile).
-		FlagWithArg("-hdf page.now ", `"$(date -d @$(cat `+ctx.Config().Getenv("BUILD_DATETIME_FILE")+`) "+%d %b %Y %k:%M")" `)
+		FlagWithArg("-hdf page.now ", `"$(date -d @$(cat `+buildDateFile.String()+`) "+%d %b %Y %k:%M")" `).OrderOnly(buildDateFile)
 
 	if String(d.properties.Custom_template) == "" {
 		// TODO: This is almost always droiddoc-templates-sdk
@@ -825,7 +828,7 @@ func (d *Droiddoc) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	outDir := android.PathForModuleOut(ctx, "out")
 	srcJarDir := android.PathForModuleOut(ctx, "srcjars")
 
-	rule := android.NewRuleBuilder(pctx, ctx)
+	rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 
 	srcJarList := zipSyncCmd(ctx, rule, srcJarDir, d.Javadoc.srcJars)
 
@@ -866,12 +869,6 @@ func (d *Droiddoc) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 		FlagWithArg("-C ", outDir.String()).
 		FlagWithArg("-D ", outDir.String())
 
-	if String(d.properties.Publish_dir) != "" {
-		publishDir := path.Join("out/target/common/docs", String(d.properties.Publish_dir))
-		rule.Command().Text("mkdir -p").Text(publishDir)
-		rule.Command().Text("unzip -qo").Input(d.docZip).Text("-d").Text(publishDir)
-	}
-
 	rule.Restat()
 
 	zipSyncCleanupCmd(rule, srcJarDir)
@@ -890,6 +887,7 @@ type ExportedDroiddocDirProperties struct {
 	Path *string
 }
 
+// @auto-generate: gob
 type ExportedDroiddocDirInfo struct {
 	Deps android.Paths
 	Dir  android.Path

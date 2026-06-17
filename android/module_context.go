@@ -87,6 +87,7 @@ type BuildParams struct {
 
 type ModuleContext interface {
 	BaseModuleContext
+	CreateNinjaPhonyOnceContext
 
 	// BlueprintModuleContext returns the blueprint.ModuleContext that the ModuleContext wraps.  It may only be
 	// used by the golang module types that need to call into the bootstrap module types.
@@ -229,7 +230,7 @@ type ModuleContext interface {
 	ExtraModuleInfoJSON() *ModuleInfoJSON
 
 	// SetOutputFiles stores the outputFiles to outputFiles property, which is used
-	// to set the OutputFilesProvider later.
+	// to set the OutputFiles in CommonModuleInfo later.
 	SetOutputFiles(outputFiles Paths, tag string)
 
 	GetOutputFiles() OutputFilesInfo
@@ -244,8 +245,8 @@ type ModuleContext interface {
 	ComplianceMetadataInfo() *ComplianceMetadataInfo
 
 	// Get the information about the containers this module belongs to.
-	getContainersInfo() ContainersInfo
-	setContainersInfo(info ContainersInfo)
+	getContainersInfo() *ContainersInfo
+	setContainersInfo(info *ContainersInfo)
 
 	setAconfigPaths(paths Paths)
 
@@ -280,6 +281,20 @@ type ModuleContext interface {
 	// This is similar to OutputFiles, but can be used for files that are not intended to be
 	// consumed by other modules. These files are built as part of checkbuild.
 	ModulePhonyFiles(srcPaths ...Path)
+
+	SetLogtagsInfo(info *LogtagsInfo)
+
+	SetTestModuleInfo(info *TestModuleInformation)
+
+	SetSymbolicOutputInfo(info *SymbolicOutputInfos)
+
+	SetMakeNamesInfo(info *MakeNamesInfo)
+
+	SetBaseJarJarProviderData(data *BaseJarJarProviderData)
+
+	AddRuntimeDeps(deps ...Path)
+
+	AddRuntimeHostToolDeps(deps ...blueprint.HostTool)
 }
 
 type moduleContext struct {
@@ -294,7 +309,7 @@ type moduleContext struct {
 	module           Module
 	phonies          map[string]Paths
 	// outputFiles stores the output of a module by tag and is used to set
-	// the OutputFilesProvider in GenerateBuildActions
+	// the OutputFiles in CommonModuleInfo in GenerateBuildActions
 	outputFiles OutputFilesInfo
 
 	TransitiveInstallFiles depset.DepSet[InstallPath]
@@ -330,7 +345,7 @@ type moduleContext struct {
 
 	// containersInfo stores the information about the containers and the information of the
 	// apexes the module belongs to.
-	containersInfo ContainersInfo
+	containersInfo *ContainersInfo
 
 	// Merged Aconfig files for all transitive deps.
 	aconfigFilePaths Paths
@@ -343,6 +358,21 @@ type moduleContext struct {
 
 	testSuiteInfo    TestSuiteInfo
 	testSuiteInfoSet bool
+
+	logTags                   *LogtagsInfo
+	logTagsSet                bool
+	testModuleInfo            *TestModuleInformation
+	testModuleInfoSet         bool
+	symbolicOutput            *SymbolicOutputInfos
+	symbolicOutputSet         bool
+	makeNames                 *MakeNamesInfo
+	makeNamesSet              bool
+	baseJarJarProviderData    *BaseJarJarProviderData
+	baseJarJarProviderDataSet bool
+
+	ninjaPhonies map[string]NinjaPhoniesGlobsInfo
+
+	runtimeHostToolDeps Paths
 }
 
 var _ ModuleContext = &moduleContext{}
@@ -420,7 +450,7 @@ func (m *moduleContext) Variable(pctx PackageContext, name, value string) {
 func (m *moduleContext) Rule(pctx PackageContext, name string, params blueprint.RuleParams,
 	argNames ...string) blueprint.Rule {
 
-	if m.config.UseRemoteBuild() {
+	if m.config.REWrapperRemoteBuild() {
 		if params.Pool == nil {
 			// When USE_REWRAPPER=true is set and the rule is not supported by RBE,
 			// restrict jobs to the local parallelism value
@@ -627,12 +657,12 @@ func (m *moduleContext) InstallFileWithExtraFilesZip(installPath InstallPath, na
 
 func (m *moduleContext) PackageFile(installPath InstallPath, name string, srcPath Path) PackagingSpec {
 	fullInstallPath := installPath.Join(m, name)
-	return m.packageFile(fullInstallPath, srcPath, false, false)
+	return m.packageFile(fullInstallPath, srcPath, false, false, nil)
 }
 
 func (m *moduleContext) PackageFileWithFakeFullInstall(installPath InstallPath, name string, srcPath Path) PackagingSpec {
 	fullInstallPath := installPath.Join(m, name)
-	return m.packageFile(fullInstallPath, srcPath, false, true)
+	return m.packageFile(fullInstallPath, srcPath, false, true, nil)
 }
 
 func (m *moduleContext) getAconfigPaths() Paths {
@@ -656,9 +686,14 @@ func (m *moduleContext) getOwnerAndOverrides() (string, []string) {
 	return owner, overrides
 }
 
-func (m *moduleContext) packageFile(fullInstallPath InstallPath, srcPath Path, executable bool, requiresFullInstall bool) PackagingSpec {
+func (m *moduleContext) packageFile(fullInstallPath InstallPath, srcPath Path, executable bool, requiresFullInstall bool,
+	extraZip *extraFilesZip) PackagingSpec {
 	licenseFiles := m.Module().EffectiveLicenseFiles()
 	owner, overrides := m.getOwnerAndOverrides()
+	zip := OptionalPath{}
+	if extraZip != nil {
+		zip = OptionalPathForPath(extraZip.zip)
+	}
 	spec := PackagingSpec{
 		relPathInPackage:      Rel(m, fullInstallPath.PartitionDir(), fullInstallPath.String()),
 		srcPath:               srcPath,
@@ -676,6 +711,7 @@ func (m *moduleContext) packageFile(fullInstallPath InstallPath, srcPath Path, e
 		installInSanitizerDir: m.InstallInSanitizerDir(),
 		variation:             m.ModuleSubDir(),
 		prebuilt:              IsModulePrebuilt(m, m.Module()),
+		extraZip:              zip,
 	}
 	m.packagingSpecs = append(m.packagingSpecs, spec)
 	return spec
@@ -731,10 +767,10 @@ func (m *moduleContext) installFile(installPath InstallPath, name string, srcPat
 
 			extraCmds := ""
 			if extraZip != nil {
-				extraCmds += fmt.Sprintf(" && ( unzip -qDD -d '%s' '%s' 2>&1 | grep -v \"zipfile is empty\"; exit $${PIPESTATUS[0]} )",
-					extraZip.dir.String(), extraZip.zip.String())
-				extraCmds += " || ( code=$$?; if [ $$code -ne 0 -a $$code -ne 1 ]; then exit $$code; fi )"
-				implicitDeps = append(implicitDeps, extraZip.zip)
+				zipSync := m.Config().HostToolPath(m, "zipsync")
+				extraCmds += fmt.Sprintf(" && %s --keep-existing-files -d '%s' '%s'",
+					zipSync, extraZip.dir.String(), extraZip.zip.String())
+				implicitDeps = append(implicitDeps, extraZip.zip, zipSync)
 			}
 
 			var cpFlags = "-f"
@@ -765,7 +801,7 @@ func (m *moduleContext) installFile(installPath InstallPath, name string, srcPat
 		m.installFiles = append(m.installFiles, fullInstallPath)
 	}
 
-	m.packageFile(fullInstallPath, srcPath, executable, m.requiresFullInstall())
+	m.packageFile(fullInstallPath, srcPath, executable, m.requiresFullInstall(), extraZip)
 
 	if checkbuild {
 		if srcPath == nil {
@@ -1005,11 +1041,11 @@ func (m *moduleContext) TargetRequiredModuleNames() []string {
 	return m.module.TargetRequiredModuleNames()
 }
 
-func (m *moduleContext) getContainersInfo() ContainersInfo {
+func (m *moduleContext) getContainersInfo() *ContainersInfo {
 	return m.containersInfo
 }
 
-func (m *moduleContext) setContainersInfo(info ContainersInfo) {
+func (m *moduleContext) setContainersInfo(info *ContainersInfo) {
 	m.containersInfo = info
 }
 
@@ -1066,4 +1102,63 @@ func (m *moduleContext) ModulePhonyFiles(srcPaths ...Path) {
 		}
 	}
 	m.modulePhonyFiles = append(m.modulePhonyFiles, srcPaths...)
+}
+
+func (c *moduleContext) SetLogtagsInfo(info *LogtagsInfo) {
+	if c.logTagsSet {
+		panic("Cannot call SetLogtagsInfo twice")
+	}
+	c.logTags = info
+	c.logTagsSet = true
+}
+
+func (c *moduleContext) SetTestModuleInfo(info *TestModuleInformation) {
+	if c.testModuleInfoSet {
+		panic("Cannot call SetTestModuleInfo twice")
+	}
+	c.testModuleInfo = info
+	c.testModuleInfoSet = true
+}
+
+func (c *moduleContext) SetSymbolicOutputInfo(info *SymbolicOutputInfos) {
+	if c.symbolicOutputSet {
+		panic("Cannot call SetSymbolicOutputInfo twice")
+	}
+	c.symbolicOutput = info
+	c.symbolicOutputSet = true
+}
+
+func (c *moduleContext) SetMakeNamesInfo(info *MakeNamesInfo) {
+	if c.makeNamesSet {
+		panic("Cannot call SetMakeNamesInfo twice")
+	}
+	c.makeNames = info
+	c.makeNamesSet = true
+}
+
+func (c *moduleContext) SetBaseJarJarProviderData(data *BaseJarJarProviderData) {
+	if c.baseJarJarProviderDataSet {
+		panic("Cannot call SetBaseJarJarProviderData twice")
+	}
+	c.baseJarJarProviderData = data
+	c.baseJarJarProviderDataSet = true
+}
+
+func (c *moduleContext) AddRuntimeDeps(deps ...Path) {
+	if !c.Host() {
+		return
+	}
+
+	c.runtimeHostToolDeps = append(c.runtimeHostToolDeps, deps...)
+}
+
+func (c *moduleContext) AddRuntimeHostToolDeps(deps ...blueprint.HostTool) {
+	if !c.Host() {
+		return
+	}
+
+	for _, tool := range deps {
+		paths := c.Config().HostToolAndDepsPathsFromHostTool(c, tool)
+		c.AddRuntimeDeps(paths...)
+	}
 }

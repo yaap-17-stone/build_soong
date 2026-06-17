@@ -30,31 +30,37 @@ import (
 	"github.com/google/blueprint/proptools"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 var (
 	extractMatchingApex = pctx.StaticRule(
 		"extractMatchingApex",
 		blueprint.RuleParams{
-			Command: `rm -rf "$out" && ` +
-				`${extract_apks} -o "${out}" -allow-prereleased=${allow-prereleased} ` +
-				`-sdk-version=${sdk-version} -skip-sdk-check=${skip-sdk-check} -abis=${abis} ` +
-				`-screen-densities=all -extract-single ` +
+			Command2: blueprint.NewCommand(
+				android.Rm, ` -rf "$out" && `,
+				extract_apks, ` -o "${out}" -allow-prereleased=${allow-prereleased} `,
+				`-sdk-version=${sdk-version} -skip-sdk-check=${skip-sdk-check} -abis=${abis} `,
+				`-screen-densities=all -extract-single `,
 				`${in}`,
-			CommandDeps: []string{"${extract_apks}"},
+			),
 		},
 		"abis", "allow-prereleased", "sdk-version", "skip-sdk-check")
 	decompressApex = pctx.StaticRule("decompressApex", blueprint.RuleParams{
-		Command:     `rm -rf $out && ${deapexer} decompress --copy-if-uncompressed --input ${in} --output ${out}`,
-		CommandDeps: []string{"${deapexer}"},
+		Command2: blueprint.NewCommand(
+			android.Rm, ` -rf $out && `, deapexer, ` decompress --copy-if-uncompressed --input ${in} --output ${out}`,
+		),
 		Description: "decompress $out",
 	})
 	// Compares the declared apps of `prebuilt_apex` with the actual apks
 	validateApkInPrebuiltApex = pctx.StaticRule("validateApkinPrebuiltApex", blueprint.RuleParams{
-		Command: `rm -rf ${out} ${actualApks} &&` +
-			` ${apex_ls} ${in} | grep apk$$ | awk -F '/' '{print $$NF}' | sort -u > ${actualApks} &&` +
-			` cmp -s ${expectedApks} ${actualApks} && touch ${out}` +
-			` || (echo "Found diffs between "apps" property of ${apexName} and actual contents of ${in}.` +
-			` Please ensure that all apk-in-apexes are declared in 'apps' property." && exit 1)`,
-		CommandDeps: []string{"${apex_ls}"},
+		Command2: blueprint.NewCommand(
+			android.Rm, ` -rf ${out} ${actualApks} && `,
+			apex_ls, ` ${in} | `, android.Grep, ` apk$$ | `, android.Awk, ` -F '/' '{print $$NF}' | `,
+			android.Sort, ` -u > ${actualApks} && `,
+			android.Cmp, ` -s ${expectedApks} ${actualApks} && `, android.Touch, ` ${out} `,
+			`|| ( `, android.Echo, ` "Found diffs between "apps" property of ${apexName} and actual contents of ${in}. `,
+			`Please ensure that all apk-in-apexes are declared in 'apps' property." && exit 1)`,
+		),
 		Description: "validate apk in prebuilt_apex $out",
 	}, "expectedApks", "actualApks", "apexName")
 )
@@ -67,6 +73,8 @@ type prebuilt interface {
 type prebuiltCommon struct {
 	android.ModuleBase
 	java.Dexpreopter
+	blueprint.ModuleUsesIncrementalWalkDeps
+
 	prebuilt android.Prebuilt
 
 	// Properties common to both prebuilt_apex and apex_set.
@@ -128,11 +136,11 @@ type PrebuiltCommonProperties struct {
 
 	// List of bootclasspath fragments inside this prebuilt APEX bundle and for which this APEX
 	// bundle will create an APEX variant.
-	Exported_bootclasspath_fragments []string
+	Exported_bootclasspath_fragments proptools.Configurable[[]string]
 
 	// List of systemserverclasspath fragments inside this prebuilt APEX bundle and for which this
 	// APEX bundle will create an APEX variant.
-	Exported_systemserverclasspath_fragments []string
+	Exported_systemserverclasspath_fragments proptools.Configurable[[]string]
 
 	// Path to the .prebuilt_info file of the prebuilt apex.
 	// In case of mainline modules, the .prebuilt_info file contains the build_id that was used to
@@ -204,6 +212,10 @@ func (p *prebuiltCommon) initApexFilesForAndroidMk(ctx android.ModuleContext) {
 	// If this apex contains a system server jar, then the dexpreopt artifacts should be added as required
 	p.systemServerDexpreoptInstalls = append(p.systemServerDexpreoptInstalls, p.Dexpreopter.ApexSystemServerDexpreoptInstalls()...)
 	p.systemServerDexJars = append(p.systemServerDexJars, p.Dexpreopter.ApexSystemServerDexJars()...)
+}
+
+func (p *prebuiltCommon) DepsMutator(ctx android.BottomUpMutatorContext) {
+	p.Dexpreopter.DepsMutator(ctx)
 }
 
 // If this prebuilt has system server jar, create the rules to dexpreopt it and install it alongside the prebuilt apex
@@ -291,9 +303,9 @@ func (p *prebuiltCommon) AndroidMkEntries() []android.AndroidMkEntries {
 	return entriesList
 }
 
-func (p *prebuiltCommon) hasExportedDeps() bool {
-	return len(p.prebuiltCommonProperties.Exported_bootclasspath_fragments) > 0 ||
-		len(p.prebuiltCommonProperties.Exported_systemserverclasspath_fragments) > 0
+func (p *prebuiltCommon) hasExportedDeps(ctx android.ModuleContext) bool {
+	return len(p.prebuiltCommonProperties.Exported_bootclasspath_fragments.GetOrDefault(ctx, nil)) > 0 ||
+		len(p.prebuiltCommonProperties.Exported_systemserverclasspath_fragments.GetOrDefault(ctx, nil)) > 0
 }
 
 type appInPrebuiltApexDepTag struct {
@@ -308,13 +320,13 @@ var appInPrebuiltApexTag = appInPrebuiltApexDepTag{}
 func (p *prebuiltCommon) prebuiltApexContentsDeps(ctx android.BottomUpMutatorContext) {
 	module := ctx.Module()
 
-	for _, dep := range p.prebuiltCommonProperties.Exported_bootclasspath_fragments {
+	for _, dep := range p.prebuiltCommonProperties.Exported_bootclasspath_fragments.GetOrDefault(ctx, nil) {
 		prebuiltDep := android.PrebuiltNameFromSource(dep)
 		ctx.AddDependency(module, exportedBootclasspathFragmentTag, prebuiltDep)
 		ctx.AddDependency(module, fragmentInApexTag, prebuiltDep)
 	}
 
-	for _, dep := range p.prebuiltCommonProperties.Exported_systemserverclasspath_fragments {
+	for _, dep := range p.prebuiltCommonProperties.Exported_systemserverclasspath_fragments.GetOrDefault(ctx, nil) {
 		prebuiltDep := android.PrebuiltNameFromSource(dep)
 		ctx.AddDependency(module, exportedSystemserverclasspathFragmentTag, prebuiltDep)
 	}
@@ -325,6 +337,7 @@ func (m *prebuiltCommon) GetDepInSameApexChecker() android.DepInSameApexChecker 
 	return ApexPrebuiltDepInSameApexChecker{}
 }
 
+// @auto-generate: gob
 type ApexPrebuiltDepInSameApexChecker struct {
 	android.BaseDepInSameApexChecker
 }
@@ -593,7 +606,7 @@ func (p *Prebuilt) ApexTransitionMutatorMutate(ctx android.BottomUpMutatorContex
 
 // creates the build rules to deapex the prebuilt, and returns a deapexerInfo
 func (p *prebuiltCommon) getDeapexerInfo(ctx android.ModuleContext, apexFile android.Path) *android.DeapexerInfo {
-	if !p.hasExportedDeps() {
+	if !p.hasExportedDeps(ctx) {
 		// nothing to do
 		return nil
 	}
@@ -658,7 +671,8 @@ func (p *Prebuilt) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 
 	p.apexKeysPath = writeApexKeys(ctx, p)
 	// TODO(jungjw): Check the key validity.
-	p.inputApex = android.PathForModuleSrc(ctx, p.properties.prebuiltApexSelector(ctx, ctx.Module()))
+	prebuiltApex := p.properties.prebuiltApexSelector(ctx, ctx.Module())
+	p.inputApex = android.PathForModuleSrc(ctx, prebuiltApex)
 	p.installDir = android.PathForModuleInstall(ctx, "apex")
 	p.installFilename = p.InstallFilename()
 	if !strings.HasSuffix(p.installFilename, imageApexSuffix) {
@@ -666,7 +680,7 @@ func (p *Prebuilt) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	}
 	p.outputApex = android.PathForModuleOut(ctx, p.installFilename)
 	ctx.Build(pctx, android.BuildParams{
-		Rule:   android.Cp,
+		Rule:   android.CpRule,
 		Input:  p.inputApex,
 		Output: p.outputApex,
 	})
@@ -708,6 +722,8 @@ func (p *Prebuilt) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	ctx.SetOutputFiles(android.Paths{p.outputApex}, "")
 
 	android.SetProvider(ctx, filesystem.ApexKeyPathInfoProvider, filesystem.ApexKeyPathInfo{p.apexKeysPath})
+
+	ctx.ComplianceMetadataInfo().SetPrebuiltSrc(ctx, prebuiltApex)
 }
 
 // Creates a timestamp file that will be used to validate that there is no mismtach
@@ -932,7 +948,7 @@ func (a *ApexSet) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	a.outputApex = android.PathForModuleOut(ctx, a.installFilename)
 
 	// Build the output APEX. If compression is not enabled, make sure the output is not compressed even if the input is compressed
-	buildRule := android.Cp
+	buildRule := android.CpRule
 	if !ctx.Config().ApexCompressionEnabled() {
 		buildRule = decompressApex
 	}

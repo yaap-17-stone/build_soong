@@ -120,6 +120,7 @@ func TestBootJarsMarshaling(t *testing.T) {
 }
 
 func assertStringEquals(t *testing.T, expected, actual string) {
+	t.Helper()
 	if actual != expected {
 		t.Errorf("expected %q found %q", expected, actual)
 	}
@@ -282,10 +283,12 @@ func TestPartialCompile(t *testing.T) {
 		isEngBuild bool
 		expected   partialCompileFlags
 	}{
-		{"", true, defaultPartialCompileFlags},
+		{"", true, falsePartialCompileFlags},
+		{"default", true, defaultPartialCompileFlags},
+		{"default", false, falsePartialCompileFlags},
 		{"false", true, falsePartialCompileFlags},
 		{"true", true, truePartialCompileFlags},
-		{"true", false, partialCompileFlags{}},
+		{"true", false, falsePartialCompileFlags},
 		{"all", true, allPartialCompileFlags},
 
 		// This verifies both use_d8 and the processing order.

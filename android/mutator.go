@@ -31,11 +31,11 @@ import (
 // collateGloballyRegisteredMutators constructs the list of mutators that have been registered
 // with the InitRegistrationContext and will be used at runtime.
 func collateGloballyRegisteredMutators() sortableComponents {
-	return collateRegisteredMutators(preArch, preDeps, postDeps, postApex, finalDeps)
+	return collateRegisteredMutators(prePartial, preArch, preDeps, postDeps, postApex, finalDeps)
 }
 
 // collateRegisteredMutators constructs a single list of mutators from the separate lists.
-func collateRegisteredMutators(preArch, preDeps, postDeps, postApex, finalDeps []RegisterMutatorFunc) sortableComponents {
+func collateRegisteredMutators(prePartial, preArch, preDeps, postDeps, postApex, finalDeps []RegisterMutatorFunc) sortableComponents {
 	mctx := &registerMutatorsContext{}
 
 	register := func(funcs []RegisterMutatorFunc) {
@@ -43,6 +43,10 @@ func collateRegisteredMutators(preArch, preDeps, postDeps, postApex, finalDeps [
 			f(mctx)
 		}
 	}
+
+	register(prePartial)
+
+	register([]RegisterMutatorFunc{registerPartialMutator})
 
 	register(preArch)
 
@@ -74,7 +78,8 @@ type RegisterMutatorsContext interface {
 
 type RegisterMutatorFunc func(RegisterMutatorsContext)
 
-var preArch = []RegisterMutatorFunc{
+// Mutators that run before partial analysis logic kicks in.
+var prePartial = []RegisterMutatorFunc{
 	RegisterNamespaceMutator,
 
 	// Check the visibility rules are valid.
@@ -134,7 +139,9 @@ var preArch = []RegisterMutatorFunc{
 	// a DefaultableHook can be either a prebuilt or a source module with a matching
 	// prebuilt.
 	RegisterPrebuiltsPreArchMutators,
+}
 
+var preArch = []RegisterMutatorFunc{
 	// Gather the licenses properties for all modules for use during expansion and enforcement.
 	//
 	// This must come after the defaults mutators to ensure that any licenses supplied
@@ -163,14 +170,38 @@ var preDeps = []RegisterMutatorFunc{
 var postDeps = []RegisterMutatorFunc{
 	registerPathDepsMutator,
 	RegisterPrebuiltsPostDepsMutators,
-	RegisterVisibilityRuleEnforcer,
 	registerNeverallowMutator,
-	RegisterOverridePostDepsMutators,
+
+	// Mutators for override/overridable modules. All the fun happens in these functions.
+	// It is critical to keep them in this order and not put any order mutators between them.
+	// We group Override and Visibility logic in this anonymous function to enforce that atomicity
+	// and prevent accidental reordering or injections during registration.
+	func(ctx RegisterMutatorsContext) {
+		RegisterOverrideDepsPostDepsMutators(ctx)
+
+		// The VisibilityRuleEnforcer must run before PrebuiltPostDepsMutator and
+		// replaceDepsOnOverridingModuleMutator.
+		// Visibility checks are strictly enforced on direct dependencies only.
+		// If run later, the mutators might mistakenly check visibility on
+		// transitive dependencies that have been promoted.
+		RegisterVisibilityRuleEnforcer(ctx)
+
+		// Because overridableModuleDepsMutator is run after PrebuiltPostDepsMutator,
+		// prebuilt's ReplaceDependencies doesn't affect to those deps added by
+		// overridable properties. By running PrebuiltPostDepsMutator again after
+		// overridableModuleDepsMutator, deps via overridable properties
+		// can be replaced with prebuilts.
+		RegisterReplaceDepsPostDepsMutators(ctx)
+	},
 }
 
 var postApex = []RegisterMutatorFunc{}
 
 var finalDeps = []RegisterMutatorFunc{}
+
+func PrePartialMutators(f RegisterMutatorFunc) {
+	prePartial = append(prePartial, f)
+}
 
 func PreArchMutators(f RegisterMutatorFunc) {
 	preArch = append(preArch, f)
@@ -201,7 +232,7 @@ type BottomUpMutatorContext interface {
 	// dependency (some entries may be nil).
 	//
 	// This method will pause until the new dependencies have had the current mutator called on them.
-	AddDependency(module blueprint.Module, tag blueprint.DependencyTag, name ...string) []Module
+	AddDependency(module blueprint.Module, tag blueprint.DependencyTag, name ...string) []ModuleProxy
 
 	// AddReverseDependency adds a dependency from the destination to the given module.
 	// Does not affect the ordering of the current mutator pass, but will be ordered
@@ -217,7 +248,7 @@ type BottomUpMutatorContext interface {
 	// all the non-local variations of the current module, plus the variations argument.
 	//
 	// This method will pause until the new dependencies have had the current mutator called on them.
-	AddVariationDependencies(variations []blueprint.Variation, tag blueprint.DependencyTag, names ...string) []Module
+	AddVariationDependencies(variations []blueprint.Variation, tag blueprint.DependencyTag, names ...string) []ModuleProxy
 
 	// AddReverseVariationDependency adds a dependency from the named module to the current
 	// module. The given variations will be added to the current module's varations, and then the
@@ -240,7 +271,11 @@ type BottomUpMutatorContext interface {
 	// dependency only needs to match the supplied variations.
 	//
 	// This method will pause until the new dependencies have had the current mutator called on them.
-	AddFarVariationDependencies([]blueprint.Variation, blueprint.DependencyTag, ...string) []Module
+	AddFarVariationDependencies([]blueprint.Variation, blueprint.DependencyTag, ...string) []ModuleProxy
+
+	// Adds dependencies to the Soong defined host tool modules. This should be called
+	// to utilize the tool in [RuleBuilderCommand.BuiltTool].
+	AddHostToolDependencies(...string)
 
 	// ReplaceDependencies finds all the variants of the module with the specified name, then
 	// replaces all dependencies onto those variants with the current variant of this module.
@@ -279,7 +314,8 @@ var (
 type bottomUpMutatorContext struct {
 	bp blueprint.BottomUpMutatorContext
 	baseModuleContext
-	finalPhase bool
+	finalPhase        bool
+	addedHostToolDeps map[string]struct{}
 }
 
 // callers must immediately follow the call to this function with defer bottomUpMutatorContextPool.Put(mctx).
@@ -302,7 +338,7 @@ func (x *registerMutatorsContext) BottomUp(name string, m BottomUpMutator) Mutat
 		if a, ok := ctx.Module().(Module); ok {
 			mctx := bottomUpMutatorContextFactory(ctx, a, finalPhase)
 			defer bottomUpMutatorContextPool.Put(mctx)
-			if mctx.config.captureBuild {
+			if mctx.config.captureBuild && ctx.CaptureModuleForTests() {
 				mctx.config.modulesForTests.Insert(mctx.ModuleName(), mctx.Module())
 			}
 			m(mctx)
@@ -386,6 +422,9 @@ func (mutator *mutator) register(ctx *Context) {
 	if mutator.mutatesGlobalState {
 		handle.MutatesGlobalState()
 	}
+	if mutator.prePartial {
+		handle.PrePartial()
+	}
 }
 
 type MutatorHandle interface {
@@ -418,6 +457,9 @@ type MutatorHandle interface {
 	// MutatesGlobalState marks the mutator as modifying global state, which prevents coalescing
 	// adjacent mutators into a single mutator pass.
 	MutatesGlobalState() MutatorHandle
+
+	// PrePartial marks the mutator to be the pre-partial marker mutator.
+	PrePartial() MutatorHandle
 }
 
 type TransitionMutatorHandle interface {
@@ -467,6 +509,11 @@ func (mutator *mutator) NeverFar() MutatorHandle {
 	return mutator
 }
 
+func (mutator *mutator) PrePartial() MutatorHandle {
+	mutator.prePartial = true
+	return mutator
+}
+
 func RegisterComponentsMutator(ctx RegisterMutatorsContext) {
 	ctx.BottomUp("component-deps", componentDepsMutator)
 }
@@ -476,6 +523,14 @@ func RegisterComponentsMutator(ctx RegisterMutatorsContext) {
 // module.
 func componentDepsMutator(ctx BottomUpMutatorContext) {
 	ctx.Module().ComponentDepsMutator(ctx)
+}
+
+func partialMutator(_ BottomUpMutatorContext) {
+	// Just a marker mutator.
+}
+
+func registerPartialMutator(ctx RegisterMutatorsContext) {
+	ctx.BottomUp("partial", partialMutator).PrePartial()
 }
 
 func depsMutator(ctx BottomUpMutatorContext) {
@@ -515,11 +570,11 @@ func (b *bottomUpMutatorContext) CreateModule(factory ModuleFactory, props ...in
 	return createModule(b, factory, "_bottomUpMutatorModule", doesNotSpecifyDirectory(), props...)
 }
 
-func (b *bottomUpMutatorContext) AddDependency(module blueprint.Module, tag blueprint.DependencyTag, name ...string) []Module {
+func (b *bottomUpMutatorContext) AddDependency(module blueprint.Module, tag blueprint.DependencyTag, name ...string) []ModuleProxy {
 	if b.baseModuleContext.checkedMissingDeps() {
 		panic("Adding deps not allowed after checking for missing deps")
 	}
-	return bpModulesToModules(b.bp.AddDependency(module, tag, name...))
+	return bpModuleProxiesToModuleProxies(b.bp.AddDependency(module, tag, name...))
 }
 
 func (b *bottomUpMutatorContext) AddReverseDependency(module blueprint.Module, tag blueprint.DependencyTag, name string) {
@@ -537,20 +592,33 @@ func (b *bottomUpMutatorContext) AddReverseVariationDependency(variations []blue
 }
 
 func (b *bottomUpMutatorContext) AddVariationDependencies(variations []blueprint.Variation, tag blueprint.DependencyTag,
-	names ...string) []Module {
+	names ...string) []ModuleProxy {
 	if b.baseModuleContext.checkedMissingDeps() {
 		panic("Adding deps not allowed after checking for missing deps")
 	}
-	return bpModulesToModules(b.bp.AddVariationDependencies(variations, tag, names...))
+	return bpModuleProxiesToModuleProxies(b.bp.AddVariationDependencies(variations, tag, names...))
 }
 
 func (b *bottomUpMutatorContext) AddFarVariationDependencies(variations []blueprint.Variation,
-	tag blueprint.DependencyTag, names ...string) []Module {
+	tag blueprint.DependencyTag, names ...string) []ModuleProxy {
 	if b.baseModuleContext.checkedMissingDeps() {
 		panic("Adding deps not allowed after checking for missing deps")
 	}
 
-	return bpModulesToModules(b.bp.AddFarVariationDependencies(variations, tag, names...))
+	return bpModuleProxiesToModuleProxies(b.bp.AddFarVariationDependencies(variations, tag, names...))
+}
+
+func (b *bottomUpMutatorContext) AddHostToolDependencies(tools ...string) {
+	if b.addedHostToolDeps == nil {
+		b.addedHostToolDeps = make(map[string]struct{})
+	}
+	for _, tool := range tools {
+		if _, ok := b.addedHostToolDeps[tool]; ok {
+			continue
+		}
+		b.addedHostToolDeps[tool] = struct{}{}
+		b.AddFarVariationDependencies(b.Config().BuildOSTarget.Variations(), HostToolDepTag, tool)
+	}
 }
 
 func (b *bottomUpMutatorContext) ReplaceDependencies(name string) {
@@ -580,4 +648,12 @@ func bpModuleToModule(bpModule blueprint.Module) Module {
 		return bpModule.(Module)
 	}
 	return nil
+}
+
+func bpModuleProxiesToModuleProxies(bpModules []blueprint.ModuleProxy) []ModuleProxy {
+	modules := make([]ModuleProxy, len(bpModules))
+	for i, bpModule := range bpModules {
+		modules[i] = ModuleProxy{bpModule}
+	}
+	return modules
 }

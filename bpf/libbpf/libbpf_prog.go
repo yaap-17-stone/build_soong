@@ -43,10 +43,11 @@ var (
 
 	libbpfProgCcRule = pctx.AndroidStaticRule("libbpfProgCcRule",
 		blueprint.RuleParams{
-			Depfile:     "${out}.d",
-			Deps:        blueprint.DepsGCC,
-			Command:     "$relPwd $ccCmd --target=bpf -c $cFlags -MD -MF ${out}.d -o $out $in",
-			CommandDeps: []string{"$ccCmd"},
+			Depfile:         "${out}.d",
+			Deps:            blueprint.DepsGCC,
+			Command:         "$relPwd $ccCmd --target=bpf -mcpu=v1 -c $cFlags -MD -MF ${out}.d -o $out $in",
+			CommandDeps:     []string{"$ccCmd"},
+			SandboxDisabled: true,
 		},
 		"ccCmd", "cFlags")
 
@@ -54,7 +55,8 @@ var (
 		blueprint.RuleParams{
 			Command: `$stripCmd --strip-unneeded --remove-section=.rel.BTF ` +
 				`--remove-section=.rel.BTF.ext $in -o $out`,
-			CommandDeps: []string{"$stripCmd"},
+			CommandDeps:     []string{"$stripCmd"},
+			SandboxDisabled: true,
 		},
 		"stripCmd")
 
@@ -186,7 +188,8 @@ func (libbpf *libbpfProg) GenerateAndroidBuildActions(ctx android.ModuleContext)
 	ctx.VisitDirectDepsProxy(func(dep android.ModuleProxy) {
 		depTag := ctx.OtherModuleDependencyTag(dep)
 		if depTag == libbpfProgDepTag {
-			if info, ok := android.OtherModuleProvider(ctx, dep, android.GeneratedSourceInfoProvider); ok {
+			if commonInfo, ok := android.OtherModuleProvider(ctx, dep, android.CommonModuleInfoProvider); ok && commonInfo.GeneratedSource != nil {
+				info := commonInfo.GeneratedSource
 				cFlagsDeps = append(cFlagsDeps, info.GeneratedDeps...)
 				dirs := info.GeneratedHeaderDirs
 				for _, dir := range dirs {

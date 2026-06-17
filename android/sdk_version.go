@@ -21,6 +21,8 @@ import (
 	"strings"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 type SdkContext interface {
 	// SdkVersion returns SdkSpec that corresponds to the sdk_version property of the current module
 	SdkVersion(ctx ConfigContext) SdkSpec
@@ -48,7 +50,6 @@ type SdkKind int
 const (
 	SdkInvalid SdkKind = iota
 	SdkNone
-	SdkToolchain // API surface provided by ART to compile other API domains
 	SdkCore
 	SdkCorePlatform
 	SdkIntraCore // API surface provided by one core module to another
@@ -86,8 +87,6 @@ func (k SdkKind) String() string {
 		return "module-lib"
 	case SdkSystemServer:
 		return "system-server"
-	case SdkToolchain:
-		return "toolchain"
 	default:
 		return "invalid"
 	}
@@ -160,6 +159,7 @@ func (k SdkKind) DefaultExportableJavaLibraryName() string {
 }
 
 // SdkSpec represents the kind and the version of an SDK for a module to build against
+// @auto-generate: gob
 type SdkSpec struct {
 	Kind     SdkKind
 	ApiLevel ApiLevel
@@ -198,7 +198,6 @@ func (s SdkSpec) Stable() bool {
 	default:
 		panic(fmt.Errorf("unknown SdkKind=%v", s.Kind))
 	}
-	return false
 }
 
 // PrebuiltSdkAvailableForUnbundledBuild tells whether this SdkSpec can have a prebuilt SDK
@@ -255,7 +254,6 @@ func (s SdkSpec) UsePrebuilt(ctx EarlyModuleContext) bool {
 		if s.Kind != SdkPublic && s.Kind != SdkSystem && s.Kind != SdkTest &&
 			s.Kind != SdkTestFrameworksCore && s.Kind != SdkModule && s.Kind != SdkSystemServer {
 			panic(fmt.Errorf("prebuilt SDK is not not available for SdkKind=%q", s.Kind))
-			return false
 		}
 		// numbered SDKs are always from prebuilt
 		return true

@@ -24,7 +24,13 @@ import (
 var (
 	x86_64Cflags = []string{
 		// Help catch common 32/64-bit errors.
+		// Common to all LP64 architectures.
 		"-Werror=implicit-function-declaration",
+
+		// For stack allocations larger than a page, touch each page immediately
+		// to ensure we hit the guard page on stack overflow.
+		// Common to all LP64 architectures.
+		"-fstack-clash-protection",
 	}
 
 	x86_64Cppflags = []string{}
@@ -60,6 +66,9 @@ var (
 		},
 		"ivybridge": []string{
 			"-march=core-avx-i",
+		},
+		"pantherlake": []string{
+			"-march=pantherlake",
 		},
 		"sandybridge": []string{
 			"-march=corei7",
@@ -147,8 +156,10 @@ func (t *toolchainX86_64) ClangTriple() string {
 	return "x86_64-linux-android"
 }
 
-func (t *toolchainX86_64) ToolchainLdflags() string {
-	return "${config.X86_64ToolchainLdflags}"
+func (t *toolchainX86_64) ToolchainLdflags() FlagsWithDeps {
+	return FlagsWithDeps{
+		Flags: "${config.X86_64ToolchainLdflags}",
+	}
 }
 
 func (t *toolchainX86_64) ToolchainCflags() string {
@@ -163,8 +174,10 @@ func (t *toolchainX86_64) Cppflags() string {
 	return "${config.X86_64Cppflags}"
 }
 
-func (t *toolchainX86_64) Ldflags() string {
-	return "${config.X86_64Ldflags}"
+func (t *toolchainX86_64) Ldflags(ctx ToolchainFlagsContext) FlagsWithDeps {
+	return FlagsWithDeps{
+		Flags: "${config.X86_64Ldflags}",
+	}
 }
 
 func (t *toolchainX86_64) YasmFlags() string {

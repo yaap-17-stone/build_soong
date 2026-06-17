@@ -14,7 +14,7 @@ import (
 
 var fileSepRegex = regexp.MustCompile("[^[:space:]]+")
 
-func GenerateIncrementalInput(jarFilePath, outputDir, packageOutputDir, dexTarget, deps string) {
+func GenerateIncrementalInput(jarFilePath, outputDir, packageOutputDir, dexTarget, deps string, tools []string) {
 	inputPcState := dexTarget + ".input.pc_state"
 	depsPcState := dexTarget + ".deps.pc_state"
 
@@ -23,7 +23,6 @@ func GenerateIncrementalInput(jarFilePath, outputDir, packageOutputDir, dexTarge
 	includeAllPackages := false
 
 	version := ""
-	tools := []string{}
 	addF, delF, chF := findInputDelta(version, tools, []string{jarFilePath}, inputPcState, dexTarget, true)
 
 	depsList := readRspFile(deps)
@@ -177,11 +176,15 @@ func flattenChanges(root *fid_lib.FileList) ([]string, []string, []string) {
 	var allChangedFiles []string
 
 	for _, addition := range root.Additions {
-		allAdditions = append(allAdditions, addition)
+		allAdditions = append(allAdditions, addition.Name)
+		recAdd, _, _ := flattenChanges(&addition)
+		allAdditions = append(allAdditions, recAdd...)
 	}
 
 	for _, del := range root.Deletions {
-		allDeletions = append(allDeletions, del)
+		allDeletions = append(allDeletions, del.Name)
+		_, recDel, _ := flattenChanges(&del)
+		allDeletions = append(allDeletions, recDel...)
 	}
 
 	for _, ch := range root.Changes {

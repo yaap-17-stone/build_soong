@@ -34,6 +34,8 @@ import (
 	"github.com/google/blueprint/proptools"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 var pctx = android.NewPackageContext("android/soong/filesystem")
 
 func init() {
@@ -43,7 +45,6 @@ func init() {
 	pctx.HostBinToolVariable("fs_config", "fs_config")
 	pctx.HostBinToolVariable("SoongZipCmd", "soong_zip")
 	pctx.HostBinToolVariable("check_radio_versions", "check_radio_versions")
-	pctx.Import("android/soong/kernel")
 }
 
 func registerBuildComponents(ctx android.RegistrationContext) {
@@ -55,6 +56,7 @@ func registerBuildComponents(ctx android.RegistrationContext) {
 	ctx.RegisterModuleType("avb_gen_vbmeta_image", avbGenVbmetaImageFactory)
 	ctx.RegisterModuleType("avb_gen_vbmeta_image_defaults", avbGenVbmetaImageDefaultsFactory)
 	ctx.RegisterModuleType("bootimg", BootimgFactory)
+	ctx.RegisterModuleType("raw_binary", rawBinaryFactory)
 }
 
 func registerMutators(ctx android.RegistrationContext) {
@@ -66,29 +68,34 @@ func registerMutators(ctx android.RegistrationContext) {
 var (
 	// Remember to add referenced files to implicits!
 	textFileProcessorRule = pctx.AndroidStaticRule("text_file_processing", blueprint.RuleParams{
-		Command:     "build/soong/scripts/text_file_processor.py $in $out",
-		CommandDeps: []string{"build/soong/scripts/text_file_processor.py"},
+		Command:         "build/soong/scripts/text_file_processor.py $in $out",
+		CommandDeps:     []string{"build/soong/scripts/text_file_processor.py"},
+		SandboxDisabled: true,
 	})
 
 	// Remember to add the output image file as an implicit dependency!
 	installedFilesJsonRule = pctx.AndroidStaticRule("installed_files_json", blueprint.RuleParams{
-		Command:     `${fileslist} ${rootDir} > ${out}`,
-		CommandDeps: []string{"${fileslist}"},
+		Command:         `${fileslist} ${rootDir} > ${out}`,
+		CommandDeps:     []string{"${fileslist}"},
+		SandboxDisabled: true,
 	}, "rootDir")
 
 	installedFilesTxtRule = pctx.AndroidStaticRule("installed_files_txt", blueprint.RuleParams{
-		Command:     `build/make/tools/fileslist_util.py -c ${in} > ${out}`,
-		CommandDeps: []string{"build/make/tools/fileslist_util.py"},
+		Command:         `build/make/tools/fileslist_util.py -c ${in} > ${out}`,
+		CommandDeps:     []string{"build/make/tools/fileslist_util.py"},
+		SandboxDisabled: true,
 	})
 	fsConfigRule = pctx.AndroidStaticRule("fs_config_rule", blueprint.RuleParams{
-		Command:     `(cd ${rootDir}; find . -type d | sed 's,$$,/,'; find . \! -type d) | cut -c 3- | sort | sed 's,^,${prefix},' | ${fs_config} -C -D ${rootDir} -R "${prefix}" > ${out}`,
-		CommandDeps: []string{"${fs_config}"},
+		Command:         `(cd ${rootDir}; find . -type d | sed 's,$$,/,'; find . \! -type d) | cut -c 3- | sort | sed 's,^,${prefix},' | ${fs_config} -C -D ${rootDir} -R "${prefix}" > ${out}`,
+		CommandDeps:     []string{"${fs_config}"},
+		SandboxDisabled: true,
 	}, "rootDir", "prefix")
 	zipFiles = pctx.AndroidStaticRule("SnapshotZipFiles", blueprint.RuleParams{
-		Command:        `${SoongZipCmd}  -r $out.rsp -o $out`,
-		CommandDeps:    []string{"${SoongZipCmd}"},
-		Rspfile:        "$out.rsp",
-		RspfileContent: "$in",
+		Command:         `${SoongZipCmd}  -r $out.rsp -o $out`,
+		CommandDeps:     []string{"${SoongZipCmd}"},
+		Rspfile:         "$out.rsp",
+		RspfileContent:  "$in",
+		SandboxDisabled: true,
 	})
 )
 
@@ -96,6 +103,7 @@ type filesystem struct {
 	android.ModuleBase
 	android.PackagingBase
 	android.DefaultableModuleBase
+	blueprint.ModuleUsesIncrementalWalkDeps
 
 	properties FilesystemProperties
 
@@ -183,7 +191,7 @@ type FilesystemProperties struct {
 
 	// Type of the filesystem. Currently, ext4, erofs, cpio, and compressed_cpio are supported. Default
 	// is ext4.
-	Type *string
+	Type proptools.Configurable[string]
 
 	// Identifies which partition this is for //visibility:any_system_image (and others) visibility
 	// checks, and will be used in the future for API surface checks.
@@ -213,6 +221,11 @@ type FilesystemProperties struct {
 
 	// Seconds since unix epoch to override timestamps of file entries
 	Fake_timestamp *string
+
+	// To produce hermetic filesystems, the timestamp of the file entries is pinned to a known
+	// timestamp by default.
+	// Setting `No_use_fixed_timestamp` to true will create unpinned timestamps.
+	No_use_fixed_timestamp *bool
 
 	// When set, passed to mkuserimg_mke2fs --mke2fs_uuid & --mke2fs_hash_seed.
 	// Otherwise, they'll be set as random which might cause indeterministic build output.
@@ -269,6 +282,12 @@ type FilesystemProperties struct {
 	// Whether to enable per-file compression in f2fs
 	Enable_compression *bool
 
+	// F2FS block size which must be the same with the page size
+	F2fs_blocksize *int64
+
+	// Whether to format f2fs in a way that supports packed ssa feature
+	Support_f2fs_packedssa *bool
+
 	// Whether this partition is not supported by flashall.
 	// If true, this partition will not be included in the `updatedpackage` dist artifact.
 	No_flashall *bool
@@ -300,16 +319,18 @@ type AndroidFilesystemDeps struct {
 type ErofsProperties struct {
 	// Compressor and Compression level passed to mkfs.erofs. e.g. (lz4hc,9)
 	// Please see external/erofs-utils/README for complete documentation.
-	Compressor *string
+	Compressor proptools.Configurable[string]
 
 	// Used as --compress-hints for mkfs.erofs
-	Compress_hints *string `android:"path"`
+	Compress_hints proptools.Configurable[string] `android:"path"`
 
 	Sparse *bool
 
 	Pcluster_size *int64
 
 	Block_size *int64
+
+	Enable_dedupe *bool
 }
 
 // Additional properties required to generate f2fs FS partitions.
@@ -442,11 +463,12 @@ func (f *filesystem) DepsMutator(ctx android.BottomUpMutatorContext) {
 	for _, partition := range f.properties.Include_files_of {
 		ctx.AddDependency(ctx.Module(), interPartitionInstallDependencyTag, partition)
 	}
-	// TODO: remove this once android_system_image_prebuilt is fully implemented.
+	// TODO: remove this once android_filesystem_prebuilt is fully implemented.
 	if f.properties.Prebuilt_module_name != nil {
 		ctx.AddDependency(ctx.Module(), android.PrebuiltDepTag, proptools.String(f.properties.Prebuilt_module_name))
 	}
 
+	ctx.AddHostToolDependencies("conv_linker_config")
 }
 
 type fsType int
@@ -478,17 +500,20 @@ func (t fsType) String() string {
 	panic(fmt.Errorf("unsupported fs type %d", t))
 }
 
+// @auto-generate: gob
 type InstalledFilesStruct struct {
 	Txt  android.Path
 	Json android.Path
 }
 
+// @auto-generate: gob
 type InstalledModuleInfo struct {
 	Name      string
 	Variation string
 	Prebuilt  bool
 }
 
+// @auto-generate: gob
 type FilesystemInfo struct {
 	// The built filesystem image
 	Output android.Path
@@ -562,6 +587,7 @@ type FilesystemInfo struct {
 // out/target/product/<device>/<partition>. This is essentially legacy behavior, maintained for
 // tools like adb sync and adevice, but we should update them to query the build system for the
 // installed files no matter where they are.
+// @auto-generate: gob
 type FullInstallPathInfo struct {
 	// RequiresFullInstall tells us if the origional module did the install to FullInstallPath
 	// already. If it's false, the android_device module needs to emit the install rule.
@@ -585,6 +611,7 @@ type FullInstallPathInfo struct {
 
 var FilesystemProvider = blueprint.NewProvider[FilesystemInfo]()
 
+// @auto-generate: gob
 type FilesystemDefaultsInfo struct{}
 
 var FilesystemDefaultsInfoProvider = blueprint.NewProvider[FilesystemDefaultsInfo]()
@@ -607,7 +634,7 @@ func GetFsTypeFromString(ctx android.EarlyModuleContext, typeStr string) fsType 
 }
 
 func (f *filesystem) fsType(ctx android.ModuleContext) fsType {
-	typeStr := proptools.StringDefault(f.properties.Type, "ext4")
+	typeStr := f.properties.Type.GetOrDefault(ctx, "ext4")
 	fsType := GetFsTypeFromString(ctx, typeStr)
 	if fsType == unknown {
 		ctx.PropertyErrorf("type", "%q not supported", typeStr)
@@ -732,7 +759,7 @@ func (f *filesystem) updateAvbInFsInfo(ctx android.ModuleContext, fsInfo *Filesy
 func (f *filesystem) gatherOverriddenModulesPackagingSpecs(ctx android.ModuleContext) {
 	f.overriddenModulesPackagingSpecs = make(map[string]depset.DepSet[android.PackagingSpec])
 	ctx.VisitDirectDepsProxyWithTag(android.OverriddenModuleDepTag, func(proxy android.ModuleProxy) {
-		f.overriddenModulesPackagingSpecs[proxy.Name()] = android.OtherModuleProviderOrDefault(ctx, proxy, android.InstallFilesProvider).TransitivePackagingSpecs
+		f.overriddenModulesPackagingSpecs[proxy.Name()] = android.GetInstallFiles(ctx, proxy).TransitivePackagingSpecs
 	})
 }
 
@@ -751,7 +778,7 @@ func (f *filesystem) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	if f.properties.Base_dir != nil {
 		rebasedDir = rootDir.Join(ctx, *f.properties.Base_dir)
 	}
-	builder := android.NewRuleBuilder(pctx, ctx)
+	builder := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 
 	// Wipe the root dir to get rid of leftover files from prior builds
 	builder.Command().Textf("rm -rf %s && mkdir -p %s", rootDir, rootDir)
@@ -796,9 +823,13 @@ func (f *filesystem) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 		} else {
 			ctx.PropertyErrorf("prebuilt_module_name", "must provide filesystem")
 		}
+
+		if apexKeysInfo, ok := android.OtherModuleProvider(ctx, m, ApexKeyPathInfoProvider); ok {
+			android.SetProvider(ctx, ApexKeyPathInfoProvider, apexKeysInfo)
+		}
 	})
 
-	builder = android.NewRuleBuilder(pctx, ctx)
+	builder = android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	var buildImagePropFile android.Path
 	var buildImagePropFileDeps android.Paths
 	var extraRootDirs android.Paths
@@ -847,8 +878,8 @@ func (f *filesystem) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	}
 
 	var erofsCompressHints android.Path
-	if f.properties.Erofs.Compress_hints != nil {
-		erofsCompressHints = android.PathForModuleSrc(ctx, *f.properties.Erofs.Compress_hints)
+	if v := f.properties.Erofs.Compress_hints.Get(ctx); v.IsPresent() {
+		erofsCompressHints = android.PathForModuleSrc(ctx, v.Get())
 	}
 
 	var installedFilesStructList []InstalledFilesStruct
@@ -858,7 +889,7 @@ func (f *filesystem) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 			rootDirForInstalledFiles := android.PathForModuleOut(ctx, "root_for_installed_files", "root")
 			copyToRootTimestamp := android.PathForModuleOut(ctx, "root_copy_timestamp")
 
-			builder := android.NewRuleBuilder(pctx, ctx)
+			builder := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 			builder.Command().Text("touch").Text(copyToRootTimestamp.String())
 			builder.Command().Text("rm -rf").Text(rootDirForInstalledFiles.String())
 			builder.Command().Text("mkdir -p").Text(rootDirForInstalledFiles.String())
@@ -931,10 +962,6 @@ func (f *filesystem) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	}
 
 	f.fileListFile = fileListFile
-
-	if proptools.Bool(f.properties.Unchecked_module) {
-		ctx.UncheckedModule()
-	}
 
 	f.setVbmetaPartitionProvider(ctx)
 
@@ -1016,8 +1043,8 @@ func (f *filesystem) validateVintfFragments(ctx android.ModuleContext) {
 	packagingSpecs := f.gatherFilteredPackagingSpecs(ctx)
 
 	moduleInFileSystem := func(mod android.ModuleProxy) bool {
-		for _, ps := range android.OtherModuleProviderOrDefault(
-			ctx, mod, android.InstallFilesProvider).PackagingSpecs {
+		for _, ps := range android.GetInstallFiles(
+			ctx, mod).PackagingSpecs {
 			if _, ok := packagingSpecs[ps.RelPathInPackage()]; ok {
 				return true
 			}
@@ -1034,7 +1061,7 @@ func (f *filesystem) validateVintfFragments(ctx android.ModuleContext) {
 			return true
 		}
 
-		if installInfo, ok := android.OtherModuleProvider(ctx, child, android.InstallFilesProvider); ok && len(installInfo.VintfFragmentsPaths) > 0 {
+		if installInfo := android.GetInstallFiles(ctx, child); len(installInfo.VintfFragmentsPaths) > 0 {
 			ctx.PropertyErrorf(
 				"vintf_fragments",
 				"Module %s is referenced by soong-defined filesystem %s with property vintf_fragments(%s) in use."+
@@ -1241,7 +1268,7 @@ func (f *filesystem) verifyGenericConfig(ctx android.ModuleContext) {
 		// Dynamic dependencies can be installed in a non-system partition
 		isDynamicDependency := false
 		depTag := ctx.OtherModuleDependencyTag(child)
-		if java.IsOptionalUsesLibraryDepTag(depTag) || java.IsLibDepTag(depTag) || cc.IsSharedDepTag(depTag) {
+		if java.IsOptionalUsesLibraryDepTag(depTag) || java.IsLibDepTag(depTag) || java.IsTraceReferencesDepTag(depTag) || cc.IsSharedDepTag(depTag) {
 			isDynamicDependency = true
 		}
 
@@ -1327,7 +1354,7 @@ func (f *filesystem) buildImageUsingBuildImage(
 }
 
 func (f *filesystem) buildFileContexts(ctx android.ModuleContext) android.Path {
-	builder := android.NewRuleBuilder(pctx, ctx)
+	builder := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	fcBin := android.PathForModuleOut(ctx, "file_contexts.bin")
 	builder.Command().BuiltTool("sefcontext_compile").
 		FlagWithOutput("-o ", fcBin).
@@ -1399,6 +1426,8 @@ func (f *filesystem) buildPropFile(ctx android.ModuleContext) (android.Path, and
 		addStr("timestamp", timestamp)
 	} else if ctx.Config().Getenv("USE_FIXED_TIMESTAMP_IMG_FILES") == "true" {
 		addStr("use_fixed_timestamp", "true")
+	} else if !proptools.Bool(f.properties.No_use_fixed_timestamp) {
+		addStr("use_fixed_timestamp", "true")
 	}
 
 	if uuid := proptools.String(f.properties.Uuid); uuid != "" {
@@ -1416,9 +1445,9 @@ func (f *filesystem) buildPropFile(ctx android.ModuleContext) (android.Path, and
 	switch fst {
 	case erofsType:
 		// Add erofs properties
-		addStr("erofs_default_compressor", proptools.StringDefault(f.properties.Erofs.Compressor, "lz4hc,9"))
-		if f.properties.Erofs.Compress_hints != nil {
-			src := android.PathForModuleSrc(ctx, *f.properties.Erofs.Compress_hints)
+		addStr("erofs_default_compressor", f.properties.Erofs.Compressor.GetOrDefault(ctx, "lz4hc,9"))
+		if v := f.properties.Erofs.Compress_hints.Get(ctx); v.IsPresent() {
+			src := android.PathForModuleSrc(ctx, v.Get())
 			addPath("erofs_default_compress_hints", src)
 		}
 		if proptools.BoolDefault(f.properties.Erofs.Sparse, true) {
@@ -1434,11 +1463,22 @@ func (f *filesystem) buildPropFile(ctx android.ModuleContext) (android.Path, and
 			addStr("erofs_blocksize", fmt.Sprintf("%d", *f.properties.Erofs.Block_size))
 		}
 
+		if proptools.Bool(f.properties.Erofs.Enable_dedupe) {
+			addStr("erofs_enable_dedupe", "true")
+		}
+
 	case f2fsType:
 		if proptools.BoolDefault(f.properties.F2fs.Sparse, true) {
 			// https://source.corp.google.com/h/googleplex-android/platform/build/+/88b1c67239ca545b11580237242774b411f2fed9:core/Makefile;l=2294;drc=ea8f34bc1d6e63656b4ec32f2391e9d54b3ebb6b;bpv=1;bpt=0
 			addStr("f2fs_sparse_flag", "-S")
 		}
+		if f.properties.F2fs_blocksize != nil {
+			addStr("f2fs_blocksize", strconv.FormatInt(*f.properties.F2fs_blocksize, 10))
+		}
+		if proptools.BoolDefault(f.properties.Support_f2fs_packedssa, false) {
+			addStr("f2fs_packed_ssa", "1")
+		}
+
 	case ext4Type:
 		// build_image.py implicitly adds some properties when mount point is not specified.
 		// Make built prop files does not specify mount_point, but Soong built prop files do.
@@ -1532,7 +1572,7 @@ func (f *filesystem) buildPropFileForMiscInfo(ctx android.ModuleContext) android
 	switch fst {
 	case erofsType:
 		// Add erofs properties
-		addStr("erofs_default_compressor", proptools.StringDefault(f.properties.Erofs.Compressor, "lz4hc,9"))
+		addStr("erofs_default_compressor", f.properties.Erofs.Compressor.GetOrDefault(ctx, "lz4hc,9"))
 		if proptools.BoolDefault(f.properties.Erofs.Sparse, true) {
 			// https://source.corp.google.com/h/googleplex-android/platform/build/+/88b1c67239ca545b11580237242774b411f2fed9:core/Makefile;l=2292;bpv=1;bpt=0;drc=ea8f34bc1d6e63656b4ec32f2391e9d54b3ebb6b
 			addStr("erofs_sparse_flag", "-s")
@@ -1545,11 +1585,20 @@ func (f *filesystem) buildPropFileForMiscInfo(ctx android.ModuleContext) android
 		if f.properties.Erofs.Block_size != nil {
 			addStr(f.partitionName()+"_erofs_blocksize", fmt.Sprintf("%d", *f.properties.Erofs.Block_size))
 		}
+		if proptools.Bool(f.properties.Erofs.Enable_dedupe) {
+			addStr("erofs_enable_dedupe", "true")
+		}
 
 	case f2fsType:
 		if proptools.BoolDefault(f.properties.F2fs.Sparse, true) {
 			// https://source.corp.google.com/h/googleplex-android/platform/build/+/88b1c67239ca545b11580237242774b411f2fed9:core/Makefile;l=2294;drc=ea8f34bc1d6e63656b4ec32f2391e9d54b3ebb6b;bpv=1;bpt=0
 			addStr("f2fs_sparse_flag", "-S")
+		}
+		if f.properties.F2fs_blocksize != nil {
+			addStr("f2fs_blocksize", strconv.FormatInt(*f.properties.F2fs_blocksize, 10))
+		}
+		if proptools.BoolDefault(f.properties.Support_f2fs_packedssa, false) {
+			addStr("f2fs_packed_ssa", "1")
 		}
 	}
 
@@ -1603,7 +1652,12 @@ func (f *filesystem) getAvbAddHashtreeFooterArgs(ctx android.ModuleContext) (str
 	// We're not going to add BuildFingerPrintFile as a dep. If it changed, it's likely because
 	// the build number changed, and we don't want to trigger rebuilds solely based on the build
 	// number.
-	if ctx.Module().UseGenericConfig() {
+	if f.partitionName() == "system" {
+		// The system partition has product-agnostic fingerprint.
+		avb_add_hashtree_footer_args += fmt.Sprintf(" --prop com.android.build.%s.fingerprint:{CONTENTS_OF:%s}", f.partitionName(), ctx.Config().BuildSystemFingerprintFile(ctx))
+		deps = append(deps, ctx.Config().BuildSystemFingerprintFile(ctx))
+	} else if ctx.Module().UseGenericConfig() {
+		// If non-system partition wants to use generic config, use thumbprint instead.
 		avb_add_hashtree_footer_args += fmt.Sprintf(" --prop com.android.build.%s.fingerprint:{CONTENTS_OF:%s}", f.partitionName(), ctx.Config().BuildThumbprintFile(ctx))
 		deps = append(deps, ctx.Config().BuildThumbprintFile(ctx))
 	} else {
@@ -1612,6 +1666,8 @@ func (f *filesystem) getAvbAddHashtreeFooterArgs(ctx android.ModuleContext) (str
 	}
 	if f.properties.Security_patch != nil && proptools.String(f.properties.Security_patch) != "" {
 		avb_add_hashtree_footer_args += fmt.Sprintf(" --prop com.android.build.%s.security_patch:%s", f.partitionName(), proptools.String(f.properties.Security_patch))
+	} else if android.InList(f.partitionName(), []string{"system", "system_ext", "product"}) {
+		avb_add_hashtree_footer_args += fmt.Sprintf(" --prop com.android.build.%s.security_patch:%s", f.partitionName(), ctx.Config().PlatformSecurityPatch())
 	}
 	return avb_add_hashtree_footer_args, deps
 }
@@ -1625,7 +1681,9 @@ func (f *filesystem) checkFsTypePropertyError(ctx android.ModuleContext, t fsTyp
 	}
 
 	if t != erofsType {
-		if f.properties.Erofs.Compressor != nil || f.properties.Erofs.Compress_hints != nil || f.properties.Erofs.Sparse != nil {
+		compressor := f.properties.Erofs.Compressor.Get(ctx)
+		compressHints := f.properties.Erofs.Compress_hints.Get(ctx)
+		if compressor.IsPresent() || compressHints.IsPresent() || f.properties.Erofs.Sparse != nil {
 			raiseError("erofs", fs)
 		}
 	}
@@ -1868,6 +1926,7 @@ func (f *filesystem) AndroidMkEntries() []android.AndroidMkEntries {
 					entries.SetString("LOCAL_FILESYSTEM_AVB_KEY_PATH", f.avbKey.String())
 				}
 				entries.SetString("LOCAL_FILESYSTEM_AVB_ALGORITHM", proptools.StringDefault(f.properties.Avb_algorithm, "SHA256_RSA4096"))
+				entries.SetBoolIfTrue(fmt.Sprintf("BOARD_%s_IMAGE_NO_FLASHALL", strings.ToUpper(f.Name())), proptools.Bool(f.properties.No_flashall))
 			},
 		},
 	}}
@@ -2002,11 +2061,11 @@ func (f *filesystem) getLibsForLinkerConfig(ctx android.ModuleContext) ([]androi
 
 	deps := f.gatherFilteredPackagingSpecs(ctx)
 	ctx.WalkDepsProxy(func(child, parent android.ModuleProxy) bool {
-		if !android.OtherModulePointerProviderOrDefault(ctx, child, android.CommonModuleInfoProvider).Enabled {
+		commonInfo := android.OtherModulePointerProviderOrDefault(ctx, child, android.CommonModuleInfoProvider)
+		if !commonInfo.Enabled {
 			return false
 		}
-		for _, ps := range android.OtherModuleProviderOrDefault(
-			ctx, child, android.InstallFilesProvider).PackagingSpecs {
+		for _, ps := range android.GetInstallFilesCommon(commonInfo).PackagingSpecs {
 			if _, ok := deps[ps.RelPathInPackage()]; ok && ps.Partition() == f.PartitionType() {
 				modulesInPackageByModule[child] = true
 				modulesInPackageByName[child.Name()] = true
@@ -2115,6 +2174,9 @@ func addAutogeneratedRroDeps(ctx android.BottomUpMutatorContext) {
 
 		// Auto generated rros of apps that are installed via apex are not installed in make.
 		// Only add the dependencies for non-apex variants.
+		if android.OtherModuleProviderOrDefault(ctx, child, android.PlatformAvailabilityInfoProvider).NotAvailableToPlatform {
+			return true
+		}
 		if apexInfo, ok := android.OtherModuleProvider(ctx, child, android.ApexInfoProvider); !ok || apexInfo.ApexVariationName == "" {
 			if vendorOverlay := overlayModuleName(child, "vendor"); ctx.OtherModuleExists(vendorOverlay) && thisPartition == "vendor" {
 				ctx.AddFarVariationDependencies(nil, dependencyTagWithVisibilityEnforcementBypass, vendorOverlay)
@@ -2153,7 +2215,7 @@ func (f *filesystem) checkVintf(ctx android.ModuleContext, rebasedDir android.Ou
 	checkVintfLog := android.PathForModuleOut(ctx, "vintf", "check_vintf_"+f.PartitionType()+".log")
 	extractedApexDir := android.PathForModuleOut(ctx, "vintf", "apex_extracted")
 
-	builder := android.NewRuleBuilder(pctx, ctx)
+	builder := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	// Use apexd_host to extract the apexes of this partition to an intermediate location.
 	// This intermediate location will be subsequently used by checkvintf.
 	cmd := builder.Command()

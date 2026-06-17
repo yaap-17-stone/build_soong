@@ -21,17 +21,6 @@ import (
 	"github.com/google/blueprint/proptools"
 )
 
-var (
-	copyStagingDirRule = pctx.AndroidStaticRule("copy_staging_dir", blueprint.RuleParams{
-		Command: "rsync -a --checksum $dir/ $dest && touch $out",
-	}, "dir", "dest")
-)
-
-func (a *androidDevice) copyToProductOut(ctx android.ModuleContext, builder *android.RuleBuilder, src android.Path, dest string) {
-	destPath := android.PathForModuleInPartitionInstall(ctx, "").Join(ctx, dest)
-	builder.Command().Text("rsync").Flag("-a").Flag("--checksum").Input(src).Text(destPath.String())
-}
-
 func (a *androidDevice) copyFilesToProductOutForSoongOnly(ctx android.ModuleContext) android.Path {
 	filesystemInfos := a.getFsInfos(ctx)
 
@@ -42,7 +31,7 @@ func (a *androidDevice) copyFilesToProductOutForSoongOnly(ctx android.ModuleCont
 		info := filesystemInfos[partition]
 		imgInstallPath := android.PathForModuleInPartitionInstall(ctx, "", partition+".img")
 		ctx.Build(pctx, android.BuildParams{
-			Rule:   android.Cp,
+			Rule:   android.CpRule,
 			Input:  info.Output,
 			Output: imgInstallPath,
 		})
@@ -111,7 +100,7 @@ func (a *androidDevice) copyFilesToProductOutForSoongOnly(ctx android.ModuleCont
 			if _, exists := installedFilesMap[installedFiles.Json]; !exists && installedFiles.Json != nil {
 				installPath := android.PathForModuleInPartitionInstall(ctx, "", installedFiles.Json.Base())
 				ctx.Build(pctx, android.BuildParams{
-					Rule:   android.Cp,
+					Rule:   android.CpRule,
 					Input:  installedFiles.Json,
 					Output: installPath,
 				})
@@ -121,7 +110,7 @@ func (a *androidDevice) copyFilesToProductOutForSoongOnly(ctx android.ModuleCont
 			if _, exists := installedFilesMap[installedFiles.Txt]; !exists && installedFiles.Txt != nil {
 				installPath := android.PathForModuleInPartitionInstall(ctx, "", installedFiles.Txt.Base())
 				ctx.Build(pctx, android.BuildParams{
-					Rule:   android.Cp,
+					Rule:   android.CpRule,
 					Input:  installedFiles.Txt,
 					Output: installPath,
 				})
@@ -144,7 +133,19 @@ func (a *androidDevice) copyFilesToProductOutForSoongOnly(ctx android.ModuleCont
 		for _, file := range files {
 			installPath := android.PathForModuleInPartitionInstall(ctx, "", file.Base())
 			ctx.Build(pctx, android.BuildParams{
-				Rule:   android.Cp,
+				Rule:   android.CpRule,
+				Input:  file,
+				Output: installPath,
+			})
+			deps = append(deps, installPath)
+		}
+
+		// Copy the unpacked bootloader partitions to a location expected by incremental flashstation.
+		bootloaderPartitionFiles := android.OutputFilesForModule(ctx, child, "bootloader_partitions")
+		for _, file := range bootloaderPartitionFiles {
+			installPath := android.PathForModuleInPartitionInstall(ctx, "obj", "PACKAGING", "unpacked", file.Base())
+			ctx.Build(pctx, android.BuildParams{
+				Rule:   android.CpRule,
 				Input:  file,
 				Output: installPath,
 			})
@@ -158,7 +159,7 @@ func (a *androidDevice) copyFilesToProductOutForSoongOnly(ctx android.ModuleCont
 			if info, ok := android.OtherModuleProvider(ctx, partition, BootimgInfoProvider); ok {
 				installPath := android.PathForModuleInPartitionInstall(ctx, "", type_+".img")
 				ctx.Build(pctx, android.BuildParams{
-					Rule:   android.Cp,
+					Rule:   android.CpRule,
 					Input:  info.Output,
 					Output: installPath,
 				})
@@ -173,13 +174,29 @@ func (a *androidDevice) copyFilesToProductOutForSoongOnly(ctx android.ModuleCont
 	copyBootImg(a.partitionProps.Boot_partition_name, "boot")
 	copyBootImg(a.partitionProps.Vendor_boot_partition_name, "vendor_boot")
 	copyBootImg(a.partitionProps.Vendor_kernel_boot_partition_name, "vendor_kernel_boot")
+	copyBootImg(a.partitionProps.Vendor_boot_debug_partition_name, "vendor_boot-debug")
+
+	// vendor bootconfig
+	// https://cs.android.com/android/platform/superproject/main/+/main:build/make/core/Makefile;l=1672;drc=a951ebf0198006f7fd38073a05c442d0eb92f97b
+	if a.partitionProps.Vendor_boot_partition_name != nil {
+		partition := ctx.GetDirectDepProxyWithTag(*a.partitionProps.Vendor_boot_partition_name, filesystemDepTag)
+		if info, ok := android.OtherModuleProvider(ctx, partition, BootimgInfoProvider); ok && info.Bootconfig != nil {
+			installPath := android.PathForModuleInPartitionInstall(ctx, "", "vendor-bootconfig.img")
+			ctx.Build(pctx, android.BuildParams{
+				Rule:   android.CpRule,
+				Input:  info.Bootconfig,
+				Output: installPath,
+			})
+			deps = append(deps, installPath)
+		}
+	}
 
 	// pvmfw
 	if a.deviceProps.Pvmfw.Image != nil {
 		pvmfwImg := android.PathForModuleSrc(ctx, proptools.String(a.deviceProps.Pvmfw.Image))
 		installPath := android.PathForModuleInPartitionInstall(ctx, "", "pvmfw.img")
 		ctx.Build(pctx, android.BuildParams{
-			Rule:   android.Cp,
+			Rule:   android.CpRule,
 			Input:  pvmfwImg,
 			Output: installPath,
 		})
@@ -193,7 +210,7 @@ func (a *androidDevice) copyFilesToProductOutForSoongOnly(ctx android.ModuleCont
 		for _, file := range files {
 			installPath := android.PathForModuleInPartitionInstall(ctx, "", file.Base())
 			ctx.Build(pctx, android.BuildParams{
-				Rule:   android.Cp,
+				Rule:   android.CpRule,
 				Input:  file,
 				Output: installPath,
 			})
@@ -208,7 +225,7 @@ func (a *androidDevice) copyFilesToProductOutForSoongOnly(ctx android.ModuleCont
 			img := android.OutputFilesForModule(ctx, dtboModule, "")[0]
 			installPath := android.PathForModuleInPartitionInstall(ctx, "", img.Base())
 			ctx.Build(pctx, android.BuildParams{
-				Rule:   android.Cp,
+				Rule:   android.CpRule,
 				Input:  img,
 				Output: installPath,
 			})
@@ -219,7 +236,7 @@ func (a *androidDevice) copyFilesToProductOutForSoongOnly(ctx android.ModuleCont
 	// Fastboot-info.txt
 	fastbootInstallpath := android.PathForModuleInPartitionInstall(ctx, "", "fastboot-info.txt")
 	ctx.Build(pctx, android.BuildParams{
-		Rule:   android.Cp,
+		Rule:   android.CpRule,
 		Input:  a.fastbootInfoFile,
 		Output: fastbootInstallpath,
 	})
@@ -230,7 +247,7 @@ func (a *androidDevice) copyFilesToProductOutForSoongOnly(ctx android.ModuleCont
 		if info, ok := android.OtherModuleProvider(ctx, partition, vbmetaPartitionProvider); ok {
 			installPath := android.PathForModuleInPartitionInstall(ctx, "", info.Name+".img")
 			ctx.Build(pctx, android.BuildParams{
-				Rule:   android.Cp,
+				Rule:   android.CpRule,
 				Input:  info.Output,
 				Output: installPath,
 			})
@@ -245,15 +262,16 @@ func (a *androidDevice) copyFilesToProductOutForSoongOnly(ctx android.ModuleCont
 		if info, ok := android.OtherModuleProvider(ctx, partition, SuperImageProvider); ok {
 			installPath := android.PathForModuleInPartitionInstall(ctx, "", "super.img")
 			ctx.Build(pctx, android.BuildParams{
-				Rule:   android.Cp,
+				Rule:   android.CpRule,
 				Input:  info.SuperImage,
 				Output: installPath,
 			})
+			ctx.Phony("superimage", installPath)
 			deps = append(deps, installPath)
 			if info.SuperEmptyImage != nil {
 				installPath := android.PathForModuleInPartitionInstall(ctx, "", "super_empty.img")
 				ctx.Build(pctx, android.BuildParams{
-					Rule:   android.Cp,
+					Rule:   android.CpRule,
 					Input:  info.SuperEmptyImage,
 					Output: installPath,
 				})
@@ -272,7 +290,7 @@ func (a *androidDevice) copyFilesToProductOutForSoongOnly(ctx android.ModuleCont
 			validations = append(validations, a.checkRadioVersion(ctx))
 		}
 		ctx.Build(pctx, android.BuildParams{
-			Rule:        android.Cp,
+			Rule:        android.CpRule,
 			Input:       a.androidInfoTxt,
 			Output:      installPath,
 			Validations: validations,
@@ -280,9 +298,19 @@ func (a *androidDevice) copyFilesToProductOutForSoongOnly(ctx android.ModuleCont
 		deps = append(deps, installPath)
 	}
 
+	for _, pair := range a.stageDeviceFiles {
+		installPath := android.PathForModuleInPartitionInstall(ctx, "", pair.dst)
+		ctx.Build(pctx, android.BuildParams{
+			Rule:   android.CpRule,
+			Input:  pair.src,
+			Output: installPath,
+		})
+		deps = append(deps, installPath)
+	}
+
 	copyToProductOutTimestamp := android.PathForModuleOut(ctx, "product_out_copy_timestamp")
 	ctx.Build(pctx, android.BuildParams{
-		Rule:      android.Touch,
+		Rule:      android.TouchRule,
 		Output:    copyToProductOutTimestamp,
 		Implicits: deps,
 	})
@@ -295,7 +323,7 @@ func (a *androidDevice) copyFilesToProductOutForSoongOnly(ctx android.ModuleCont
 // Any changes to installed files of the main `android_device` will retrigger SBOM generation
 func (a *androidDevice) createComplianceMetadataTimestamp(ctx android.ModuleContext, installedFiles android.Paths) {
 	ctx.Build(pctx, android.BuildParams{
-		Rule:      android.Touch,
+		Rule:      android.TouchRule,
 		Implicits: installedFiles,
 		Output:    android.PathForOutput(ctx, "compliance-metadata", ctx.Config().DeviceProduct(), "installed_files.stamp"),
 	})
@@ -327,6 +355,7 @@ func (a *androidDevice) getFsInfos(ctx android.ModuleContext) map[string]Filesys
 		// images inside of them
 		propToType{a.partitionProps.Init_boot_partition_name, "ramdisk"},
 		propToType{a.partitionProps.Vendor_boot_partition_name, "vendor_ramdisk"},
+		propToType{a.partitionProps.Vendor_kernel_ramdisk_partition_name, "vendor_kernel_ramdisk"},
 	}
 	for _, partitionDefinition := range partitionDefinitions {
 		if proptools.String(partitionDefinition.prop) != "" {
@@ -348,6 +377,16 @@ func (a *androidDevice) getFsInfos(ctx android.ModuleContext) map[string]Filesys
 			ctx.ModuleErrorf("Super partition %s does not set SuperImageProvider\n", superPartition.Name())
 		}
 	}
+	for _, customPartition := range a.customPartitionFilesystemInfos {
+		if customPartition.Output == nil {
+			continue
+		}
+		if _, present := filesystemInfos[customPartition.ModuleName]; present {
+			ctx.ModuleErrorf("Custom partition %s conflicts with standard partition", customPartition.ModuleName)
+			continue
+		}
+		filesystemInfos[customPartition.ModuleName] = customPartition
+	}
 
 	return filesystemInfos
 }
@@ -365,6 +404,12 @@ func (a *androidDevice) getInfoOnlyFsInfos(ctx android.ModuleContext) map[string
 		systemExtPartition := ctx.GetDirectDepProxyWithTag(*a.deviceProps.InfoPartitionProps.System_ext_partition_name, filesystemDepTag)
 		if info, ok := android.OtherModuleProvider(ctx, systemExtPartition, FilesystemProvider); ok {
 			filesystemInfos["system_ext"] = info
+		}
+	}
+	if a.deviceProps.InfoPartitionProps.Product_partition_name != nil {
+		productPartition := ctx.GetDirectDepProxyWithTag(*a.deviceProps.InfoPartitionProps.Product_partition_name, filesystemDepTag)
+		if info, ok := android.OtherModuleProvider(ctx, productPartition, FilesystemProvider); ok {
+			filesystemInfos["product"] = info
 		}
 	}
 

@@ -15,6 +15,8 @@
 package rust
 
 import (
+	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 
@@ -23,50 +25,55 @@ import (
 
 	"android/soong/android"
 	"android/soong/cc"
+	cc_config "android/soong/cc/config"
 	"android/soong/remoteexec"
 	"android/soong/rust/config"
 )
 
 var (
-	_ = pctx.SourcePathVariable("rustcCmd", "${config.RustBin}/rustc")
+	_            = pctx.SourcePathVariable("rustcCmd", "${config.RustBin}/rustc")
+	rustcWrapper = pctx.HostTool("rustc_wrapper")
 
 	rustc, rustcRbe = pctx.RemoteStaticRules("rustc",
 		blueprint.RuleParams{
-			Command: "$relPwd $reTemplate/usr/bin/env $envVars ${RustcWrapper} ${rustcCmd} " +
+			Command: "$relPwd $reTemplate ${SoongEnvCmd} -i --allow PWD --allow TMPDIR $envVars ${RustcWrapper} ${rustcCmd} " +
 				"-C linker=${RustcLinkerCmd} -C link-args=\"--android-clang-bin=${config.ClangCmd} ${linkerScriptFlags}\" " +
 				"-C link-args=@${out}.clang.rsp " +
-				"--emit ${emitType} -o $out --emit dep-info=$out.d.raw $in ${libFlags} $rustcFlags",
-			CommandDeps:    []string{"$rustcCmd", "${RustcLinkerCmd}", "${config.ClangCmd}", "${RustcWrapper}"},
+				"--emit ${emitType} -o $out --emit dep-info=$out.d.raw $in ${libFlags} $rustcFlags" +
+				" && ${DepfileVerifier} --check-suffix-only $out.d ${soongSrcsFile}",
+			CommandDeps:    []string{"$rustcCmd", "${RustcLinkerCmd}", "${config.ClangCmd}", "${DepfileVerifier}", "${RustcWrapper}", "${SoongEnvCmd}"},
 			Rspfile:        "${out}.clang.rsp",
 			RspfileContent: "${crtBegin} ${earlyLinkFlags} ${linkFlags} ${crtEnd}",
-			Deps:           blueprint.DepsGCC,
-			Depfile:        "$out.d",
 		}, &remoteexec.REParams{
 			// Until there's a "rust" tool, use clang. This interprets "-L" flags
 			// to help identify potential build dependencies.
-			Labels:       map[string]string{"type": "link", "tool": "clang"},
-			Inputs:       []string{"${out}.clang.rsp"},
-			RSPFiles:     []string{"$rbeRspFile"},
-			OutputFiles:  []string{"${out}.d", "${out}.d.raw", "${out}"},
-			ExecStrategy: "${config.RERustExecStrategy}",
+			Labels:               map[string]string{"type": "link", "tool": "clang"},
+			Inputs:               []string{"${out}.clang.rsp"},
+			RSPFiles:             []string{"$rbeRspFile"},
+			OutputFiles:          []string{"${out}.d", "${out}.d.raw", "${out}"},
+			ExecStrategy:         "${config.RERustExecStrategy}",
+			EnvironmentVariables: []string{"PWD"},
 			ToolchainInputs: []string{
 				"${rustcCmd}",
 				"${RustcLinkerCmd}",
 				"${config.ClangCmd}",
 				"${config.LlvmDlltool}",
+				"${DepfileVerifier}",
 				"${RustcWrapper}",
+				"${SoongEnvCmd}",
 			},
 			Platform: map[string]string{remoteexec.PoolKey: "${config.RERustPool}"},
 		},
-		[]string{"rustcFlags", "linkerScriptFlags", "earlyLinkFlags", "linkFlags", "libFlags", "crtBegin", "crtEnd", "emitType", "envVars"},
+		[]string{"rustcFlags", "linkerScriptFlags", "earlyLinkFlags", "linkFlags", "libFlags", "crtBegin", "crtEnd", "emitType", "envVars", "soongSrcsFile"},
 		[]string{"rbeRspFile"})
 
 	_       = pctx.SourcePathVariable("rustdocCmd", "${config.RustBin}/rustdoc")
 	rustdoc = pctx.AndroidStaticRule("rustdoc",
 		blueprint.RuleParams{
-			Command: "$envVars ${RustcWrapper} $rustdocCmd $rustdocFlags $in -o $outDir && " +
-				"touch $out",
-			CommandDeps: []string{"$rustdocCmd", "${RustcWrapper}"},
+			Command2: blueprint.NewCommand(
+				"$envVars ", rustcWrapper, " $rustdocCmd $rustdocFlags $in -o $outDir && ",
+				android.Touch, " $out"),
+			CommandDeps: []string{"$rustdocCmd"},
 		},
 		"rustdocFlags", "outDir", "envVars")
 
@@ -74,16 +81,16 @@ var (
 	generateClippyRule = func(ruleName string, extraFlags string) blueprint.Rule {
 		return pctx.AndroidStaticRule(ruleName,
 			blueprint.RuleParams{
-				Command: "$envVars ${RustcWrapper} $clippyCmd " +
+				Command2: blueprint.NewCommand(
+					"$envVars ", rustcWrapper, " ${clippyCmd} ",
 					// Because clippy-driver uses rustc as backend, we need to have some output even during the linting.
 					// Use the metadata output as it has the smallest footprint.
-					"--emit metadata -o $out --emit dep-info=$out.d.raw $in ${libFlags} " +
-					"$rustcFlags $clippyFlags " + extraFlags,
-				CommandDeps: []string{"$clippyCmd", "${RustcWrapper}"},
-				Deps:        blueprint.DepsGCC,
-				Depfile:     "$out.d",
+					"--emit metadata -o $out --emit dep-info=$out.d.raw $in ${libFlags} ",
+					"$rustcFlags $clippyFlags ", extraFlags, " && ",
+					android.DepfileVerifier, " --check-suffix-only $out.d ${soongSrcsFile}"),
+				CommandDeps: []string{"$clippyCmd"},
 			},
-			"rustcFlags", "libFlags", "clippyFlags", "envVars")
+			"rustcFlags", "libFlags", "clippyFlags", "envVars", "soongSrcsFile")
 	}
 	clippyDriver = generateClippyRule("clippy", "")
 
@@ -92,17 +99,10 @@ var (
 	// errors and warnings to rust-analyzer.
 	clippyJsonDriver = generateClippyRule("clippyJson", "--error-format=json 2> $out.error")
 
-	zip = pctx.AndroidStaticRule("zip",
-		blueprint.RuleParams{
-			Command:        "cat $out.rsp | tr ' ' '\\n' | tr -d \\' | sort -u > ${out}.tmp && ${SoongZipCmd} -o ${out} -C $$OUT_DIR -l ${out}.tmp",
-			CommandDeps:    []string{"${SoongZipCmd}"},
-			Rspfile:        "$out.rsp",
-			RspfileContent: "$in",
-		})
-
 	cp = pctx.AndroidStaticRule("cp",
 		blueprint.RuleParams{
-			Command:        "cp `cat $outDir.rsp` $outDir",
+			Command2: blueprint.NewCommand(
+				android.Cp, " `", android.Cat, " $outDir.rsp` $outDir"),
 			Rspfile:        "${outDir}.rsp",
 			RspfileContent: "$in",
 		},
@@ -118,23 +118,26 @@ func init() {
 	pctx.HostBinToolVariable("SoongZipCmd", "soong_zip")
 	pctx.HostBinToolVariable("RustcLinkerCmd", "rustc_linker")
 	pctx.HostBinToolVariable("RustcWrapper", "rustc_wrapper")
+	pctx.HostBinToolVariable("SoongEnvCmd", "soong_env")
+	pctx.HostBinToolVariable("DepfileVerifier", "depfile_verifier")
 	pctx.StaticVariable("relPwd", cc.PwdPrefix())
 
 	cc.TransformRlibstoStaticlib = TransformRlibstoStaticlib
 }
 
 type transformProperties struct {
-	crateName       string
-	targetTriple    string
-	is64Bit         bool
-	bootstrap       bool
-	inRecovery      bool
-	inRamdisk       bool
-	inVendorRamdisk bool
-	cargoOutDir     android.OptionalPath
-	synthetic       bool
-	crateType       string
-	emitType        string
+	crateName               string
+	targetTriple            string
+	is64Bit                 bool
+	bootstrap               bool
+	inRecovery              bool
+	inRamdisk               bool
+	inVendorRamdisk         bool
+	cargoOutDir             android.OptionalPath
+	synthetic               bool
+	crateType               string
+	emitType                string
+	useExpansiveDefaultSrcs bool
 }
 
 // Populates a standard transformProperties struct for Rust modules
@@ -157,28 +160,30 @@ func getTransformProperties(ctx ModuleContext, crateType string) transformProper
 		synthetic: false,
 
 		emitType: module.compiler.emitType(),
+
+		useExpansiveDefaultSrcs: module.compiler.useExpansiveDefaultSrcs(),
 	}
 }
 
 func TransformSrcToBinary(ctx ModuleContext, mainSrc android.Path, deps PathDeps, flags Flags,
-	outputFile android.WritablePath) buildOutput {
+	outputFile, checkJsonFile android.WritablePath) buildOutput {
 	if ctx.RustModule().compiler.Thinlto() {
-		flags.GlobalRustFlags = append(flags.GlobalRustFlags, "-C lto=thin")
+		flags.GlobalRustFlags = flags.GlobalRustFlags.AppendNoDeps("-C lto=thin")
 	}
 
-	return transformSrctoCrate(ctx, mainSrc, deps, flags, outputFile, getTransformProperties(ctx, "bin"))
+	return transformSrctoCrate(ctx, mainSrc, deps, flags, outputFile, checkJsonFile, getTransformProperties(ctx, "bin"))
 }
 
 func TransformSrcToObject(ctx ModuleContext, mainSrc android.Path, deps PathDeps, flags Flags,
-	outputFile android.WritablePath) buildOutput {
+	outputFile, checkJsonFile android.WritablePath) buildOutput {
 
 	// There's no "obj" crate-type since it doesn't get linked, so don't define one.
-	return transformSrctoCrate(ctx, mainSrc, deps, flags, outputFile, getTransformProperties(ctx, ""))
+	return transformSrctoCrate(ctx, mainSrc, deps, flags, outputFile, checkJsonFile, getTransformProperties(ctx, ""))
 }
 
 func TransformSrctoRlib(ctx ModuleContext, mainSrc android.Path, deps PathDeps, flags Flags,
-	outputFile android.WritablePath) buildOutput {
-	return transformSrctoCrate(ctx, mainSrc, deps, flags, outputFile, getTransformProperties(ctx, "rlib"))
+	outputFile, checkJsonFile android.WritablePath) buildOutput {
+	return transformSrctoCrate(ctx, mainSrc, deps, flags, outputFile, checkJsonFile, getTransformProperties(ctx, "rlib"))
 }
 
 // TransformRlibstoStaticlib is assumed to be callable from the cc module, and
@@ -189,11 +194,15 @@ func TransformRlibstoStaticlib(ctx android.ModuleContext, mainSrc android.Path, 
 
 	var rustPathDeps PathDeps
 	var rustFlags Flags
-
+	IsHwasan := false
 	for _, rlibDep := range deps {
 		rustPathDeps.RLibs = append(rustPathDeps.RLibs, RustLibrary{Path: rlibDep.LibPath, CrateName: rlibDep.CrateName})
 		rustPathDeps.linkDirs = append(rustPathDeps.linkDirs, rlibDep.LinkDirs...)
+		IsHwasan = IsHwasan || rlibDep.IsHwasan
+		rustPathDeps.linkDirsDeps = append(rustPathDeps.linkDirsDeps, rlibDep.LinkDirsDeps...)
 	}
+	rustPathDeps.linkDirs = android.FirstUniqueStrings(rustPathDeps.linkDirs)
+	rustPathDeps.linkDirsDeps = android.FirstUniquePaths(rustPathDeps.linkDirsDeps)
 
 	mod := ctx.Module().(cc.LinkableInterface)
 	toolchain := config.FindToolchain(ctx.Os(), ctx.Arch())
@@ -216,47 +225,54 @@ func TransformRlibstoStaticlib(ctx android.ModuleContext, mainSrc android.Path, 
 
 		// synthetic indicates whether this is an actual Rust module or not
 		synthetic: true,
+
+		// To match the default value of useExpansiveDefaultSrcs() from rust'd baseCompiler.
+		// Should switch to false in the future.
+		useExpansiveDefaultSrcs: true,
 	}
 
 	rustFlags = CommonDefaultFlags(ctx, toolchain, rustFlags)
 	rustFlags = CommonLibraryCompilerFlags(ctx, rustFlags)
-	rustFlags.GlobalRustFlags = append(rustFlags.GlobalRustFlags, "-C lto=thin")
+	if IsHwasan {
+		rustFlags.RustFlags = append(rustFlags.RustFlags, "-Zsanitizer=hwaddress")
+	}
+	rustFlags.GlobalRustFlags = rustFlags.GlobalRustFlags.AppendNoDeps("-C lto=thin")
 
 	rustFlags.EmitXrefs = false
 
-	return transformSrctoCrate(ctx, mainSrc, rustPathDeps, rustFlags, outputFile, t).outputFile
+	return transformSrctoCrate(ctx, mainSrc, rustPathDeps, rustFlags, outputFile, nil, t).outputFile
 }
 
 func TransformSrctoDylib(ctx ModuleContext, mainSrc android.Path, deps PathDeps, flags Flags,
-	outputFile android.WritablePath) buildOutput {
+	outputFile, checkJsonFile android.WritablePath) buildOutput {
 	if ctx.RustModule().compiler.Thinlto() {
-		flags.GlobalRustFlags = append(flags.GlobalRustFlags, "-C lto=thin")
+		flags.GlobalRustFlags = flags.GlobalRustFlags.AppendNoDeps("-C lto=thin")
 	}
 
-	return transformSrctoCrate(ctx, mainSrc, deps, flags, outputFile, getTransformProperties(ctx, "dylib"))
+	return transformSrctoCrate(ctx, mainSrc, deps, flags, outputFile, checkJsonFile, getTransformProperties(ctx, "dylib"))
 }
 
 func TransformSrctoStatic(ctx ModuleContext, mainSrc android.Path, deps PathDeps, flags Flags,
-	outputFile android.WritablePath) buildOutput {
+	outputFile, checkJsonFile android.WritablePath) buildOutput {
 	if ctx.RustModule().compiler.Thinlto() {
-		flags.GlobalRustFlags = append(flags.GlobalRustFlags, "-C lto=thin")
+		flags.GlobalRustFlags = flags.GlobalRustFlags.AppendNoDeps("-C lto=thin")
 	}
 
-	return transformSrctoCrate(ctx, mainSrc, deps, flags, outputFile, getTransformProperties(ctx, "staticlib"))
+	return transformSrctoCrate(ctx, mainSrc, deps, flags, outputFile, checkJsonFile, getTransformProperties(ctx, "staticlib"))
 }
 
 func TransformSrctoShared(ctx ModuleContext, mainSrc android.Path, deps PathDeps, flags Flags,
-	outputFile android.WritablePath) buildOutput {
+	outputFile, checkJsonFile android.WritablePath) buildOutput {
 	if ctx.RustModule().compiler.Thinlto() {
-		flags.GlobalRustFlags = append(flags.GlobalRustFlags, "-C lto=thin")
+		flags.GlobalRustFlags = flags.GlobalRustFlags.AppendNoDeps("-C lto=thin")
 	}
 
-	return transformSrctoCrate(ctx, mainSrc, deps, flags, outputFile, getTransformProperties(ctx, "cdylib"))
+	return transformSrctoCrate(ctx, mainSrc, deps, flags, outputFile, checkJsonFile, getTransformProperties(ctx, "cdylib"))
 }
 
 func TransformSrctoProcMacro(ctx ModuleContext, mainSrc android.Path, deps PathDeps,
-	flags Flags, outputFile android.WritablePath) buildOutput {
-	return transformSrctoCrate(ctx, mainSrc, deps, flags, outputFile, getTransformProperties(ctx, "proc-macro"))
+	flags Flags, outputFile, checkJsonFile android.WritablePath) buildOutput {
+	return transformSrctoCrate(ctx, mainSrc, deps, flags, outputFile, checkJsonFile, getTransformProperties(ctx, "proc-macro"))
 }
 
 func rustLibsToPaths(libs RustLibraries) android.Paths {
@@ -267,8 +283,9 @@ func rustLibsToPaths(libs RustLibraries) android.Paths {
 	return paths
 }
 
-func makeLibFlags(deps PathDeps) []string {
+func makeLibFlags(deps PathDeps) ([]string, android.Paths) {
 	var libFlags []string
+	var depFiles []android.Path
 
 	// Collect library/crate flags
 	for _, lib := range deps.RLibs {
@@ -284,8 +301,9 @@ func makeLibFlags(deps PathDeps) []string {
 	for _, path := range deps.linkDirs {
 		libFlags = append(libFlags, "-L "+path)
 	}
+	depFiles = append(depFiles, deps.linkDirsDeps...)
 
-	return libFlags
+	return libFlags, depFiles
 }
 
 func rustStringifyEnvVars(envVars map[string]string) string {
@@ -319,6 +337,7 @@ func rustEnvVars(ctx android.ModuleContext, deps PathDeps, crateName string, car
 			envVars["CARGO_BIN_NAME"] = bin.getStem(ctx)
 		}
 		envVars["CARGO_CRATE_NAME"] = crateName
+		envVars["CARGO_MANIFEST_DIR"] = ctx.ModuleDir()
 		envVars["CARGO_PKG_NAME"] = crateName
 		pkgVersion := rustMod.compiler.cargoPkgVersion()
 		if pkgVersion != "" {
@@ -351,14 +370,26 @@ func rustEnvVars(ctx android.ModuleContext, deps PathDeps, crateName string, car
 		envVars["ANDROID_RUST_DARWIN"] = "true"
 	}
 
+	// TODO: Remove, there are existing users.
+	envVars["TARGET_BUILD_VARIANT"] = func() string {
+		if ctx.Config().Eng() {
+			return "eng"
+		} else if ctx.Config().Debuggable() {
+			return "userdebug"
+		} else {
+			return "user"
+		}
+	}()
+
 	return envVars
 }
 
 func transformSrctoCrate(ctx android.ModuleContext, main android.Path, deps PathDeps, flags Flags,
-	outputFile android.WritablePath, t transformProperties) buildOutput {
+	outputFile, checkJsonFile android.WritablePath, t transformProperties) buildOutput {
 
 	var inputs android.Paths
 	var implicits android.Paths
+	var validations android.Paths
 	var orderOnly android.Paths
 	var output buildOutput
 	var linkerScriptFlags, rustcFlags, linkFlags []string
@@ -371,7 +402,8 @@ func transformSrctoCrate(ctx android.ModuleContext, main android.Path, deps Path
 	inputs = append(inputs, main)
 
 	// Collect rustc flags
-	rustcFlags = append(rustcFlags, flags.GlobalRustFlags...)
+	rustcFlags = append(rustcFlags, flags.GlobalRustFlags.Flags)
+	implicits = append(implicits, flags.GlobalRustFlags.Deps...)
 	rustcFlags = append(rustcFlags, flags.RustFlags...)
 	if t.crateType != "" {
 		rustcFlags = append(rustcFlags, "--crate-type="+t.crateType)
@@ -397,7 +429,6 @@ func transformSrctoCrate(ctx android.ModuleContext, main android.Path, deps Path
 	} else {
 		rustcFlags = append(rustcFlags, "-C codegen-units=1")
 	}
-
 	// Disallow experimental features
 	modulePath := ctx.ModuleDir()
 	if !android.IsThirdPartyPath(modulePath) && !strings.HasPrefix(modulePath, "prebuilts") {
@@ -409,12 +440,19 @@ func transformSrctoCrate(ctx android.ModuleContext, main android.Path, deps Path
 		earlyLinkFlags = "-Wl,--as-needed"
 	}
 
-	linkFlags = append(linkFlags, flags.GlobalLinkFlags...)
-	linkFlags = append(linkFlags, flags.LinkFlags...)
+	linkFlags = append(linkFlags, flags.GlobalLinkFlags.Flags)
+	implicits = append(implicits, flags.GlobalLinkFlags.Deps...)
+	linkFlags = append(linkFlags, flags.LinkFlags.Flags)
+	implicits = append(implicits, flags.LinkFlags.Deps...)
 	linkerScriptFlags = append(linkerScriptFlags, flags.LinkerScriptFlags...)
 
 	// Check if this module needs to use the bootstrap linker
-	if t.bootstrap && !t.inRecovery && !t.inRamdisk && !t.inVendorRamdisk {
+	useBootstrap := t.bootstrap && !t.inRecovery && !t.inRamdisk && !t.inVendorRamdisk
+	if ctx.Config().GetBuildFlagBool("RELEASE_DEPRECATE_RUNTIME_APEX") {
+		useBootstrap = false
+	}
+
+	if useBootstrap {
 		dynamicLinker := "-Wl,-dynamic-linker,/system/bin/bootstrap/linker"
 		if t.is64Bit {
 			dynamicLinker += "64"
@@ -427,22 +465,18 @@ func transformSrctoCrate(ctx android.ModuleContext, main android.Path, deps Path
 		linkFlags = append(linkFlags, generatedLib.String())
 	}
 
-	libFlags := makeLibFlags(deps)
+	libFlags, libFlagsDeps := makeLibFlags(deps)
 
 	// Collect dependencies
-	implicits = append(implicits, rustLibsToPaths(deps.RLibs)...)
-	implicits = append(implicits, rustLibsToPaths(deps.DyLibs)...)
-	implicits = append(implicits, rustLibsToPaths(deps.ProcMacros)...)
-	implicits = append(implicits, deps.StaticLibs...)
-	implicits = append(implicits, deps.SharedLibDeps...)
-	implicits = append(implicits, deps.srcProviderFiles...)
-	implicits = append(implicits, deps.AfdoProfiles...)
-	implicits = append(implicits, deps.LinkerDeps...)
-
-	implicits = append(implicits, deps.CrtBegin...)
-	implicits = append(implicits, deps.CrtEnd...)
-
 	orderOnly = append(orderOnly, deps.SharedLibs...)
+
+	srcInputs := android.Paths{}
+	srcInputs = append(srcInputs, main)
+	srcInputs = append(srcInputs, deps.srcProviderFiles...)
+	srcInputs = append(srcInputs, deps.SrcFiles...)
+	// AFDO profiles are included in Rusts deps file, so include these here
+	// so they're not missing when comparing inputs.
+	srcInputs = append(srcInputs, deps.AfdoProfiles...)
 
 	if !t.synthetic {
 		// Only worry about OUT_DIR for actual Rust modules.
@@ -455,7 +489,9 @@ func transformSrctoCrate(ctx android.ModuleContext, main android.Path, deps Path
 					ctx.PropertyErrorf("srcs",
 						"multiple source providers generate the same filename output: "+genSrc.Base())
 				}
-				outputs = append(outputs, android.PathForModuleOut(ctx, genSubDir+genSrc.Base()))
+				copiedFile := android.PathForModuleOut(ctx, genSubDir+genSrc.Base())
+				outputs = append(outputs, copiedFile)
+				srcInputs = append(srcInputs, copiedFile)
 			}
 
 			ctx.Build(pctx, android.BuildParams{
@@ -467,7 +503,6 @@ func transformSrctoCrate(ctx android.ModuleContext, main android.Path, deps Path
 					"outDir": t.cargoOutDir.String(),
 				},
 			})
-			implicits = append(implicits, outputs.Paths()...)
 		}
 	}
 	var implicitOutputs android.WritablePaths
@@ -486,16 +521,33 @@ func transformSrctoCrate(ctx android.ModuleContext, main android.Path, deps Path
 		implicitOutputs = append(implicitOutputs, pdb)
 	}
 
+	implicits = append(implicits, rustLibsToPaths(deps.RLibs)...)
+	implicits = append(implicits, rustLibsToPaths(deps.DyLibs)...)
+	implicits = append(implicits, rustLibsToPaths(deps.ProcMacros)...)
+	implicits = append(implicits, deps.StaticLibs...)
+	implicits = append(implicits, deps.SharedLibDeps...)
+	implicits = append(implicits, deps.LinkerDeps...)
+	implicits = append(implicits, deps.CrtBegin...)
+	implicits = append(implicits, deps.CrtEnd...)
+	implicits = append(implicits, srcInputs...)
+	implicits = append(implicits, libFlagsDeps...)
+
+	toolchainImplicitsPhony := toolchainImplicitsPhony(ctx)
+	implicits = append(implicits, toolchainImplicitsPhony)
+
+	soongDepsFile := android.PathForModuleOut(ctx, outputFile.Base()+".soong_deps")
+	android.WriteFileRule(ctx, soongDepsFile, strings.Join(srcInputs.Strings(), "\n"))
+	implicits = append(implicits, soongDepsFile)
+
 	if !t.synthetic {
 		// Only worry about clippy for actual Rust modules.
 		// Libraries built from cc use generated source, and don't need to run clippy.
-		checkJsonFile := android.PathForModuleOut(ctx, outputFile.Base()+".checkJson")
-
 		args := map[string]string{
-			"rustcFlags":  strings.Join(rustcFlags, " "),
-			"libFlags":    strings.Join(libFlags, " "),
-			"clippyFlags": strings.Join(flags.ClippyFlags, " "),
-			"envVars":     rustStringifyEnvVars(envVars),
+			"rustcFlags":    strings.Join(rustcFlags, " "),
+			"libFlags":      strings.Join(libFlags, " "),
+			"clippyFlags":   strings.Join(flags.ClippyFlags, " "),
+			"envVars":       rustStringifyEnvVars(envVars),
+			"soongSrcsFile": soongDepsFile.String(),
 		}
 		if flags.Clippy {
 			ctx.Build(pctx, android.BuildParams{
@@ -518,8 +570,10 @@ func transformSrctoCrate(ctx android.ModuleContext, main android.Path, deps Path
 				OrderOnly:       orderOnly,
 				Args:            args,
 			})
-			// Declare the clippy build as an implicit dependency of the original crate.
-			implicits = append(implicits, clippyFile)
+			// Declare the clippy build as a validation dependency of the original crate.  It will
+			// be run in any build that builds the crate, but not block building the crate or anything
+			// that depends on the crate.
+			validations = append(validations, clippyFile)
 		}
 	}
 
@@ -534,6 +588,7 @@ func transformSrctoCrate(ctx android.ModuleContext, main android.Path, deps Path
 		"crtEnd":            strings.Join(deps.CrtEnd.Strings(), " "),
 		"envVars":           rustStringifyEnvVars(envVars),
 		"emitType":          t.emitType,
+		"soongSrcsFile":     soongDepsFile.String(),
 	}
 
 	// If SrcFiles populating is ever tied to some other property being set
@@ -542,14 +597,9 @@ func transformSrctoCrate(ctx android.ModuleContext, main android.Path, deps Path
 		rule = rustcRbe
 		rbeInputs := android.Paths{}
 		rbeInputs = append(rbeInputs, implicits...)
-		rbeInputs = append(rbeInputs, deps.SrcDeps...)
-		rbeInputs = append(rbeInputs, deps.srcProviderFiles...)
-		rbeInputs = append(rbeInputs, main)
 		rbeInputs = append(rbeInputs, depset.New(depset.PREORDER, deps.directApexImplementationDeps, deps.transitiveApexImplementationDeps).ToList()...)
 		rbeInputs = append(rbeInputs, depset.New(depset.PREORDER, deps.directNonApexImplementationDeps, deps.transitiveNonApexImplementationDeps).ToList()...)
-		rbeInputs = append(rbeInputs, deps.SrcFiles...)
 		rbeInputs = android.FirstUniquePaths(rbeInputs)
-
 		// Produce an rsp file for RBE as the inputs list can easily grow too large.
 		rbeRustRspFile := android.PathForModuleOut(ctx, "", outputFile.Base()+".rbe.rsp")
 		android.WriteFileRule(ctx, rbeRustRspFile, strings.Join(rbeInputs.Strings(), "\n"))
@@ -566,6 +616,7 @@ func transformSrctoCrate(ctx android.ModuleContext, main android.Path, deps Path
 		Implicits:       implicits,
 		ImplicitOutputs: implicitOutputs,
 		OrderOnly:       orderOnly,
+		Validations:     validations,
 		Args:            args,
 	})
 
@@ -575,8 +626,11 @@ func transformSrctoCrate(ctx android.ModuleContext, main android.Path, deps Path
 func Rustdoc(ctx ModuleContext, main android.Path, deps PathDeps,
 	flags Flags) android.ModuleOutPath {
 
+	var implicits android.Paths
+
 	rustdocFlags := slices.Clone(flags.RustdocFlags)
-	rustdocFlags = append(rustdocFlags, flags.GlobalRustFlags...)
+	rustdocFlags = append(rustdocFlags, flags.GlobalRustFlags.Flags)
+	implicits = append(implicits, flags.GlobalRustFlags.Deps...)
 	rustdocFlags = append(rustdocFlags, "--sysroot=/dev/null")
 
 	// Build an index for all our crates. -Z unstable options is required to use
@@ -596,13 +650,14 @@ func Rustdoc(ctx ModuleContext, main android.Path, deps PathDeps,
 	crateName := ctx.RustModule().CrateName()
 	rustdocFlags = append(rustdocFlags, "--crate-name "+crateName)
 
-	rustdocFlags = append(rustdocFlags, makeLibFlags(deps)...)
+	libFlags, libFlagsDeps := makeLibFlags(deps)
+	rustdocFlags = append(rustdocFlags, libFlags...)
 	docTimestampFile := android.PathForModuleOut(ctx, "rustdoc.timestamp")
 
 	// Silence warnings about renamed lints for third-party crates
 	modulePath := ctx.ModuleDir()
 	if android.IsThirdPartyPath(modulePath) {
-		rustdocFlags = append(rustdocFlags, " -A warnings")
+		rustdocFlags = append(rustdocFlags, " --cap-lints allow")
 	}
 
 	// Yes, the same out directory is used simultaneously by all rustdoc builds.
@@ -612,10 +667,14 @@ func Rustdoc(ctx ModuleContext, main android.Path, deps PathDeps,
 	// https://github.com/rust-lang/rust/blob/master/src/librustdoc/html/render/write_shared.rs#L144-L146
 	docDir := android.PathForOutput(ctx, "rustdoc")
 
-	var implicits android.Paths
+	toolchainImplicitsPhony := toolchainImplicitsPhony(ctx)
+	implicits = append(implicits, toolchainImplicitsPhony)
+
 	implicits = append(implicits, rustLibsToPaths(deps.RLibs)...)
 	implicits = append(implicits, rustLibsToPaths(deps.DyLibs)...)
 	implicits = append(implicits, rustLibsToPaths(deps.ProcMacros)...)
+	implicits = append(implicits, libFlagsDeps...)
+	implicits = append(implicits, deps.SrcFiles...)
 	envVars := rustEnvVars(ctx, deps, crateName, ctx.RustModule().compiler.cargoOutDir(ctx))
 	ctx.Build(pctx, android.BuildParams{
 		Rule:        rustdoc,
@@ -632,4 +691,20 @@ func Rustdoc(ctx ModuleContext, main android.Path, deps PathDeps,
 	})
 
 	return docTimestampFile
+}
+
+func toolchainImplicitsPhony(ctx android.ModuleContext) android.Path {
+	rustPath := config.RustPath(ctx)
+	clangPath := cc_config.ClangPath(ctx, "").String()
+
+	return ctx.CreateNinjaPhonyOnce("rustToolchainImplicits", []string{
+		filepath.Join(rustPath, "lib/librustc_driver-*.so"),
+		filepath.Join(rustPath, "lib/rustlib/*/lib/**/*"),
+		filepath.Join(rustPath, "lib/libLLVM*"),
+		filepath.Join(rustPath, "lib64/*.so"),
+		filepath.Join(clangPath, "lib/clang/*/include/**/*"),
+		filepath.Join(clangPath, "lib/clang/*/lib", runtime.GOOS, "**/*"),
+		filepath.Join(clangPath, "lib/libxml2.so*"),
+		filepath.Join(clangPath, "bin/**/*"),
+	})
 }

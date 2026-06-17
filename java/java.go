@@ -39,7 +39,7 @@ import (
 	"android/soong/tradefed"
 )
 
-//go:generate go run ../../blueprint/gobtools/codegen/gob_gen.go
+//go:generate go run ../../blueprint/gobtools/codegen
 
 func init() {
 	registerJavaBuildComponents(android.InitRegistrationContext)
@@ -227,14 +227,6 @@ var (
 			PropertyName: "java_tests",
 		},
 	}
-
-	// Rule for generating device binary default wrapper
-	deviceBinaryWrapper = pctx.StaticRule("deviceBinaryWrapper", blueprint.RuleParams{
-		Command: `printf '#!/system/bin/sh\n` +
-			`export CLASSPATH=/system/framework/$jar_name\n` +
-			`exec app_process /$partition/bin $main_class "$$@"\n'> ${out}`,
-		Description: "Generating device binary wrapper ${jar_name}",
-	}, "jar_name", "partition", "main_class")
 )
 
 // @auto-generate: gob
@@ -244,24 +236,35 @@ type ProguardSpecInfo struct {
 	// static_libs edges.
 	Export_proguard_flags_files bool
 
-	// TransitiveDepsProguardSpecFiles is a depset of paths to proguard flags files that are exported from
-	// all transitive deps. This list includes all proguard flags files from transitive static dependencies,
-	// and all proguard flags files from transitive libs dependencies which set `export_proguard_spec: true`.
+	// ProguardFlagsFiles is a depset of paths to proguard flags files that are exported from
+	// all transitive deps. This list includes all proguard flags files from transitive static
+	// dependencies, and all proguard flags files from transitive libs dependencies which set
+	// `export_proguard_spec: true`.
 	ProguardFlagsFiles depset.DepSet[android.Path]
+
+	// IncludedProguardFlagsFiles is a depset of files included (with the -include directive)
+	// from the ProguardFlagsFiles.
+	IncludedProguardFlagsFiles depset.DepSet[android.Path]
 
 	// implementation detail to store transitive proguard flags files from exporting shared deps
 	UnconditionallyExportedProguardFlags depset.DepSet[android.Path]
+
+	// implementation detail to store transitive included proguard flags files from exporting shared
+	// deps
+	IncludedUnconditionallyExportedProguardFlags depset.DepSet[android.Path]
 }
 
 var ProguardSpecInfoProvider = blueprint.NewProvider[ProguardSpecInfo]()
 
+// @auto-generate: gob
 type AndroidLibraryDependencyInfo struct {
 	ExportPackage       android.Path
-	ResourcesNodeDepSet depset.DepSet[*resourcesNode]
+	ResourcesNodeDepSet depset.DepSet[resourcesNode]
 	RRODirsDepSet       depset.DepSet[rroDir]
 	ManifestsDepSet     depset.DepSet[android.Path]
 }
 
+// @auto-generate: gob
 type UsesLibraryDependencyInfo struct {
 	DexJarInstallPath   android.Path
 	ClassLoaderContexts dexpreopt.ClassLoaderContextMap
@@ -272,19 +275,18 @@ func (u *UsesLibraryDependencyInfo) GetClassLoaderContexts() dexpreopt.ClassLoad
 	return u.ClassLoaderContexts.DeepCopy()
 }
 
+// @auto-generate: gob
 type ProvidesUsesLibInfo struct {
 	ProvidesUsesLib *string
 }
 
-type ModuleWithUsesLibraryInfo struct {
-	UsesLibrary *usesLibrary
-}
-
+// @auto-generate: gob
 type ModuleWithSdkDepInfo struct {
 	SdkLinkType sdkLinkType
 	Stubs       bool
 }
 
+// @auto-generate: gob
 type ApexDependencyInfo struct {
 	// These fields can be different from the ones in JavaInfo, for example, for sdk_library
 	// the following fields are set since sdk_library inherits the implementations of
@@ -294,6 +296,7 @@ type ApexDependencyInfo struct {
 }
 
 // JavaInfo contains information about a java module for use by modules that depend on it.
+// @auto-generate: gob
 type JavaInfo struct {
 	// HeaderJars is a list of jars that can be passed as the javac classpath in order to link
 	// against this module.  If empty, ImplementationJars should be used instead.
@@ -471,6 +474,7 @@ type JavaInfo struct {
 
 var JavaInfoProvider = blueprint.NewProvider[*JavaInfo]()
 
+// @auto-generate: gob
 type DexpreopterInfo struct {
 	// The path to the profile on host that dexpreopter generates. This is used as the input for
 	// dex2oat.
@@ -484,6 +488,7 @@ type DexpreopterInfo struct {
 	ApexSystemServerDexJars android.Paths
 }
 
+// @auto-generate: gob
 type JavaLibraryInfo struct {
 	Prebuilt          bool
 	PermittedPackages []string
@@ -491,12 +496,14 @@ type JavaLibraryInfo struct {
 
 var JavaLibraryInfoProvider = blueprint.NewProvider[JavaLibraryInfo]()
 
+// @auto-generate: gob
 type JavaDexImportInfo struct{}
 
 var JavaDexImportInfoProvider = blueprint.NewProvider[JavaDexImportInfo]()
 
 // SyspropPublicStubInfo contains info about the sysprop public stub library that corresponds to
 // the sysprop implementation library.
+// @auto-generate: gob
 type SyspropPublicStubInfo struct {
 	// JavaInfo is the JavaInfoProvider of the sysprop public stub library that corresponds to
 	// the sysprop implementation library.
@@ -552,6 +559,12 @@ type dependencyTag struct {
 
 	installable bool
 }
+
+type excludeFromVisibilityEnforcementDependencyTag struct {
+	dependencyTag
+}
+
+func (e excludeFromVisibilityEnforcementDependencyTag) ExcludeFromVisibilityEnforcement() {}
 
 var _ android.InstallNeededDependencyTag = (*dependencyTag)(nil)
 
@@ -617,6 +630,8 @@ var (
 	sdkLibTag                  = dependencyTag{name: "sdklib", runtimeLinked: true}
 	java9LibTag                = dependencyTag{name: "java9lib", runtimeLinked: true}
 	pluginTag                  = dependencyTag{name: "plugin", toolchain: true}
+	javaStrictDepsPluginTag    = dependencyTag{name: "java-strict-deps-plugin", toolchain: true}
+	kotlinStrictDepsPluginTag  = dependencyTag{name: "kotlin-strict-deps-plugin", toolchain: true}
 	errorpronePluginTag        = dependencyTag{name: "errorprone-plugin", toolchain: true}
 	exportedPluginTag          = dependencyTag{name: "exported-plugin", toolchain: true}
 	bootClasspathTag           = dependencyTag{name: "bootclasspath", runtimeLinked: true}
@@ -626,23 +641,27 @@ var (
 	composeEmbeddablePluginTag = dependencyTag{name: "compose-embeddable-plugin", toolchain: true}
 	composePluginTag           = dependencyTag{name: "compose-plugin", toolchain: true}
 	proguardRaiseTag           = dependencyTag{name: "proguard-raise"}
-	certificateTag             = dependencyTag{name: "certificate"}
-	headerJarOverrideTag       = dependencyTag{name: "header-jar-override"}
-	instrumentationForTag      = dependencyTag{name: "instrumentation_for"}
-	extraLintCheckTag          = dependencyTag{name: "extra-lint-check", toolchain: true}
-	jniLibTag                  = dependencyTag{name: "jnilib", runtimeLinked: true}
-	r8LibraryJarTag            = dependencyTag{name: "r8-libraryjar", runtimeLinked: true}
-	traceReferencesTag         = dependencyTag{name: "trace-references"}
-	syspropPublicStubDepTag    = dependencyTag{name: "sysprop public stub"}
-	javaApiContributionTag     = dependencyTag{name: "java-api-contribution"}
-	aconfigDeclarationTag      = dependencyTag{name: "aconfig-declaration"}
-	jniInstallTag              = dependencyTag{name: "jni install", runtimeLinked: true, installable: true}
-	usesLibReqTag              = makeUsesLibraryDependencyTag(dexpreopt.AnySdkVersion, false)
-	usesLibOptTag              = makeUsesLibraryDependencyTag(dexpreopt.AnySdkVersion, true)
-	usesLibCompat28OptTag      = makeUsesLibraryDependencyTag(28, true)
-	usesLibCompat29ReqTag      = makeUsesLibraryDependencyTag(29, false)
-	usesLibCompat30OptTag      = makeUsesLibraryDependencyTag(30, true)
-	usesLibStagingTag          = usesLibStagingTagStruct{}
+	// Note: SDK-specific Proguard modules are intentionally locked down for visibility, and usage
+	// should only be allowed via explicit tags orchestrated by the build system.
+	sdkDepProguardTag = excludeFromVisibilityEnforcementDependencyTag{dependencyTag{name: "sdk-dep-proguard"}}
+	//TODO(b/465840743): Enable the visibility enforcement for certificateTag dependency.
+	certificateTag          = excludeFromVisibilityEnforcementDependencyTag{dependencyTag{name: "certificate"}}
+	headerJarOverrideTag    = dependencyTag{name: "header-jar-override"}
+	instrumentationForTag   = dependencyTag{name: "instrumentation_for"}
+	extraLintCheckTag       = dependencyTag{name: "extra-lint-check", toolchain: true}
+	jniLibTag               = dependencyTag{name: "jnilib", runtimeLinked: true}
+	r8LibraryJarTag         = dependencyTag{name: "r8-libraryjar", runtimeLinked: true}
+	traceReferencesTag      = dependencyTag{name: "trace-references"}
+	syspropPublicStubDepTag = dependencyTag{name: "sysprop public stub"}
+	javaApiContributionTag  = dependencyTag{name: "java-api-contribution"}
+	aconfigDeclarationTag   = dependencyTag{name: "aconfig-declaration"}
+	jniInstallTag           = dependencyTag{name: "jni install", runtimeLinked: true, installable: true}
+	usesLibReqTag           = makeUsesLibraryDependencyTag(dexpreopt.AnySdkVersion, false)
+	usesLibOptTag           = makeUsesLibraryDependencyTag(dexpreopt.AnySdkVersion, true)
+	usesLibCompat28OptTag   = makeUsesLibraryDependencyTag(28, true)
+	usesLibCompat29ReqTag   = makeUsesLibraryDependencyTag(29, false)
+	usesLibCompat30OptTag   = makeUsesLibraryDependencyTag(30, true)
+	usesLibStagingTag       = usesLibStagingTagStruct{}
 )
 
 // A list of tags for deps used for compiling a module.
@@ -667,6 +686,7 @@ var (
 		syspropPublicStubDepTag,
 		instrumentationForTag,
 		traceReferencesTag,
+		sdkDepProguardTag,
 	}
 )
 
@@ -674,8 +694,25 @@ func IsLibDepTag(depTag blueprint.DependencyTag) bool {
 	return depTag == libTag
 }
 
+// IsStaticLibDepTag returns true if the depTag is a dependencyTag with static set to true.
 func IsStaticLibDepTag(depTag blueprint.DependencyTag) bool {
-	return depTag == staticLibTag
+	if tag, ok := depTag.(dependencyTag); ok {
+		return tag.static
+	}
+	return false
+}
+
+// IsRuntimeDepTag returns true if the depTag is a dependencyTag with runtimeLinked set to true.
+// This captures all library-style dependencies that are linked at runtime (e.g., javalib, sdklib, jnilib).
+func IsRuntimeDepTag(depTag blueprint.DependencyTag) bool {
+	if tag, ok := depTag.(dependencyTag); ok {
+		return tag.runtimeLinked
+	}
+	return false
+}
+
+func IsTraceReferencesDepTag(depTag blueprint.DependencyTag) bool {
+	return depTag == traceReferencesTag
 }
 
 type sdkDep struct {
@@ -701,6 +738,9 @@ type sdkDep struct {
 	aidl android.OptionalPath
 
 	noStandardLibs, noFrameworksLibs bool
+
+	// Custom Proguard file modules to apply based on the target SDK.
+	proguardFlags []string
 }
 
 func (s sdkDep) hasStandardLibs() bool {
@@ -711,6 +751,7 @@ func (s sdkDep) hasFrameworkLibs() bool {
 	return !s.noStandardLibs && !s.noFrameworksLibs
 }
 
+// @auto-generate: gob
 type jniLib struct {
 	name           string
 	path           android.Path
@@ -721,19 +762,22 @@ type jniLib struct {
 	installPaths   android.InstallPaths
 }
 
-func sdkDeps(ctx android.BottomUpMutatorContext, sdkContext android.SdkContext, d dexer) {
+func sdkDeps(ctx android.BottomUpMutatorContext, sdkContext android.SdkContext, addR8DexDeps bool) {
 	sdkDep := decodeSdkDep(ctx, sdkContext)
 	if sdkDep.useModule {
 		ctx.AddVariationDependencies(nil, bootClasspathTag, sdkDep.bootclasspath...)
 		ctx.AddVariationDependencies(nil, java9LibTag, sdkDep.java9Classpath...)
 		ctx.AddVariationDependencies(nil, sdkLibTag, sdkDep.classpath...)
-		if d.effectiveOptimizeEnabled(ctx) && sdkDep.hasStandardLibs() {
+		if addR8DexDeps && sdkDep.hasStandardLibs() {
 			ctx.AddVariationDependencies(nil, proguardRaiseTag,
 				config.LegacyCorePlatformBootclasspathLibraries...,
 			)
 		}
-		if d.effectiveOptimizeEnabled(ctx) && sdkDep.hasFrameworkLibs() {
+		if addR8DexDeps && sdkDep.hasFrameworkLibs() {
 			ctx.AddVariationDependencies(nil, proguardRaiseTag, config.FrameworkLibraries...)
+		}
+		if addR8DexDeps {
+			ctx.AddVariationDependencies(nil, sdkDepProguardTag, sdkDep.proguardFlags...)
 		}
 	}
 	if sdkDep.systemModules != "" {
@@ -750,6 +794,9 @@ type deps struct {
 	// classpath is the list of jars that form the classpath for javac and kotlinc rules.  It
 	// contains header jars for all static and non-static dependencies.
 	classpath classpath
+
+	// directClasspath contains just the direct dependencies (header jars) for strict deps verification.
+	directClasspath classpath
 
 	// dexClasspath is the list of jars that form the classpath for d8 and r8 rules.  It contains
 	// header jars for all non-static dependencies.  Static dependencies have already been
@@ -780,6 +827,9 @@ type deps struct {
 
 	headerJarOverride          android.OptionalPath
 	headerJarOverridePreJarjar android.OptionalPath
+
+	javaStrictDepsPluginJars   android.Paths
+	kotlinStrictDepsPluginJars android.Paths
 
 	disableTurbine bool
 
@@ -1178,6 +1228,7 @@ func (j *Library) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	android.SetProvider(ctx, ProguardSpecInfoProvider, proguardSpecInfo)
 	exportedProguardFlagsFiles := proguardSpecInfo.ProguardFlagsFiles.ToList()
 	j.extraProguardFlagsFiles = append(j.extraProguardFlagsFiles, exportedProguardFlagsFiles...)
+	j.extraIncludedProguardFlagsFiles = append(j.extraIncludedProguardFlagsFiles, proguardSpecInfo.IncludedProguardFlagsFiles.ToList()...)
 
 	combinedExportedProguardFlagFile := android.PathForModuleOut(ctx, "export_proguard_flags")
 	writeCombinedProguardFlagsFile(ctx, combinedExportedProguardFlagFile, exportedProguardFlagsFiles)
@@ -1209,7 +1260,7 @@ func (j *Library) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 
 	j.setInstallRules(ctx)
 
-	android.SetProvider(ctx, android.TestOnlyProviderKey, android.TestModuleInformation{
+	ctx.SetTestModuleInfo(&android.TestModuleInformation{
 		TestOnly:       Bool(j.sourceProperties.Test_only),
 		TopLevelTarget: j.sourceProperties.Top_level_test_target,
 	})
@@ -1238,7 +1289,7 @@ func (j *Library) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 		android.SetProvider(ctx, JavaInfoProvider, javaInfo)
 	}
 
-	setOutputFiles(ctx, j.Module)
+	setOutputFiles(ctx, &j.Module)
 
 	j.javaLibraryModuleInfoJSON(ctx)
 
@@ -1247,13 +1298,13 @@ func (j *Library) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	j.createApiXmlFile(ctx)
 
 	if j.dexer.proguardDictionary.Valid() {
-		android.SetProvider(ctx, ProguardProvider, ProguardInfo{
+		android.SetProvider(ctx, ProguardProvider, ProguardInfos{{
 			ModuleName:         android.ModuleNameWithPossibleOverride(ctx),
 			Class:              "JAVA_LIBRARIES",
 			ProguardDictionary: j.dexer.proguardDictionary.Path(),
 			ProguardUsageZip:   j.dexer.proguardUsageZip.Path(),
 			ClassesJar:         j.implementationAndResourcesJar,
-		})
+		}})
 	}
 
 	if ctx.Os() == android.Windows {
@@ -1613,7 +1664,7 @@ type testProperties struct {
 
 	// the name of the test configuration (for example "AndroidTest.xml") that should be
 	// installed with the module.
-	Test_config *string `android:"path,arch_variant"`
+	Test_config proptools.Configurable[string] `android:"path,arch_variant,replace_instead_of_append"`
 
 	// the name of the test configuration template (for example "AndroidTestTemplate.xml") that
 	// should be installed with the module.
@@ -1621,7 +1672,7 @@ type testProperties struct {
 
 	// list of files or filegroup modules that provide data that should be installed alongside
 	// the test
-	Data []string `android:"path"`
+	Data proptools.Configurable[[]string] `android:"path"`
 
 	// Same as data, but will add dependencies on modules using the device's os variation and
 	// the common arch variation. Useful for a host test that wants to embed a module built for
@@ -1666,6 +1717,10 @@ type testProperties struct {
 
 	// Install the test into a folder named for the module in all test suites.
 	Per_testcase_directory *bool
+
+	// Whether to include a static aconfig pb as a test resource. If the pb is included and a
+	// flag is read-only, tests read the flag value from the static pb.
+	Enable_static_aconfig_pb *bool
 }
 
 type hostTestProperties struct {
@@ -1710,7 +1765,7 @@ type prebuiltTestProperties struct {
 
 	// the name of the test configuration (for example "AndroidTest.xml") that should be
 	// installed with the module.
-	Test_config *string `android:"path,arch_variant"`
+	Test_config proptools.Configurable[string] `android:"path,arch_variant,replace_instead_of_append"`
 }
 
 type Test struct {
@@ -1744,6 +1799,7 @@ type JavaTestImport struct {
 	dexJarFile android.Path
 }
 
+// @auto-generate: gob
 type JavaTestInfo struct {
 	TestConfig android.Path
 }
@@ -1934,7 +1990,7 @@ func (j *Test) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 func (j *Test) generateAndroidBuildActionsWithConfig(ctx android.ModuleContext, configs []tradefed.Config) {
 	if j.testProperties.Test_options.Unit_test == nil && ctx.Host() {
 		// TODO(b/): Clean temporary heuristic to avoid unexpected onboarding.
-		defaultUnitTest := !inList("tradefed", j.properties.Libs) && !inList("cts", j.testProperties.Test_suites)
+		defaultUnitTest := !inList("tradefed", j.properties.Libs.GetOrDefault(ctx, nil)) && !inList("cts", j.testProperties.Test_suites)
 		j.testProperties.Test_options.Unit_test = proptools.BoolPtr(defaultUnitTest)
 	}
 	j.testConfig = tradefed.AutoGenTestConfig(ctx, tradefed.AutoGenTestConfigOptions{
@@ -1951,12 +2007,16 @@ func (j *Test) generateAndroidBuildActionsWithConfig(ctx android.ModuleContext, 
 		HostUnitTestTemplate:    "${JavaHostUnitTestConfigTemplate}",
 	})
 
-	j.data = android.PathsForModuleSrc(ctx, j.testProperties.Data)
+	j.data = android.PathsForModuleSrc(ctx, j.testProperties.Data.GetOrDefault(ctx, nil))
 	j.data = append(j.data, android.PathsForModuleSrc(ctx, j.testProperties.Device_common_data)...)
 	j.data = append(j.data, android.PathsForModuleSrc(ctx, j.testProperties.Device_first_data)...)
 	j.data = append(j.data, android.PathsForModuleSrc(ctx, j.testProperties.Device_first_prefer32_data)...)
 	j.data = append(j.data, android.PathsForModuleSrc(ctx, j.testProperties.Host_common_data)...)
 	j.data = append(j.data, android.PathsForModuleSrc(ctx, j.testProperties.Host_first_data)...)
+
+	if Bool(j.testProperties.Enable_static_aconfig_pb) {
+		addStaticAconfigProto(ctx, &j.extraResources)
+	}
 
 	j.extraTestConfigs = android.PathsForModuleSrc(ctx, j.testProperties.Test_options.Extra_test_configs)
 
@@ -1983,7 +2043,7 @@ func (j *Test) generateAndroidBuildActionsWithConfig(ctx android.ModuleContext, 
 			}
 			relocatedLib := android.PathForModuleOut(ctx, "relocated").Join(ctx, relPath)
 			ctx.Build(pctx, android.BuildParams{
-				Rule:   android.Cp,
+				Rule:   android.CpRule,
 				Input:  sharedLibInfo.SharedLibrary,
 				Output: relocatedLib,
 			})
@@ -2312,15 +2372,12 @@ func (j *Binary) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 				wrapper := android.PathForModuleOut(ctx, ctx.ModuleName()+".sh")
 				jarName := j.Stem() + ".jar"
 				partition := j.PartitionTag(ctx.DeviceConfig())
-				ctx.Build(pctx, android.BuildParams{
-					Rule:   deviceBinaryWrapper,
-					Output: wrapper,
-					Args: map[string]string{
-						"jar_name":   jarName,
-						"partition":  partition,
-						"main_class": String(j.binaryProperties.Main_class),
-					},
-				})
+				mainClass := String(j.binaryProperties.Main_class)
+				content := fmt.Sprintf("#!/system/bin/sh\n"+
+					"export CLASSPATH=/system/framework/%s\n"+
+					"exec app_process /%s/bin %s \"$@\"\n",
+					jarName, partition, mainClass)
+				android.WriteFileRule(ctx, wrapper, content)
 				j.wrapperFile = wrapper
 			}
 		} else {
@@ -2359,7 +2416,7 @@ func (j *Binary) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 
 	// Compile the jar
 	if j.binaryProperties.Main_class != nil {
-		if j.properties.Manifest != nil {
+		if j.properties.Manifest.GetOrDefault(ctx, "") != "" {
 			ctx.PropertyErrorf("main_class", "main_class cannot be used when manifest is set")
 		}
 		manifestFile := android.PathForModuleOut(ctx, "manifest.txt")
@@ -2445,6 +2502,7 @@ func ApiContributionFactory() android.Module {
 	return module
 }
 
+// @auto-generate: gob
 type JavaApiImportInfo struct {
 	ApiFile    android.Path
 	ApiSurface string
@@ -2494,11 +2552,11 @@ type ApiLibrary struct {
 	kSnapshotFiles map[string]android.Path
 }
 
-func (al ApiLibrary) JarToSnapshotMap() map[string]android.Path {
+func (al *ApiLibrary) JarToSnapshotMap() map[string]android.Path {
 	return al.kSnapshotFiles
 }
 
-var _ KSnapshotContainer = ApiLibrary{}
+var _ KSnapshotContainer = (*ApiLibrary)(nil)
 
 type JavaApiLibraryProperties struct {
 	// name of the API surface
@@ -2588,6 +2646,7 @@ func metalavaStubCmd(ctx android.ModuleContext, rule *android.RuleBuilder,
 
 	cmd := rule.Command()
 	cmd.FlagWithArg("ANDROID_PREFS_ROOT=", homeDir.String())
+	rule.ToolchainPaths(filepath.Dir(config.JavaCmd(ctx).String()))
 
 	if metalavaUseRewrapper(ctx) {
 		rule.Remoteable(android.RemoteRuleSupports{RBE: true})
@@ -2625,15 +2684,7 @@ func metalavaStubCmd(ctx android.ModuleContext, rule *android.RuleBuilder,
 
 	addOptionalApiSurfaceToCmd(cmd, apiSurface)
 
-	if len(classpath) == 0 {
-		// The main purpose of the `--api-class-resolution api` option is to force metalava to ignore
-		// classes on the classpath when an API file contains missing classes. However, as this command
-		// does not specify `--classpath` this is not needed for that. However, this is also used as a
-		// signal to the special metalava code for generating stubs from text files that it needs to add
-		// some additional items into the API (e.g. default constructors).
-		cmd.FlagWithArg("--api-class-resolution ", "api")
-	} else {
-		cmd.FlagWithArg("--api-class-resolution ", "api:classpath")
+	if len(classpath) != 0 {
 		cmd.FlagWithInputList("--classpath ", classpath, ":")
 	}
 
@@ -2734,18 +2785,15 @@ func (al *ApiLibrary) sortApiFilesByApiScope(ctx android.ModuleContext, srcFiles
 	return srcFilesInfo
 }
 
-var validstubsType = []StubsType{Everything, Runtime, Exportable}
-
 func (al *ApiLibrary) validateProperties(ctx android.ModuleContext) {
 	if al.properties.Stubs_type == nil {
 		ctx.ModuleErrorf("java_api_library module type must specify stubs_type property.")
 	} else {
-		al.stubsType = StringToStubsType(proptools.String(al.properties.Stubs_type))
-	}
-
-	if !android.InList(al.stubsType, validstubsType) {
-		ctx.PropertyErrorf("stubs_type", "%s is not a valid stubs_type property value. "+
-			"Must be one of %s.", proptools.String(al.properties.Stubs_type), validstubsType)
+		stubsType, err := StringToStubsType(proptools.String(al.properties.Stubs_type))
+		if err != nil {
+			ctx.PropertyErrorf("stubs_type", err.Error())
+		}
+		al.stubsType = stubsType
 	}
 }
 
@@ -2754,11 +2802,10 @@ func (al *ApiLibrary) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 
 	al.kSnapshotFiles = make(map[string]android.Path)
 
-	rule := android.NewRuleBuilder(pctx, ctx)
+	rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 
 	rule.Sbox(android.PathForModuleOut(ctx, "metalava"),
-		android.PathForModuleOut(ctx, "metalava.sbox.textproto")).
-		SandboxInputs()
+		android.PathForModuleOut(ctx, "metalava.sbox.textproto"))
 
 	stubsDir := android.OptionalPathForPath(android.PathForModuleOut(ctx, "metalava", "stubsDir"))
 	rule.Command().Text("rm -rf").Text(stubsDir.String())
@@ -2856,7 +2903,7 @@ func (al *ApiLibrary) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 		al.addValidation(ctx, cmd, al.validationPaths)
 	}
 
-	generateRevertAnnotationArgs(ctx, cmd, al.stubsType, al.aconfigProtoFiles)
+	generateMetalavaFlagConfigArgs(ctx, cmd, al.stubsType, al.aconfigProtoFiles)
 
 	al.stubsSrcJar = android.PathForModuleOut(ctx, "metalava", ctx.ModuleName()+"-"+"stubs.srcjar")
 	al.stubsJarWithoutStaticLibs = android.PathForModuleOut(ctx, "metalava", "stubs.jar")
@@ -2884,7 +2931,7 @@ func (al *ApiLibrary) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	TransformJavaToClasses(ctx, al.stubsJarWithoutStaticLibs, 0, android.Paths{},
 		android.Paths{al.stubsSrcJar}, annoSrcJar, javacFlags, android.Paths{}, nil)
 
-	builder := android.NewRuleBuilder(pctx, ctx)
+	builder := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	builder.Command().
 		BuiltTool("merge_zips").
 		Output(al.stubsJar).
@@ -3031,7 +3078,7 @@ type ImportProperties struct {
 	Permitted_packages []string
 
 	// List of shared java libs that this module has dependencies to
-	Libs []string
+	Libs proptools.Configurable[[]string]
 
 	// List of static java libs that this module has dependencies to
 	Static_libs proptools.Configurable[[]string]
@@ -3160,11 +3207,14 @@ func (j *Import) CreatedByJavaSdkLibraryName() *string {
 }
 
 func (j *Import) DepsMutator(ctx android.BottomUpMutatorContext) {
-	ctx.AddVariationDependencies(nil, libTag, j.properties.Libs...)
+	ctx.AddVariationDependencies(nil, libTag, j.properties.Libs.GetOrDefault(ctx, nil)...)
 	ctx.AddVariationDependencies(nil, staticLibTag, j.properties.Static_libs.GetOrDefault(ctx, nil)...)
 
+	j.setOptimizeForceDisabled(proptools.Bool(j.properties.Is_stubs_module))
+
 	if ctx.Device() && Bool(j.dexProperties.Compile_dex) {
-		sdkDeps(ctx, android.SdkContext(j), j.dexer)
+		addR8DexDeps := !j.isOptimizeForceDisabled(ctx)
+		sdkDeps(ctx, android.SdkContext(j), addR8DexDeps)
 	}
 
 	j.EmbeddableSdkLibraryComponent.setComponentDependencyInfoProvider(ctx)
@@ -3328,17 +3378,27 @@ func (j *Import) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	proguardFlags := android.PathForModuleOut(ctx, "proguard_flags")
 	TransformJarToR8Rules(ctx, proguardFlags, outputFile)
 
-	transitiveProguardFlags, transitiveUnconditionalExportedFlags := collectDepProguardSpecInfo(ctx)
+	proguardSpecInfo := collectDepProguardSpecInfo(ctx)
 	android.SetProvider(ctx, ProguardSpecInfoProvider, ProguardSpecInfo{
 		ProguardFlagsFiles: depset.New[android.Path](
 			depset.POSTORDER,
 			android.Paths{proguardFlags},
-			transitiveProguardFlags,
+			proguardSpecInfo.transitiveProguardFlags,
+		),
+		IncludedProguardFlagsFiles: depset.New[android.Path](
+			depset.POSTORDER,
+			nil,
+			proguardSpecInfo.transitiveIncludedProguardFlags,
 		),
 		UnconditionallyExportedProguardFlags: depset.New[android.Path](
 			depset.POSTORDER,
 			nil,
-			transitiveUnconditionalExportedFlags,
+			proguardSpecInfo.transitiveUnconditionalExportedFlags,
+		),
+		IncludedUnconditionallyExportedProguardFlags: depset.New[android.Path](
+			depset.POSTORDER,
+			nil,
+			proguardSpecInfo.transitiveIncludedUnconditionalExportedFlags,
 		),
 	})
 
@@ -3502,6 +3562,7 @@ func (m *Import) GetDepInSameApexChecker() android.DepInSameApexChecker {
 	return JavaImportDepInSameApexChecker{}
 }
 
+// @auto-generate: gob
 type JavaImportDepInSameApexChecker struct {
 	android.BaseDepInSameApexChecker
 }
@@ -3561,6 +3622,7 @@ var _ android.IDEInfo = (*Import)(nil)
 // Collect information for opening IDE project files in java/jdeps.go.
 func (j *Import) IDEInfo(ctx android.BaseModuleContext, dpInfo *android.IdeInfo) {
 	dpInfo.Jars = append(dpInfo.Jars, j.combinedImplementationFile.String())
+	dpInfo.Imported_jars = append(dpInfo.Imported_jars, android.PathsForModuleSrc(ctx, j.properties.Jars).Strings()...)
 }
 
 var _ android.PrebuiltInterface = (*Import)(nil)
@@ -3626,6 +3688,7 @@ type DexImport struct {
 	android.ModuleBase
 	android.DefaultableModuleBase
 	android.ApexModuleBase
+	blueprint.ModuleUsesIncrementalWalkDeps
 	prebuilt android.Prebuilt
 
 	properties DexImportProperties
@@ -3655,6 +3718,10 @@ func (j *DexImport) IsInstallable() bool {
 	return true
 }
 
+func (j *DexImport) DepsMutator(ctx android.BottomUpMutatorContext) {
+	j.dexpreopter.DepsMutator(ctx)
+}
+
 func (j *DexImport) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	if len(j.properties.Jars) != 1 {
 		ctx.PropertyErrorf("jars", "exactly one jar must be provided")
@@ -3673,7 +3740,7 @@ func (j *DexImport) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	dexOutputFile := android.PathForModuleOut(ctx, ctx.ModuleName()+".jar")
 
 	if j.dexpreopter.uncompressedDex {
-		rule := android.NewRuleBuilder(pctx, ctx)
+		rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 
 		temporary := android.PathForModuleOut(ctx, ctx.ModuleName()+".jar.unaligned")
 		rule.Temporary(temporary)
@@ -3698,7 +3765,7 @@ func (j *DexImport) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 		rule.Build("uncompress_dex", "uncompress dex")
 	} else {
 		ctx.Build(pctx, android.BuildParams{
-			Rule:   android.Cp,
+			Rule:   android.CpRule,
 			Input:  inputJar,
 			Output: dexOutputFile,
 		})
@@ -4066,5 +4133,44 @@ func setExtraJavaInfo(ctx android.ModuleContext, module android.Module, javaInfo
 			javaInfo.KSnapshotFiles = make(map[string]android.Path)
 		}
 		maps.Copy(javaInfo.KSnapshotFiles, ksc.JarToSnapshotMap())
+	}
+}
+
+func getCombinedAconfigProtoFile(ctx android.ModuleContext) android.Path {
+	var aconfigProtoFiles android.Paths
+	ctx.VisitDirectDepsProxyWithTag(staticLibTag, func(dep android.ModuleProxy) {
+		if provider, ok := android.OtherModuleProvider(ctx, dep, JavaInfoProvider); ok {
+			aconfigProtoFiles = append(aconfigProtoFiles, provider.AconfigIntermediateCacheOutputPaths...)
+		}
+	})
+	ctx.VisitDirectDepsProxyWithTag(libTag, func(dep android.ModuleProxy) {
+		if provider, ok := android.OtherModuleProvider(ctx, dep, JavaInfoProvider); ok {
+			aconfigProtoFiles = append(aconfigProtoFiles, provider.AconfigIntermediateCacheOutputPaths...)
+		}
+	})
+
+	if len(aconfigProtoFiles) > 0 {
+		combinedAconfigProtoFile := android.PathForModuleOut(ctx, "aconfig.pb")
+		rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
+		rule.Command().
+			BuiltTool("aconfig").
+			Text("dump-cache").
+			Flag("--dedup").
+			Flag("--format").
+			Text("protobuf").
+			FlagForEachArg("--filter ", []string{"state:ENABLED", "permission:READ_WRITE"}).
+			FlagForEachInput("--cache ", aconfigProtoFiles).
+			FlagWithOutput("--out ", combinedAconfigProtoFile)
+
+		rule.Build("combine-aconfig-protos", "combine aconfig protos")
+
+		return combinedAconfigProtoFile
+	}
+	return nil
+}
+
+func addStaticAconfigProto(ctx android.ModuleContext, extraResources *android.Paths) {
+	if pb := getCombinedAconfigProtoFile(ctx); pb != nil {
+		*extraResources = append(*extraResources, pb)
 	}
 }

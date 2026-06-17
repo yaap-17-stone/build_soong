@@ -24,6 +24,8 @@ import (
 	"github.com/google/blueprint/proptools"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 func init() {
 	RegisterRuntimeResourceOverlayBuildComponents(android.InitRegistrationContext)
 }
@@ -34,6 +36,7 @@ func RegisterRuntimeResourceOverlayBuildComponents(ctx android.RegistrationConte
 	ctx.RegisterModuleType("override_runtime_resource_overlay", OverrideRuntimeResourceOverlayModuleFactory)
 }
 
+// @auto-generate: gob
 type RuntimeResourceOverlayInfo struct {
 	OutputFile                    android.Path
 	Certificate                   Certificate
@@ -47,6 +50,9 @@ type RuntimeResourceOverlay struct {
 	android.ModuleBase
 	android.DefaultableModuleBase
 	android.OverridableModuleBase
+	// TODO(b/461815001): remove this and replace usage of WalkDepsProxy with
+	//  VisitDirectDepsProxy and DepSets.
+	blueprint.ModuleUsesIncrementalWalkDeps
 	aapt
 
 	properties            RuntimeResourceOverlayProperties
@@ -196,7 +202,8 @@ func (r *RuntimeResourceOverlay) GenerateAndroidBuildActions(ctx android.ModuleC
 
 	rotationMinSdkVersion := String(r.properties.RotationMinSdkVersion)
 
-	SignAppPackage(ctx, signed, r.aapt.exportPackage, certificates, nil, lineageFile, rotationMinSdkVersion)
+	SignAppPackage(ctx, signed, r.aapt.exportPackage, certificates, nil, lineageFile,
+		rotationMinSdkVersion, r.MinSdkVersion(ctx))
 
 	r.outputFile = signed
 	partition := rroPartition(ctx)
@@ -317,10 +324,12 @@ func OverrideRuntimeResourceOverlayModuleFactory() android.Module {
 var (
 	generateOverlayManifestFile = pctx.AndroidStaticRule("generate_overlay_manifest",
 		blueprint.RuleParams{
-			Command: "build/make/tools/generate-enforce-rro-android-manifest.py " +
-				"--package-info $in " +
-				"--partition ${partition} " +
-				"--priority ${priority} -o $out",
+			Command2: blueprint.NewCommand(
+				android.Python3, ` build/make/tools/generate-enforce-rro-android-manifest.py `,
+				`--package-info $in `,
+				`--partition ${partition} `,
+				`--priority ${priority} -o $out`,
+			),
 			CommandDeps: []string{"build/make/tools/generate-enforce-rro-android-manifest.py"},
 		}, "partition", "priority",
 	)
@@ -427,7 +436,7 @@ func (a *AutogenRuntimeResourceOverlay) GenerateAndroidBuildActions(ctx android.
 	var certificates []Certificate
 	a.certificate, certificates = processMainCert(a.ModuleBase, "", nil, ctx)
 	signed := android.PathForModuleOut(ctx, "signed", a.Name()+".apk")
-	SignAppPackage(ctx, signed, a.exportPackage, certificates, nil, nil, "")
+	SignAppPackage(ctx, signed, a.exportPackage, certificates, nil, nil, "", a.MinSdkVersion(ctx))
 	a.outputFile = signed
 
 	// Install the signed apk

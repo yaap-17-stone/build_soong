@@ -41,6 +41,7 @@ func registerBuildComponents(ctx android.RegistrationContext) {
 type sdkRepoHost struct {
 	android.ModuleBase
 	android.PackagingBase
+	blueprint.ModuleUsesIncrementalWalkDeps
 
 	properties sdkRepoHostProperties
 }
@@ -52,7 +53,7 @@ type remapProperties struct {
 
 type sdkRepoHostProperties struct {
 	// The top level directory to use for the SDK repo.
-	Base_dir *string
+	Base_dir proptools.Configurable[string] `android:"replace_instead_of_append"`
 
 	// List of src:dst mappings to rename files from `deps`.
 	Deps_remap []remapProperties `android:"arch_variant"`
@@ -67,6 +68,9 @@ type sdkRepoHostProperties struct {
 	// List of files to strip. This should be a list of files, not modules. This happens after
 	// `deps_remap` and `merge_zips` are applied, but before the `base_dir` is added.
 	Strip_files []string `android:"arch_variant"`
+
+	// Add $(OUT)/soong/framework.aidl into the SDK repo if set to true.
+	Pack_framework_aidl *bool
 }
 
 // android_sdk_repo_host defines an Android SDK repo containing host tools.
@@ -113,9 +117,20 @@ func (s *sdkRepoHost) DepsMutator(ctx android.BottomUpMutatorContext) {
 func (s *sdkRepoHost) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	dir := android.PathForModuleOut(ctx, "zip")
 	outputZipFile := dir.Join(ctx, "output.zip")
-	builder := android.NewRuleBuilder(pctx, ctx).
-		Sbox(dir, android.PathForModuleOut(ctx, "out.sbox.textproto")).
-		SandboxInputs()
+	builder := android.NewRuleBuilder(pctx, ctx).SandboxDisabled().
+		Sbox(dir, android.PathForModuleOut(ctx, "out.sbox.textproto"))
+
+	// Always create the dir not rely on BuildNoticeTextOutputFromLicenseMetadata because the notice text may not be generated if there's not other deps.
+	builder.Command().Textf("mkdir -p %s", dir)
+
+	// Handle `merge_zips` by extracting their contents into our tmpdir.  Do this first in case their
+	// files (like NOTICE.txt) need to be overwritten.
+	if zips := android.PathsForModuleSrc(ctx, s.properties.Merge_zips); len(zips) > 0 {
+		builder.Command().
+			BuiltTool("zipsync").
+			FlagWithArg("-d ", dir.String()).
+			Inputs(zips)
+	}
 
 	// Get files from modules listed in `deps`
 	packageSpecs := s.GatherPackagingSpecs(ctx)
@@ -128,33 +143,33 @@ func (s *sdkRepoHost) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 
 	s.CopySpecsToDir(ctx, builder, packageSpecs, dir)
 
-	noticeFile := android.PathForModuleOut(ctx, "NOTICES.txt")
-	android.BuildNoticeTextOutputFromLicenseMetadata(
-		ctx, noticeFile, "", "",
-		android.BuildNoticeFromLicenseDataArgs{
-			StripPrefix: []string{
-				android.PathForModuleInstall(ctx, "sdk-repo").String() + "/",
-				outputZipFile.String(),
-			},
-		}, ctx.ModuleProxy())
-	builder.Command().Text("cp").
-		Input(noticeFile).
-		Text(filepath.Join(dir.String(), "NOTICE.txt"))
-
-	// Handle `merge_zips` by extracting their contents into our tmpdir
-	for _, zip := range android.PathsForModuleSrc(ctx, s.properties.Merge_zips) {
-		builder.Command().
-			Text("unzip").
-			Flag("-DD").
-			Flag("-q").
-			FlagWithArg("-d ", dir.String()).
-			Input(zip)
+	// NOTICES can only be generated if there is any deps defined.
+	if len(packageSpecs) > 0 {
+		noticeFile := android.PathForModuleOut(ctx, "NOTICES.txt")
+		android.BuildNoticeTextOutputFromLicenseMetadata(
+			ctx, noticeFile, "", "",
+			android.BuildNoticeFromLicenseDataArgs{
+				StripPrefix: []string{
+					android.PathForModuleInstall(ctx, "sdk-repo").String() + "/",
+					outputZipFile.String(),
+				},
+			}, ctx.ModuleProxy())
+		builder.Command().Text("cp").
+			Input(noticeFile).
+			Text(filepath.Join(dir.String(), "NOTICE.txt"))
 	}
 
 	// Copy files from `srcs` into our tmpdir
 	for _, src := range android.PathsForModuleSrc(ctx, s.properties.Srcs) {
 		builder.Command().
 			Text("cp").Input(src).Flag(dir.Join(ctx, src.Rel()).String())
+	}
+
+	// Add framework.aidl into our tmpdir.
+	if proptools.BoolDefault(s.properties.Pack_framework_aidl, false) {
+		frameworkAidlPath := android.PathForOutput(ctx, "framework.aidl")
+		builder.Command().
+			Text("cp").Input(frameworkAidlPath).Flag(dir.String())
 	}
 
 	// Handle `strip_files` by calling the necessary strip commands
@@ -224,17 +239,26 @@ func (s *sdkRepoHost) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	builder.Command().
 		BuiltTool("soong_zip").
 		FlagWithOutput("-o ", outputZipFile).
-		FlagWithArg("-P ", proptools.StringDefault(s.properties.Base_dir, ".")).
+		FlagWithArg("-P ", s.properties.Base_dir.GetOrDefault(ctx, ".")).
 		FlagWithArg("-C ", dir.String()).
 		FlagWithArg("-D ", dir.String())
 	builder.Command().Text("rm").Flag("-rf").Text(dir.String())
 
 	builder.Build("build_sdk_repo", "Creating sdk-repo-"+s.BaseModuleName())
 
+	ctx.SetOutputFiles(android.Paths{outputZipFile}, "")
+
 	osName := ctx.Os().String()
 	if osName == "linux_glibc" {
 		osName = "linux"
 	}
+
+	// Keep the names of legacy SDK targets, but add an architecture suffix for new
+	// cross-compiled arm64 tools.
+	if arch := ctx.MultiTargets()[0].Arch.ArchType; arch != android.X86_64 && ctx.Os() != android.Darwin {
+		osName += "-" + arch.Name
+	}
+
 	name := fmt.Sprintf("sdk-repo-%s-%s", osName, s.BaseModuleName())
 
 	installPath := android.PathForModuleInstall(ctx, "sdk-repo")
@@ -249,8 +273,13 @@ func (s *sdkRepoHost) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 }
 
 func remapPackageSpecs(specs map[string]android.PackagingSpec, remaps []remapProperties) error {
+	remapped := make(map[string]bool)
 	for _, remap := range remaps {
-		for path, spec := range specs {
+		paths := android.SortedKeys(specs)
+		for _, path := range paths {
+			if _, alreadyRemapped := remapped[path]; alreadyRemapped {
+				continue
+			}
 			if match, err := pathtools.Match(remap.From, path); err != nil {
 				return fmt.Errorf("Error parsing %q: %v", remap.From, err)
 			} else if match {
@@ -262,9 +291,11 @@ func remapPackageSpecs(specs map[string]android.PackagingSpec, remaps []remapPro
 					}
 					newPath = filepath.Join(remap.To, rel)
 				}
+				spec := specs[path]
 				delete(specs, path)
 				spec.SetRelPathInPackage(newPath)
 				specs[newPath] = spec
+				remapped[newPath] = true
 			}
 		}
 	}

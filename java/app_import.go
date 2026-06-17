@@ -29,6 +29,8 @@ import (
 	"android/soong/provenance"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 func init() {
 	RegisterAppImportBuildComponents(android.InitRegistrationContext)
 
@@ -37,42 +39,53 @@ func init() {
 
 var (
 	uncompressEmbeddedJniLibsRule = pctx.AndroidStaticRule("uncompress-embedded-jni-libs", blueprint.RuleParams{
-		Command: `if (zipinfo $in 'lib/*.so' 2>/dev/null | grep -v ' stor ' >/dev/null) ; then ` +
-			`${config.Zip2ZipCmd} -i $in -o $out -0 'lib/**/*.so'` +
-			`; else cp -f $in $out; fi`,
-		CommandDeps: []string{"${config.Zip2ZipCmd}"},
+		Command2: blueprint.NewCommand(
+			`if (`, android.ZipInfo, ` $in 'lib/*.so' 2>/dev/null | `,
+			android.Grep, ` -v ' stor ' >/dev/null) ; then `,
+			android.Zip2zip, ` -i $in -o $out -0 'lib/**/*.so'`,
+			`; else `, android.Cp, ` -f $in $out; fi`,
+		),
 		Description: "Uncompress embedded JNI libs",
 	})
 
 	stripEmbeddedJniLibsUnusedArchRule = pctx.AndroidStaticRule("strip-embedded-jni-libs-from-unused-arch", blueprint.RuleParams{
-		Command:     `${config.Zip2ZipCmd} -i $in -o $out -x 'lib/**/*.so' $extraArgs`,
-		CommandDeps: []string{"${config.Zip2ZipCmd}"},
+		Command2: blueprint.NewCommand(
+			android.Zip2zip, ` -i $in -o $out -x 'lib/**/*.so' $extraArgs`,
+		),
 		Description: "Remove all JNI libs from unused architectures",
 	}, "extraArgs")
 
 	uncompressDexRule = pctx.AndroidStaticRule("uncompress-dex", blueprint.RuleParams{
-		Command: `if (zipinfo $in '*.dex' 2>/dev/null | grep -v ' stor ' >/dev/null) ; then ` +
-			`${config.Zip2ZipCmd} -i $in -o $out -0 'classes*.dex'` +
-			`; else cp -f $in $out; fi`,
-		CommandDeps: []string{"${config.Zip2ZipCmd}"},
+		Command2: blueprint.NewCommand(
+			`if (`, android.ZipInfo, ` $in '*.dex' 2>/dev/null | `,
+			android.Grep, ` -v ' stor ' >/dev/null) ; then `,
+			android.Zip2zip, ` -i $in -o $out -0 'classes*.dex'`,
+			`; else `, android.Cp, ` -f $in $out; fi`,
+		),
 		Description: "Uncompress dex files",
 	})
 
 	checkPresignedApkRule = pctx.AndroidStaticRule("check-presigned-apk", blueprint.RuleParams{
-		Command:     "build/soong/scripts/check_prebuilt_presigned_apk.py --aapt2 ${config.Aapt2Cmd} --zipalign ${config.ZipAlign} $extraArgs $in $out",
-		CommandDeps: []string{"build/soong/scripts/check_prebuilt_presigned_apk.py", "${config.Aapt2Cmd}", "${config.ZipAlign}"},
-		Description: "Check presigned apk",
+		Command:         "build/soong/scripts/check_prebuilt_presigned_apk.py --aapt2 ${config.Aapt2Cmd} --zipalign ${config.ZipAlign} $extraArgs $in $out",
+		CommandDeps:     []string{"build/soong/scripts/check_prebuilt_presigned_apk.py", "${config.Aapt2Cmd}", "${config.ZipAlign}"},
+		Description:     "Check presigned apk",
+		SandboxDisabled: true,
 	}, "extraArgs")
 
 	extractApkRule = pctx.AndroidStaticRule("extract-apk", blueprint.RuleParams{
-		Command:     "unzip -p $in $extract_apk > $out",
+		Command2: blueprint.NewCommand(
+			android.ZipSync, ` -d $out.tmpdir $in && `,
+			android.Cp, ` $out.tmpdir/$extract_apk $out && `,
+			android.Rm, ` -rf $out.tmpdir`,
+		),
 		Description: "Extract specific sub apk",
 	}, "extract_apk")
 
 	gzipRule = pctx.AndroidStaticRule("gzip",
 		blueprint.RuleParams{
-			Command:     "prebuilts/build-tools/path/linux-x86/gzip -9 -c $in > $out",
-			CommandDeps: []string{"prebuilts/build-tools/path/linux-x86/gzip"},
+			Command2: blueprint.NewCommand(
+				android.Gzip, ` -9 -c $in > $out`,
+			),
 			Description: "gzip $out",
 		})
 )
@@ -89,6 +102,9 @@ type AndroidAppImport struct {
 	android.ModuleBase
 	android.DefaultableModuleBase
 	android.ApexModuleBase
+	// TODO(b/461815001): remove this and replace usage of WalkDepsProxy with
+	//  VisitDirectDepsProxy and DepSets.
+	blueprint.ModuleUsesIncrementalWalkDeps
 	prebuilt android.Prebuilt
 
 	properties       AndroidAppImportProperties
@@ -267,6 +283,8 @@ func disablePrebuiltsWithoutApkMutator(ctx android.BottomUpMutatorContext) {
 }
 
 func (a *AndroidAppImport) DepsMutator(ctx android.BottomUpMutatorContext) {
+	a.dexpreopter.DepsMutator(ctx)
+
 	cert := android.SrcIsModule(a.properties.Certificate.GetOrDefault(ctx, ""))
 	if cert != "" {
 		ctx.AddDependency(ctx.Module(), certificateTag, cert)
@@ -291,7 +309,7 @@ func (a *AndroidAppImport) uncompressEmbeddedJniLibs(
 	// with them may invalidate pre-existing signature data.
 	if ctx.InstallInTestcases() && (a.properties.Presigned.GetOrDefault(ctx, false) || a.properties.Preprocessed.GetOrDefault(ctx, false)) {
 		ctx.Build(pctx, android.BuildParams{
-			Rule:   android.Cp,
+			Rule:   android.CpRule,
 			Output: outputPath,
 			Input:  inputPath,
 		})
@@ -493,7 +511,7 @@ func (a *AndroidAppImport) generateAndroidBuildActions(ctx android.ModuleContext
 		validationStamp := a.validatePresignedApk(ctx, srcApk)
 		output := android.PathForModuleOut(ctx, apkFilename)
 		ctx.Build(pctx, android.BuildParams{
-			Rule:       android.Cp,
+			Rule:       android.CpRule,
 			Input:      srcApk,
 			Output:     output,
 			Validation: validationStamp,
@@ -513,7 +531,8 @@ func (a *AndroidAppImport) generateAndroidBuildActions(ctx android.ModuleContext
 
 		rotationMinSdkVersion := String(a.properties.RotationMinSdkVersion)
 
-		SignAppPackage(ctx, signed, jnisUncompressed, certificates, nil, lineageFile, rotationMinSdkVersion)
+		SignAppPackage(ctx, signed, jnisUncompressed, certificates, nil, lineageFile,
+			rotationMinSdkVersion, a.MinSdkVersion(ctx))
 		a.outputFile = signed
 	} else {
 		validationStamp := a.validatePresignedApk(ctx, srcApk)
@@ -551,6 +570,8 @@ func (a *AndroidAppImport) generateAndroidBuildActions(ctx android.ModuleContext
 	ctx.SetOutputFiles([]android.Path{a.outputFile}, "")
 
 	buildComplianceMetadata(ctx)
+	src := a.prebuilt.SingleSource(ctx)
+	ctx.ComplianceMetadataInfo().SetPrebuiltSrc(ctx, src)
 
 	// TODO: androidmk converter jni libs
 }
@@ -606,6 +627,10 @@ func (a *AndroidAppImport) PrivAppAllowlist() android.OptionalPath {
 	return android.OptionalPath{}
 }
 
+func (a *AndroidAppImport) PreinstallAllowlist() android.OptionalPath {
+	return android.OptionalPath{}
+}
+
 const (
 	ArchGroupName = "Arch"
 	DpiGroupName  = "Dpi_variants"
@@ -647,6 +672,7 @@ func (m *AndroidAppImport) GetDepInSameApexChecker() android.DepInSameApexChecke
 	return AppImportDepInSameApexChecker{}
 }
 
+// @auto-generate: gob
 type AppImportDepInSameApexChecker struct {
 	android.BaseDepInSameApexChecker
 }

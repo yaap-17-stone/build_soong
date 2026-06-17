@@ -56,14 +56,14 @@ const FutureApiLevelInt = 10000
 // The differentiation is necessary to enable different validation rules for these two possible values.
 var PrivateApiLevel = ApiLevel{
 	value:     "current",             // The value is current since aidl expects `current` as the default (TestAidlFlagsWithMinSdkVersion)
-	number:    FutureApiLevelInt + 1, // This is used to differentiate it from FutureApiLevel
+	major:     FutureApiLevelInt + 1, // This is used to differentiate it from FutureApiLevel
 	isPreview: true,
 }
 
 // FutureApiLevel represents unreleased API levels.
 var FutureApiLevel = ApiLevel{
 	value:     "current",
-	number:    FutureApiLevelInt,
+	major:     FutureApiLevelInt,
 	isPreview: true,
 }
 
@@ -177,6 +177,14 @@ func (c Config) CoverageSuffix() string {
 	return ""
 }
 
+func (c Config) IsActionSandboxedBuild() bool {
+	return c.Getenv("SOONG_ACTION_SANDBOXING") == "nsjail"
+}
+
+func (c Config) ActionSandboxMetrics() *blueprint.SandboxMetrics {
+	return c.sandboxMetrics
+}
+
 // MaxPageSizeSupported returns the max page size supported by the device. This
 // value will define the ELF segment alignment for binaries (executables and
 // shared libraries).
@@ -251,8 +259,8 @@ func (c Config) ReleaseBuildClangVersion(defaultVersion string) string {
 	return defaultVersion
 }
 
-func (c Config) ReleaseBuildClangShortVersion(defaultVersion string) string {
-	if val, exists := c.GetBuildFlag("RELEASE_BUILD_CLANG_SHORT_VERSION"); exists && val != "" {
+func (c Config) ReleaseBuildCppStdVersion(defaultVersion string) string {
+	if val, exists := c.GetBuildFlag("RELEASE_BUILD_CPP_STD_VERSION"); exists && val != "" {
 		return val
 	}
 	return defaultVersion
@@ -305,16 +313,16 @@ func (c Config) ReleaseUseSystemFeatureXmlForUnavailableFeatures() bool {
 	return c.config.productVariables.GetBuildFlagBool("RELEASE_USE_SYSTEM_FEATURE_XML_FOR_UNAVAILABLE_FEATURES")
 }
 
-func (c Config) ReleaseRustUseArmTargetArchVariant() bool {
-	return c.config.productVariables.GetBuildFlagBool("RELEASE_RUST_USE_ARM_TARGET_ARCH_VARIANT")
-}
-
 func (c Config) ReleaseUseSparseEncoding() bool {
 	return c.config.productVariables.GetBuildFlagBool("RELEASE_SOONG_SPARSE_ENCODING")
 }
 
 func (c Config) ReleaseUseUncompressedFonts() bool {
 	return c.config.productVariables.GetBuildFlagBool("RELEASE_SOONG_UNCOMPRESSED_FONTS")
+}
+
+func (c Config) ReleaseUseFnoCommonFor3pCode() bool {
+	return c.config.productVariables.GetBuildFlagBool("RELEASE_SOONG_FNO_COMMON_FOR_3P_CODE")
 }
 
 func (c Config) ReleaseAconfigStorageVersion() string {
@@ -356,7 +364,7 @@ type VendorConfig soongconfig.SoongConfig
 // envDeps must be a singleton. non-generic and generic configurations share a single
 // instance of envDeps.
 type envDeps struct {
-	envLock   sync.Mutex
+	envLock   sync.RWMutex
 	envDeps   map[string]string
 	envFrozen bool
 }
@@ -383,6 +391,7 @@ type config struct {
 	BuildOSCommonTarget      Target // the Target for common (java) tools run on the build machine
 	AndroidCommonTarget      Target // the Target for common modules for the Android device
 	AndroidFirstDeviceTarget Target // the first Target for modules for the Android device
+	AndroidLFITarget         Target
 
 	// Flags for Partial Compile, derived from SOONG_PARTIAL_COMPILE.
 	partialCompileFlags partialCompileFlags
@@ -429,6 +438,8 @@ type config struct {
 	// built from the source Java files, not the signature text files.
 	buildFromSourceStub bool
 
+	sandboxMetrics *blueprint.SandboxMetrics
+
 	// If ensureAllowlistIntegrity is true, then the presence of any allowlisted
 	// modules that aren't mixed-built for at least one variant will cause a build
 	// failure
@@ -448,6 +459,8 @@ type config struct {
 	// modulesForTests stores the list of modules that exist during Soong tests.  It is nil
 	// when not running Soong tests.
 	modulesForTests *modulesForTests
+
+	buildUUIDFile string
 }
 
 type partialCompileFlags struct {
@@ -504,7 +517,7 @@ var allPartialCompileFlags = func() (flags partialCompileFlags) {
 }()
 
 // These are the flags when `SOONG_PARTIAL_COMPILE=default`.
-var defaultPartialCompileFlags = falsePartialCompileFlags
+var defaultPartialCompileFlags = truePartialCompileFlags
 
 type deviceConfig struct {
 	config *config
@@ -560,7 +573,6 @@ func (c *config) parsePartialCompileFlags(isEngBuild bool) (partialCompileFlags,
 		default:
 			panic(fmt.Errorf("Invalid state %v in parsePartialCompileFlags.makeVal", state))
 		}
-		return false
 	}
 	for _, tok := range tokens {
 		var state string
@@ -779,8 +791,6 @@ func initConfig(cmdArgs CmdArgs, availableEnv map[string]string) (*config, error
 
 		katiEnabled: cmdArgs.KatiEnabled,
 	}
-	variant, ok := os.LookupEnv("TARGET_BUILD_VARIANT")
-	isEngBuild := !ok || variant == "eng"
 
 	newConfig.deviceConfig = &deviceConfig{
 		config: newConfig,
@@ -817,7 +827,7 @@ func initConfig(cmdArgs CmdArgs, availableEnv map[string]string) (*config, error
 		return &config{}, err
 	}
 
-	newConfig.partialCompileFlags, err = newConfig.parsePartialCompileFlags(isEngBuild)
+	newConfig.partialCompileFlags, err = newConfig.parsePartialCompileFlags(newConfig.Eng())
 	if err != nil {
 		return &config{}, err
 	}
@@ -859,6 +869,8 @@ func initConfig(cmdArgs CmdArgs, availableEnv map[string]string) (*config, error
 	if len(newConfig.Targets[Android]) > 0 {
 		newConfig.AndroidCommonTarget = getCommonTargets(newConfig.Targets[Android])[0]
 		newConfig.AndroidFirstDeviceTarget = FirstTarget(newConfig.Targets[Android], "lib64", "lib32")[0]
+		newConfig.AndroidLFITarget = newConfig.AndroidFirstDeviceTarget
+		newConfig.AndroidLFITarget.LFI = true
 	}
 
 	setBuildMode := func(arg string, mode SoongBuildMode) {
@@ -875,6 +887,15 @@ func initConfig(cmdArgs CmdArgs, availableEnv map[string]string) (*config, error
 	newConfig.productVariables.Build_from_text_stub = boolPtr(newConfig.BuildFromTextStub())
 
 	newConfig.deviceNameToInstall = newConfig.productVariables.DeviceName
+
+	targetProduct := String(newConfig.productVariables.DeviceProduct)
+	buildUUIDFileSuffix := ""
+	if targetProduct != "" {
+		buildUUIDFileSuffix = "-" + targetProduct
+	}
+	newConfig.buildUUIDFile = "build_uuid" + buildUUIDFileSuffix + ".txt"
+
+	newConfig.sandboxMetrics = &blueprint.SandboxMetrics{}
 
 	return newConfig, err
 }
@@ -1000,6 +1021,26 @@ func (c *config) HostToolPath(ctx PathContext, tool string) Path {
 	return path
 }
 
+func (c *config) HostToolAndDepsPathsFromHostTool(ctx PathContext, tool blueprint.HostTool) Paths {
+	_, deps, _ := tool.GetValueAndDeps(ctx.Config())
+
+	getPath := func(path string) Path {
+		if relPath, err := filepath.Rel(ctx.Config().OutDir(), path); err == nil && !strings.HasPrefix(relPath, "../") {
+			return PathForArbitraryOutput(ctx, relPath)
+		}
+		if strings.HasSuffix(path, "-deps") {
+			return PathForPhony(ctx, path)
+		}
+		return PathForSource(ctx, path)
+	}
+
+	var paths Paths
+	for _, dep := range deps {
+		paths = append(paths, getPath(dep))
+	}
+	return paths
+}
+
 func (c *config) HostJNIToolPath(ctx PathContext, lib string) Path {
 	ext := ".so"
 	if runtime.GOOS == "darwin" {
@@ -1019,11 +1060,20 @@ func (c *config) HostCcSharedLibPath(ctx PathContext, lib string) Path {
 	if ctx.Config().BuildArch.Multilib == "lib64" {
 		libDir = "lib64"
 	}
-	return pathForInstall(ctx, ctx.Config().BuildOS, ctx.Config().BuildArch, libDir, lib+".so")
+	ext := ".so"
+	if runtime.GOOS == "darwin" {
+		ext = ".dylib"
+	}
+	return pathForInstall(ctx, ctx.Config().BuildOS, ctx.Config().BuildArch, libDir, lib+ext)
 }
 
 // PrebuiltOS returns the name of the host OS used in prebuilts directories.
 func (c *config) PrebuiltOS() string {
+	return prebuiltOS()
+}
+
+// PrebuiltOS returns the name of the host OS used in prebuilts directories.
+func prebuiltOS() string {
 	switch runtime.GOOS {
 	case "linux":
 		switch runtime.GOARCH {
@@ -1068,6 +1118,16 @@ func (c *config) CpPreserveSymlinksFlags() string {
 func (c *config) Getenv(key string) string {
 	var val string
 	var exists bool
+	c.envDeps.envLock.RLock()
+	if c.envDeps.envDeps != nil {
+		val, exists = c.envDeps.envDeps[key]
+	}
+	c.envDeps.envLock.RUnlock()
+
+	if exists {
+		return val
+	}
+
 	c.envDeps.envLock.Lock()
 	defer c.envDeps.envLock.Unlock()
 	if c.envDeps.envDeps == nil {
@@ -1145,6 +1205,12 @@ func (c *config) BuildFingerprintFile(ctx PathContext) Path {
 	return PathForArbitraryOutput(ctx, "target", "product", *c.deviceNameToInstall, String(c.productVariables.BuildFingerprintFile))
 }
 
+// BuildSystemFingerprintFile returns the path to a text file containing
+// metadata representing the current build's fingerprint for the system image.
+func (c *config) BuildSystemFingerprintFile(ctx PathContext) Path {
+	return PathForArbitraryOutput(ctx, "target", "product", *c.deviceNameToInstall, String(c.productVariables.BuildSystemFingerprintFile))
+}
+
 // BuildNumberFile returns the path to a text file containing metadata
 // representing the current build's number.
 //
@@ -1154,6 +1220,12 @@ func (c *config) BuildFingerprintFile(ctx PathContext) Path {
 // rebuild on every incremental build when the build number changes.
 func (c *config) BuildNumberFile(ctx PathContext) Path {
 	return PathForOutput(ctx, String(c.productVariables.BuildNumberFile))
+}
+
+// BuildUUIDFile returns the path to a text file containing metadata
+// representing the current build's UUID.
+func (c *config) BuildUUIDFile(ctx PathContext) Path {
+	return PathForOutput(ctx, c.buildUUIDFile)
 }
 
 // BuildHostnameFile returns the path to a text file containing metadata
@@ -1241,6 +1313,10 @@ func (c *config) PlatformSdkVersionFull() string {
 	return proptools.StringDefault(c.productVariables.Platform_sdk_version_full, "")
 }
 
+func (c *config) PlatformProspectiveSdkVersionFull() string {
+	return proptools.StringDefault(c.productVariables.Platform_prospective_sdk_version_full, "")
+}
+
 func (c *config) RawPlatformSdkVersion() *int {
 	return c.productVariables.Platform_sdk_version
 }
@@ -1254,7 +1330,11 @@ func (c *config) PlatformSdkCodename() string {
 }
 
 func (c *config) PlatformSdkExtensionVersion() int {
-	return *c.productVariables.Platform_sdk_extension_version
+	version := 1
+	if c.productVariables.Platform_sdk_extension_version != nil {
+		version = *c.productVariables.Platform_sdk_extension_version
+	}
+	return version
 }
 
 func (c *config) PlatformBaseSdkExtensionVersion() int {
@@ -1311,7 +1391,7 @@ func (c *config) PreviewApiLevels() []ApiLevel {
 
 		levels = append(levels, ApiLevel{
 			value:     codename,
-			number:    i,
+			major:     i,
 			isPreview: true,
 		})
 		i++
@@ -1357,6 +1437,11 @@ func (c *config) DefaultAppTargetSdk(ctx EarlyModuleContext) ApiLevel {
 		panic("Platform_sdk_codename should not be REL when Platform_sdk_final is true")
 	}
 	return ApiLevelOrPanic(ctx, codename)
+}
+
+// This file is written by soong_ui, and sourced by rules that need a value for `SOONG_USE_PARTIAL_COMPILE`.
+func (c *config) UsePartialCompileFile(ctx PathContext) Path {
+	return PathForOutput(ctx, "use_partial_compile-"+*c.deviceNameToInstall+".sh")
 }
 
 func (c *config) PartialCompileFlags() partialCompileFlags {
@@ -1473,6 +1558,15 @@ func (c *config) MainlineBluetoothSepolicyDevCertificatesDir(ctx ModuleContext) 
 	return c.DefaultAppCertificateDir(ctx)
 }
 
+// Certificate for the Nfc module sepolicy context
+func (c *config) MainlineNfcSepolicyDevCertificatesDir(ctx ModuleContext) SourcePath {
+	cert := String(c.productVariables.MainlineNfcSepolicyDevCertificates)
+	if cert != "" {
+		return PathForSource(ctx, cert)
+	}
+	return c.DefaultAppCertificateDir(ctx)
+}
+
 // AllowMissingDependencies configures Blueprint/Soong to not fail when modules
 // are configured to depend on non-existent modules. Note that this does not
 // affect missing input dependencies at the Ninja level.
@@ -1560,6 +1654,18 @@ func (c *config) DisableScudo() bool {
 	return Bool(c.productVariables.DisableScudo)
 }
 
+func (c *config) EnableXOM() bool {
+	// Use the Build Flag value if ENABLE_XOM is not set,
+	// otherwise use the value in product variables.
+	if c.productVariables.EnableXOM == nil {
+		return c.GetBuildFlagBool("RELEASE_BUILD_EXECUTE_ONLY_MEMORY")
+	} else if Bool(c.productVariables.EnableXOM) {
+		return true
+	} else {
+		return false
+	}
+}
+
 func (c *config) Android64() bool {
 	for _, t := range c.Targets[Android] {
 		if t.Arch.ArchType.Multilib == "lib64" {
@@ -1582,19 +1688,15 @@ func (c *config) UseREWrapper() bool {
 	return Bool(c.productVariables.UseREWrapper)
 }
 
-func (c *config) UseRBEJAVAC() bool {
-	return Bool(c.productVariables.UseRBEJAVAC) && c.UseREWrapper()
+// Return the container image used for RBE.
+//
+// This is found in build/make/core/rbe.mk, if not overridden elsewhere.
+func (c *config) RBEContainerImage() string {
+	return String(c.productVariables.RBEContainerImage)
 }
 
-func (c *config) UseRBER8() bool {
-	return Bool(c.productVariables.UseRBER8) && c.UseREWrapper()
-}
-
-func (c *config) UseRBED8() bool {
-	return Bool(c.productVariables.UseRBED8) && c.UseREWrapper()
-}
-
-func (c *config) UseRemoteBuild() bool {
+// Return true if we are using rewrapper **and** RBE.
+func (c *config) REWrapperRemoteBuild() bool {
 	return c.UseRBE() && c.UseREWrapper()
 }
 
@@ -1792,10 +1894,6 @@ func IsTrunkStableVendorApiLevel(level string) bool {
 
 func (c *config) VendorApiLevelFrozen() bool {
 	return c.productVariables.GetBuildFlagBool("RELEASE_BOARD_API_LEVEL_FROZEN")
-}
-
-func (c *config) katiPackageMkDir() string {
-	return filepath.Join(c.soongOutDir, "kati_packaging"+c.katiSuffix)
 }
 
 func (c *config) DisableNoticeXmlGeneration() bool {
@@ -2136,6 +2234,13 @@ func (c *config) HWASanEnabledForPath(path string) bool {
 	return HasAnyPrefix(path, c.productVariables.HWASanIncludePaths) && !c.HWASanDisabledForPath(path)
 }
 
+func (c *config) XOMDisabledForPath(path string) bool {
+	if c.productVariables.XOMExcludePaths == nil {
+		return false
+	}
+	return HasAnyPrefix(path, c.productVariables.XOMExcludePaths)
+}
+
 func (c *config) VendorConfig(name string) VendorConfig {
 	return soongconfig.Config(c.productVariables.VendorVars[name])
 }
@@ -2158,6 +2263,21 @@ func (c *config) ApexCompressionEnabled() bool {
 
 func (c *config) DefaultApexPayloadType() string {
 	return StringDefault(c.productVariables.DefaultApexPayloadType, "ext4")
+}
+
+func (c *config) DefaultApexPayloadErofsCompressor() string {
+	return String(c.productVariables.DefaultApexPayloadErofsCompressor)
+}
+
+func (c *config) DefaultApexPayloadErofsCompressHints(ctx PathContext) Path {
+	if String(c.productVariables.DefaultApexPayloadErofsCompressHints) == "" {
+		return nil
+	}
+	return PathForSource(ctx, *c.productVariables.DefaultApexPayloadErofsCompressHints)
+}
+
+func (c *config) DefaultApexPayloadErofsPclusterSize() int64 {
+	return c.productVariables.DefaultApexPayloadErofsPclusterSize
 }
 
 func (c *config) UseSoongSystemImage() bool {
@@ -2205,10 +2325,6 @@ func (c *config) ProductPublicSepolicyDirs() []string {
 
 func (c *config) ProductPrivateSepolicyDirs() []string {
 	return c.productVariables.ProductPrivateSepolicyDirs
-}
-
-func (c *config) TargetMultitreeUpdateMeta() bool {
-	return c.productVariables.MultitreeUpdateMeta
 }
 
 func (c *deviceConfig) DeviceArch() string {
@@ -2332,6 +2448,10 @@ func (c *deviceConfig) BuildDebugfsRestrictionsEnabled() bool {
 	return c.config.productVariables.BuildDebugfsRestrictionsEnabled
 }
 
+func (c *deviceConfig) RestrictsAshmemUsage() bool {
+	return c.config.productVariables.RestrictsAshmemUsage
+}
+
 func (c *deviceConfig) BuildBrokenVendorPropertyNamespace() bool {
 	return c.config.productVariables.BuildBrokenVendorPropertyNamespace
 }
@@ -2447,8 +2567,8 @@ func (c *config) UseOptimizedResourceShrinkingByDefault() bool {
 	return c.productVariables.GetBuildFlagBool("RELEASE_USE_OPTIMIZED_RESOURCE_SHRINKING_BY_DEFAULT")
 }
 
-func (c *config) UseR8FullModeByDefault() bool {
-	return c.productVariables.GetBuildFlagBool("RELEASE_R8_FULL_MODE_BY_DEFAULT")
+func (c *config) EnableAppOptimizationByDefault() bool {
+	return c.productVariables.GetBuildFlagBool("RELEASE_R8_OPTIMIZE_BY_DEFAULT")
 }
 
 func (c *config) UseR8OnlyRuntimeVisibleAnnotations() bool {
@@ -2469,6 +2589,10 @@ func (c *config) UseR8MinimizedSyntheticNames() bool {
 
 func (c *config) UseDexV41() bool {
 	return c.productVariables.GetBuildFlagBool("RELEASE_USE_DEX_V41")
+}
+
+func (c *config) OmitR8GlobalEnumKeeps() bool {
+	return c.productVariables.GetBuildFlagBool("RELEASE_R8_OMIT_GLOBAL_ENUM_KEEPS")
 }
 
 var (
@@ -2509,6 +2633,7 @@ var (
 		"RELEASE_APEX_CONTRIBUTIONS_TZDATA":                  "com.android.tzdata",
 		"RELEASE_APEX_CONTRIBUTIONS_UPROBESTATS":             "com.android.uprobestats",
 		"RELEASE_APEX_CONTRIBUTIONS_UWB":                     "com.android.uwb",
+		"RELEASE_APEX_CONTRIBUTIONS_WEBAPP":                  "com.android.webapp",
 		"RELEASE_APEX_CONTRIBUTIONS_WIFI":                    "com.android.wifi",
 	}
 )

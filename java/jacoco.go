@@ -29,6 +29,8 @@ import (
 	"android/soong/java/config"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 func init() {
 	android.InitRegistrationContext.RegisterParallelSingletonType("device_tests_jacoco_zip", deviceTestsJacocoZipSingletonFactory)
 }
@@ -46,6 +48,7 @@ var (
 			"${config.JacocoCLIJar}",
 			"${config.MergeZipsCmd}",
 		},
+		SandboxDisabled: true,
 	},
 		"strippedJar", "stripSpec", "tmpDir", "tmpJar")
 )
@@ -173,13 +176,17 @@ func jacocoFilterToSpec(filter string) (string, error) {
 	return spec, nil
 }
 
+// @auto-generate: gob
 type JacocoInfo struct {
 	ReportClassesFile android.Path
 	Class             string
 	ModuleName        string
 }
 
-var ApexJacocoInfoProvider = blueprint.NewProvider[[]JacocoInfo]()
+// @auto-generate: gob
+type JacocoInfos []JacocoInfo
+
+var ApexJacocoInfoProvider = blueprint.NewProvider[JacocoInfos]()
 
 type BuildJacocoZipContext interface {
 	android.BuilderContext
@@ -187,7 +194,7 @@ type BuildJacocoZipContext interface {
 }
 
 func BuildJacocoZip(ctx BuildJacocoZipContext, modules []android.ModuleProxy, outputFile android.WritablePath) {
-	jacocoZipBuilder := android.NewRuleBuilder(pctx, ctx)
+	jacocoZipBuilder := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	jacocoZipCmd := jacocoZipBuilder.Command().BuiltTool("soong_zip").
 		FlagWithOutput("-o ", outputFile).
 		Flag("-L 0")
@@ -216,7 +223,7 @@ func BuildJacocoZipWithPotentialDeviceTests(ctx android.ModuleContext, modules [
 	jacocoZipWithoutDeviceTests := android.PathForModuleOut(ctx, "temp-jacoco-report-classes-all-without-device-tests.jar")
 	BuildJacocoZip(ctx, modules, jacocoZipWithoutDeviceTests)
 	ctx.Build(pctx, android.BuildParams{
-		Rule:   android.MergeZips,
+		Rule:   android.MergeZipsRule,
 		Output: outputFile,
 		Inputs: []android.Path{
 			jacocoZipWithoutDeviceTests,

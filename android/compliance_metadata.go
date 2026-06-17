@@ -27,7 +27,7 @@ import (
 	"github.com/google/blueprint"
 )
 
-//go:generate go run ../../blueprint/gobtools/codegen/gob_gen.go
+//go:generate go run ../../blueprint/gobtools/codegen
 
 var (
 	// Constants of property names used in compliance metadata of modules
@@ -35,6 +35,7 @@ var (
 		NAME                   string
 		PACKAGE                string
 		MODULE_TYPE            string
+		BASE_MODULE_TYPE       string
 		OS                     string
 		ARCH                   string
 		IS_PRIMARY_ARCH        string
@@ -60,10 +61,18 @@ var (
 		// module_type=license_kind
 		LK_CONDITIONS string
 		LK_URL        string
+
+		// module_type=cipd_package
+		CIPD_VERSION string
+
+		// module_type=prebuilt modules
+		CIPD_SRC          string
+		PREBUILT_SRC_FILE string
 	}{
 		"name",
 		"package",
 		"module_type",
+		"base_module_type",
 		"os",
 		"arch",
 		"is_primary_arch",
@@ -86,6 +95,11 @@ var (
 
 		"lk_conditions",
 		"lk_url",
+
+		"cipd_version",
+
+		"cipd_src",
+		"prebuilt_src_file",
 	}
 
 	// A constant list of all property names in compliance metadata
@@ -94,6 +108,7 @@ var (
 		ComplianceMetadataProp.NAME,
 		ComplianceMetadataProp.PACKAGE,
 		ComplianceMetadataProp.MODULE_TYPE,
+		ComplianceMetadataProp.BASE_MODULE_TYPE,
 		ComplianceMetadataProp.OS,
 		ComplianceMetadataProp.ARCH,
 		ComplianceMetadataProp.VARIANT,
@@ -123,6 +138,11 @@ var (
 		// module_type=license_kind
 		ComplianceMetadataProp.LK_CONDITIONS,
 		ComplianceMetadataProp.LK_URL,
+		// module_type=cipd_package
+		ComplianceMetadataProp.CIPD_VERSION,
+		// module_type=prebuilt modules
+		ComplianceMetadataProp.CIPD_SRC,
+		ComplianceMetadataProp.PREBUILT_SRC_FILE,
 	}
 )
 
@@ -216,6 +236,35 @@ func (c *ComplianceMetadataInfo) AddBuiltFiles(files ...string) {
 	c.SetListValue(ComplianceMetadataProp.BUILT_FILES, builtFiles)
 }
 
+func (c *ComplianceMetadataInfo) SetPrebuiltSrc(ctx ModuleContext, src string) {
+	if module, tag := SrcIsModuleWithTag(src); module != "" {
+		m := GetModuleProxyFromPathDep(ctx, module, tag)
+		baseModuleType := OtherModuleProviderOrDefault(ctx, m, CommonModuleInfoProvider).BaseModuleType
+		if ctx.OtherModuleType(m) == "cipd_package" || baseModuleType == "cipd_package" ||
+			ctx.OtherModuleType(m) == "filegroup" || baseModuleType == "filegroup" {
+			paths, err := expandOneSrcPath(sourcePathInput{context: ctx, path: src, includeDirs: true})
+			if err != nil {
+				panic(err)
+			}
+			for _, p := range paths {
+				if strings.HasPrefix(p.String(), ctx.Config().SoongOutDir()) {
+					c.SetStringValue(ComplianceMetadataProp.CIPD_SRC, p.String())
+				} else {
+					c.SetStringValue(ComplianceMetadataProp.PREBUILT_SRC_FILE, p.String())
+				}
+			}
+		}
+	} else {
+		paths, err := expandOneSrcPath(sourcePathInput{context: ctx, path: src, includeDirs: true})
+		if err != nil {
+			panic(err)
+		}
+		for _, p := range paths {
+			c.SetStringValue(ComplianceMetadataProp.PREBUILT_SRC_FILE, p.String())
+		}
+	}
+}
+
 func (c *ComplianceMetadataInfo) getStringValue(propertyName string) string {
 	if !slices.Contains(COMPLIANCE_METADATA_PROPS, propertyName) {
 		panic(fmt.Errorf("Unknown metadata property: %s.", propertyName))
@@ -227,24 +276,26 @@ func (c *ComplianceMetadataInfo) getAllValues() map[string]string {
 	return c.properties
 }
 
-var (
-	ComplianceMetadataProvider = blueprint.NewProvider[*ComplianceMetadataInfo]()
-)
-
 // buildComplianceMetadataProvider starts with the ModuleContext.ComplianceMetadataInfo() and fills in more common metadata
 // for different module types without accessing their private fields but through android.Module interface
-// and public/private fields of package android. The final metadata is stored to a module's ComplianceMetadataProvider.
-func buildComplianceMetadataProvider(ctx *moduleContext, m *ModuleBase) {
+// and public/private fields of package android. The final metadata is stored to a module's CommonModuleInfo.
+func buildComplianceMetadataProvider(ctx *moduleContext, m *ModuleBase) *ComplianceMetadataInfo {
 	complianceMetadataInfo := ctx.ComplianceMetadataInfo()
 	complianceMetadataInfo.SetStringValue(ComplianceMetadataProp.NAME, m.Name())
 	complianceMetadataInfo.SetStringValue(ComplianceMetadataProp.PACKAGE, ctx.ModuleDir())
 	complianceMetadataInfo.SetStringValue(ComplianceMetadataProp.MODULE_TYPE, ctx.ModuleType())
 
+	if baseTypePtr := m.baseProperties.Soong_config_base_module_type; baseTypePtr != nil {
+		if baseType := *baseTypePtr; baseType != "" {
+			complianceMetadataInfo.SetStringValue(ComplianceMetadataProp.BASE_MODULE_TYPE, baseType)
+		}
+	}
+
 	switch ctx.ModuleType() {
 	case "license":
 		licenseModule := m.module.(*licenseModule)
 		complianceMetadataInfo.SetListValue(ComplianceMetadataProp.LIC_LICENSE_KINDS, licenseModule.properties.License_kinds)
-		complianceMetadataInfo.SetListValue(ComplianceMetadataProp.LIC_LICENSE_TEXT, PathsForModuleSrc(ctx, licenseModule.properties.License_text).Strings())
+		complianceMetadataInfo.SetListValue(ComplianceMetadataProp.LIC_LICENSE_TEXT, PathsForModuleSrc(ctx, licenseModule.properties.License_text.GetOrDefault(ctx, nil)).Strings())
 		complianceMetadataInfo.SetStringValue(ComplianceMetadataProp.LIC_PACKAGE_NAME, String(licenseModule.properties.Package_name))
 	case "license_kind":
 		licenseKindModule := m.module.(*licenseKindModule)
@@ -288,7 +339,7 @@ func buildComplianceMetadataProvider(ctx *moduleContext, m *ModuleBase) {
 		}
 		ctx.ComplianceMetadataInfo().AddBuiltFiles(builtFiles...)
 	}
-	ctx.setProvider(ComplianceMetadataProvider, complianceMetadataInfo)
+	return complianceMetadataInfo
 }
 
 func init() {
@@ -308,9 +359,10 @@ var (
 		blueprint.RuleParams{
 			Command: `rm -rf $out && ` +
 				`cat $out.rsp | tr ' ' '\n' | while read -r file || [ -n "$$file" ]; do ${sqlite3_noicu} $out ".import --csv $${file} $$(basename $${file} .csv)"; done`,
-			CommandDeps:    []string{"${sqlite3_noicu}"},
-			Rspfile:        `$out.rsp`,
-			RspfileContent: `$in`,
+			CommandDeps:     []string{"${sqlite3_noicu}"},
+			Rspfile:         `$out.rsp`,
+			RspfileContent:  `$in`,
+			SandboxDisabled: true,
 		})
 )
 
@@ -326,6 +378,13 @@ func writerToCsv(csvWriter *csv.Writer, row []string) {
 	if err != nil {
 		panic(err)
 	}
+}
+
+func GetComplianceMetadata(ctx OtherModuleProviderContext, module ModuleProxy) *ComplianceMetadataInfo {
+	if commInfo, ok := OtherModuleProvider(ctx, module, CommonModuleInfoProvider); ok {
+		return commInfo.ComplianceMetadata
+	}
+	return nil
 }
 
 // Collect compliance metadata from all Soong modules, write to a CSV file and
@@ -351,11 +410,14 @@ func (c *complianceMetadataSingleton) GenerateBuildActions(ctx SingletonContext)
 
 		moduleType := ctx.ModuleType(module)
 		if moduleType == "package" {
-			packageInfo := OtherModuleProviderOrDefault(ctx, module, PackageInfoProvider)
+			var primaryLicenses []string
+			if packageInfo := commonInfo.PackageInfo; packageInfo != nil {
+				primaryLicenses = packageInfo.PrimaryLicenses
+			}
 			metadataMap := map[string]string{
 				ComplianceMetadataProp.NAME:                            ctx.ModuleName(module),
 				ComplianceMetadataProp.MODULE_TYPE:                     ctx.ModuleType(module),
-				ComplianceMetadataProp.PKG_DEFAULT_APPLICABLE_LICENSES: strings.Join(packageInfo.PrimaryLicenses, " "),
+				ComplianceMetadataProp.PKG_DEFAULT_APPLICABLE_LICENSES: strings.Join(primaryLicenses, " "),
 			}
 			rowId = rowId + 1
 			metadata := []string{strconv.Itoa(rowId)}
@@ -365,7 +427,7 @@ func (c *complianceMetadataSingleton) GenerateBuildActions(ctx SingletonContext)
 			writerToCsv(csvWriter, metadata)
 			return
 		}
-		if metadataInfo, ok := OtherModuleProvider(ctx, module, ComplianceMetadataProvider); ok {
+		if metadataInfo := commonInfo.ComplianceMetadata; metadataInfo != nil {
 			rowId = rowId + 1
 			metadata := []string{strconv.Itoa(rowId)}
 			for _, propertyName := range COMPLIANCE_METADATA_PROPS {
@@ -392,7 +454,7 @@ func (c *complianceMetadataSingleton) GenerateBuildActions(ctx SingletonContext)
 		ctx.VisitAllModuleProxies(func(module ModuleProxy) {
 			// In soong-only build the installed file list is from android_device module
 			if androidDeviceInfo, ok := OtherModuleProvider(ctx, module, AndroidDeviceInfoProvider); ok && androidDeviceInfo.Main_device {
-				if metadataInfo, ok := OtherModuleProvider(ctx, module, ComplianceMetadataProvider); ok {
+				if metadataInfo := GetComplianceMetadata(ctx, module); metadataInfo != nil {
 					if len(metadataInfo.filesContained) > 0 || len(metadataInfo.prebuiltFilesCopied) > 0 {
 						allFiles := make([]string, 0, len(metadataInfo.filesContained)+len(metadataInfo.prebuiltFilesCopied))
 						allFiles = append(allFiles, metadataInfo.filesContained...)
@@ -449,7 +511,7 @@ func (c *complianceMetadataSingleton) GenerateBuildActions(ctx SingletonContext)
 			if !slices.Contains(unbundledApps, module.Name()) {
 				return
 			}
-			if metadataInfo, ok := OtherModuleProvider(ctx, module, ComplianceMetadataProvider); ok && len(metadataInfo.filesContained) > 0 {
+			if metadataInfo := GetComplianceMetadata(ctx, module); metadataInfo != nil && len(metadataInfo.filesContained) > 0 {
 				csvContent := make([]string, 0, len(metadataInfo.filesContained)+1)
 				csvContent = append(csvContent, moduleInstalledFilesCsvHeaders)
 				for i, file := range metadataInfo.filesContained {

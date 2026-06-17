@@ -22,13 +22,15 @@ import (
 
 var (
 	hiddenAPIGenerateCSVRule = pctx.AndroidStaticRule("hiddenAPIGenerateCSV", blueprint.RuleParams{
-		Command:     "${config.Class2NonSdkList} --stub-api-flags ${stubAPIFlags} $in $outFlag $out",
-		CommandDeps: []string{"${config.Class2NonSdkList}"},
+		Command:         "${config.Class2NonSdkList} --stub-api-flags ${stubAPIFlags} $in $outFlag $out",
+		CommandDeps:     []string{"${config.Class2NonSdkList}"},
+		SandboxDisabled: true,
 	}, "outFlag", "stubAPIFlags")
 
 	hiddenAPIGenerateIndexRule = pctx.AndroidStaticRule("hiddenAPIGenerateIndex", blueprint.RuleParams{
-		Command:     "${config.MergeCsvCommand} --zip_input --key_field signature --output=$out $in",
-		CommandDeps: []string{"${config.MergeCsvCommand}"},
+		Command:         "${config.MergeCsvCommand} --zip_input --key_field signature --output=$out $in",
+		CommandDeps:     []string{"${config.MergeCsvCommand}"},
+		SandboxDisabled: true,
 	})
 )
 
@@ -232,6 +234,25 @@ func buildRuleToGenerateIndex(ctx android.ModuleContext, desc string, classesJar
 	})
 }
 
+// buildRuleToGenerateFlaggedApis builds a ninja rule to generate the flagged-apis.csv file from
+// the classes jars and stub-flags.csv files.
+//
+// The flagged-apis.csv file contains mappings from Java signature to the flag name specified on
+// FlaggedApi annotations in the source.
+func buildRuleToGenerateFlaggedApis(ctx android.ModuleContext, desc string, classesJars android.Paths, stubFlagsCSV android.Path, flaggedApisCSV android.WritablePath) {
+	ctx.Build(pctx, android.BuildParams{
+		Rule:        hiddenAPIGenerateCSVRule,
+		Description: desc,
+		Inputs:      classesJars,
+		Output:      flaggedApisCSV,
+		Implicit:    stubFlagsCSV,
+		Args: map[string]string{
+			"outFlag":      "--write-flagged-apis-csv",
+			"stubAPIFlags": stubFlagsCSV.String(),
+		},
+	})
+}
+
 var hiddenAPIEncodeDexRule = pctx.AndroidStaticRule("hiddenAPIEncodeDex", blueprint.RuleParams{
 	Command: `rm -rf $tmpDir && mkdir -p $tmpDir && mkdir $tmpDir/dex-input && mkdir $tmpDir/dex-output &&
 		unzip -qoDD $in 'classes*.dex' -d $tmpDir/dex-input &&
@@ -246,6 +267,7 @@ var hiddenAPIEncodeDexRule = pctx.AndroidStaticRule("hiddenAPIEncodeDex", bluepr
 		"${config.SoongZipCmd}",
 		"${config.MergeZipsCmd}",
 	},
+	SandboxDisabled: true,
 }, "flagsCsv", "hiddenapiFlags", "tmpDir", "soongZipFlags")
 
 // hiddenAPIEncodeDex generates the build rule that will encode the supplied dex jar and place the

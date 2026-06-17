@@ -23,6 +23,8 @@ import (
 	"github.com/google/blueprint/proptools"
 )
 
+//go:generate go run ../../blueprint/gobtools/codegen
+
 func init() {
 	registerPlatformCompatConfigBuildComponents(android.InitRegistrationContext)
 
@@ -43,6 +45,7 @@ func registerPlatformCompatConfigBuildComponents(ctx android.RegistrationContext
 	ctx.RegisterModuleType("global_compat_config", globalCompatConfigFactory)
 }
 
+// @auto-generate: gob
 type PlatformCompatConfigInfo struct {
 	CompatConfig         android.OutputPath
 	SubDir               string
@@ -54,7 +57,10 @@ type PlatformCompatConfigInfo struct {
 
 var PlatformCompatConfigInfoProvider = blueprint.NewProvider[PlatformCompatConfigInfo]()
 
-var PrepareForTestWithPlatformCompatConfig = android.FixtureRegisterWithContext(registerPlatformCompatConfigBuildComponents)
+var PrepareForTestWithPlatformCompatConfig = android.GroupFixturePreparers(
+	android.FixtureRegisterWithContext(registerPlatformCompatConfigBuildComponents),
+	android.PrepareForTestWithHostTools("process-compat-config"),
+)
 
 func platformCompatConfigPath(ctx android.PathContext) android.OutputPath {
 	return android.PathForOutput(ctx, "compat_config", "merged_compat_config.xml")
@@ -115,7 +121,7 @@ var _ PlatformCompatConfigIntf = (*platformCompatConfig)(nil)
 var _ platformCompatConfigMetadataProvider = (*platformCompatConfig)(nil)
 
 func (p *platformCompatConfig) GenerateAndroidBuildActions(ctx android.ModuleContext) {
-	rule := android.NewRuleBuilder(pctx, ctx)
+	rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 
 	configFileName := p.Name() + ".xml"
 	metadataFileName := p.Name() + "_meta.xml"
@@ -293,7 +299,7 @@ func (p *platformCompatConfigSingleton) GenerateBuildActions(ctx android.Singlet
 		return
 	}
 
-	rule := android.NewRuleBuilder(pctx, ctx)
+	rule := android.NewRuleBuilder(pctx, ctx).SandboxDisabled()
 	outputPath := platformCompatConfigPath(ctx)
 
 	rule.Command().
@@ -332,7 +338,7 @@ func (c *globalCompatConfig) GenerateAndroidBuildActions(ctx android.ModuleConte
 	// This ensures that outputFilePath has the correct name for others to
 	// use, as the source file may have a different name.
 	ctx.Build(pctx, android.BuildParams{
-		Rule:   android.Cp,
+		Rule:   android.CpRule,
 		Output: outputFilePath,
 		Input:  inputPath,
 	})

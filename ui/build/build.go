@@ -15,13 +15,15 @@
 package build
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sync"
 	"text/template"
-	"time"
 
 	"android/soong/elf"
 	"android/soong/ui/metrics"
@@ -33,6 +35,7 @@ func SetupOutDir(ctx Context, config Config) {
 	ensureEmptyFileExists(ctx, filepath.Join(config.OutDir(), "Android.mk"))
 	ensureEmptyFileExists(ctx, filepath.Join(config.OutDir(), "CleanSpec.mk"))
 	ensureDirectoriesExist(ctx, config.SoongOutDir())
+	ensureDirectoriesExist(ctx, filepath.Join(config.SoongOutDir(), "action_sandboxing_workdir"))
 
 	// The ninja_build file is used by our buildbots to understand that the output
 	// can be parsed as ninja output.
@@ -48,30 +51,11 @@ func SetupOutDir(ctx Context, config Config) {
 		ctx.Fatalln("Missing BUILD_DATETIME_FILE")
 	}
 
-	// BUILD_NUMBER should be set to the source control value that
-	// represents the current state of the source code.  E.g., a
-	// perforce changelist number or a git hash.  Can be an arbitrary string
-	// (to allow for source control that uses something other than numbers),
-	// but must be a single word and a valid file name.
-	//
-	// If no BUILD_NUMBER is set, create a useful "I am an engineering build
-	// from this date/time" value.  Make it start with a non-digit so that
-	// anyone trying to parse it as an integer will probably get "0".
-	buildNumber, ok := config.environ.Get("BUILD_NUMBER")
-	if ok {
-		writeValueIfChanged(ctx, filepath.Join(config.OutDir(), "file_name_tag.txt"), buildNumber)
-	} else {
-		var username string
-		if username, ok = config.environ.Get("BUILD_USERNAME"); !ok {
-			ctx.Fatalln("Missing BUILD_USERNAME")
-		}
-		buildNumber = fmt.Sprintf("eng.%.6s.%s", username, time.Now().Format("20060102.150405" /* YYYYMMDD.HHMMSS */))
-		writeValueIfChanged(ctx, filepath.Join(config.OutDir(), "file_name_tag.txt"), username)
-	}
+	writeValueIfChanged(ctx, filepath.Join(config.OutDir(), "file_name_tag.txt"), config.DistFileNameTag())
 	// Write the build number to a file so it can be read back in
 	// without changing the command line every time.  Avoids rebuilds
 	// when using ninja.
-	writeValueIfChanged(ctx, filepath.Join(config.SoongOutDir(), "build_number.txt"), buildNumber)
+	writeValueIfChanged(ctx, filepath.Join(config.SoongOutDir(), "build_number.txt"), config.BuildNumber())
 
 	hostname, ok := config.environ.Get("BUILD_HOSTNAME")
 	if !ok {
@@ -83,6 +67,29 @@ func SetupOutDir(ctx Context, config Config) {
 		}
 	}
 	writeValueIfChanged(ctx, filepath.Join(config.SoongOutDir(), "build_hostname.txt"), hostname)
+
+	buildTargetName, ok := config.environ.Get("BUILD_TARGET_NAME")
+	if targetProduct, err := config.TargetProductOrErr(); !ok && err == nil {
+		buildTargetName = targetProduct
+	}
+
+	buildUUID := buildUUID(buildTargetName, config.BuildNumber())
+	buildUUIDFile := config.BuildUUIDFile()
+	writeValueIfChanged(ctx, buildUUIDFile, buildUUID)
+	distFileToFile(ctx, config, buildUUIDFile, "BUILD_UUID")
+}
+
+// Compute a UUID based on the hash of the build name and the build number.
+func buildUUID(targetName, number string) string {
+	h := sha256.New()
+	must := func(n int, err error) {
+		if err != nil {
+			panic(err)
+		}
+	}
+	must(io.WriteString(h, targetName))
+	must(io.WriteString(h, number))
+	return base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(h.Sum(nil))
 }
 
 // SetupTempDir makes sure config.TempDir() exists and is empty.
@@ -101,7 +108,9 @@ pool highmem_pool
 subninja {{.KatiBuildNinjaFile}}
 subninja {{.KatiPackageNinjaFile}}
 {{else}}
-subninja {{.KatiSoongOnlyPackageNinjaFile}}
+dist={{if .Dist}}dist{{else}}nodist{{end}}
+distdir={{.DistDir}}
+distFileNameTag={{.DistFileNameTag}}
 {{end -}}
 subninja {{.SoongNinjaFile}}
 `))
@@ -294,7 +303,7 @@ func Build(ctx Context, config Config) {
 	checkCaseSensitivity(ctx, config)
 
 	SetupPath(ctx, config)
-	mapsCh := QueryProductReleaseConfigMaps(ctx, config)
+	mapsCh := QueryEarlyReleaseConfig(ctx, config)
 
 	what := evaluateWhatToRun(config, ctx.Verboseln)
 
@@ -308,19 +317,30 @@ func Build(ctx Context, config Config) {
 				rbePanic = recover()
 				close(rbeCh)
 			}()
-			startRBE(ctx, config)
+			startReproxy(ctx, config)
+		}()
+		defer DumpRBEMetrics(ctx, config, filepath.Join(config.LogsDir(), "rbe_metrics.pb"))
+	} else if config.StartRBEproxy() {
+		cleanupRBELogsDir(ctx, config)
+		checkRBERequirements(ctx, config)
+		go func() {
+			defer func() {
+				rbePanic = recover()
+				close(rbeCh)
+			}()
+			startRBEproxy(ctx, config)
 		}()
 		defer DumpRBEMetrics(ctx, config, filepath.Join(config.LogsDir(), "rbe_metrics.pb"))
 	} else {
 		close(rbeCh)
 	}
 
-	if config.RunCIPDProxyServer() && shouldRunCIPDProxy(config) {
+	if config.RunCIPDProxyServer() && shouldRunCIPDProxy(ctx, config) {
 		cipdProxy := startCIPDProxyServer(ctx, config)
 		defer cipdProxy.Stop(ctx)
 	}
 
-	SetProductReleaseConfigMaps(ctx, config, mapsCh)
+	CollectEarlyReleaseConfig(ctx, config, mapsCh)
 	if what&RunProductConfig != 0 {
 		runMakeProductConfig(ctx, config)
 
@@ -330,6 +350,12 @@ func Build(ctx Context, config Config) {
 	}
 
 	// Everything below here depends on product config.
+
+	// Write SOONG_USE_PARTIAL_COMPILE so it can be sourced by rules that use it.
+	shFile := config.DeviceUsePartialCompile()
+	ensureDirectoriesExist(ctx, filepath.Dir(shFile))
+	value, _ := config.environ.Get("SOONG_USE_PARTIAL_COMPILE")
+	writeValueIfChanged(ctx, shFile, fmt.Sprintf("\nexport SOONG_USE_PARTIAL_COMPILE=%s\n", value))
 
 	if inList("installclean", config.Arguments()) ||
 		inList("install-clean", config.Arguments()) {
@@ -358,7 +384,7 @@ func Build(ctx Context, config Config) {
 	if what&RunKati != 0 {
 		runKatiCleanSpec(ctx, config)
 		runKatiBuild(ctx, config)
-		runKatiPackage(ctx, config, false)
+		runKatiPackage(ctx, config)
 
 	} else if what&RunKatiNinja != 0 {
 		// Load last Kati Suffix if it exists
@@ -366,8 +392,6 @@ func Build(ctx Context, config Config) {
 			ctx.Verboseln("Loaded previous kati config:", string(katiSuffix))
 			config.SetKatiSuffix(string(katiSuffix))
 		}
-	} else if what&RunSoong != 0 {
-		runKatiPackage(ctx, config, true)
 	}
 
 	os.WriteFile(config.LastKatiSuffixFile(), []byte(config.KatiSuffix()), 0666) // a+rw
@@ -375,7 +399,7 @@ func Build(ctx Context, config Config) {
 	// Write combined ninja file
 	createCombinedBuildNinjaFile(ctx, config)
 
-	distGzipFile(ctx, config, config.CombinedNinjaFile())
+	distGzipFile(ctx, config, config.CombinedNinjaFile(), "soong_ui")
 
 	if what&RunBuildTests != 0 {
 		testForDanglingRules(ctx, config)
@@ -383,7 +407,7 @@ func Build(ctx Context, config Config) {
 
 	<-rbeCh
 	if rbePanic != nil {
-		// If there was a ctx.Fatal in startRBE, rethrow it.
+		// If there was a ctx.Fatal in startReproxy, rethrow it.
 		panic(rbePanic)
 	}
 
@@ -394,12 +418,24 @@ func Build(ctx Context, config Config) {
 
 		runUpdateApi(ctx, config)
 		runUpdateAidlApi(ctx, config)
+		createCompDbSymlink(ctx, config)
 	}
 
 	if what&RunDistActions != 0 {
 		runDistActions(ctx, config)
 	}
 	done = true
+}
+
+func createCompDbSymlink(ctx Context, config Config) {
+	if finalLinkDir, ok := config.environ.Get("SOONG_LINK_COMPDB_TO"); ok && finalLinkDir != "" {
+		finalLinkPath := filepath.Join(finalLinkDir, "compile_commands.json")
+		os.Remove(finalLinkPath)
+		compDBFilePath := filepath.Join(config.SoongOutDir(), "development/ide/compdb/compile_commands.json")
+		if err := os.Symlink(compDBFilePath, finalLinkPath); err != nil {
+			ctx.Printf("Unable to symlink %s to %s: %s", compDBFilePath, finalLinkPath, err)
+		}
+	}
 }
 
 func updateBuildIdDir(ctx Context, config Config) {
@@ -482,7 +518,7 @@ func distGzipFile(ctx Context, config Config, src string, subDirs ...string) {
 	}
 
 	subDir := filepath.Join(subDirs...)
-	destDir := filepath.Join(config.RealDistDir(), "soong_ui", subDir)
+	destDir := filepath.Join(config.RealDistDir(), subDir)
 
 	if err := os.MkdirAll(destDir, 0777); err != nil { // a+rwx
 		ctx.Printf("failed to mkdir %s: %s", destDir, err.Error())
@@ -505,7 +541,18 @@ func distFile(ctx Context, config Config, src string, subDirs ...string) {
 	}
 
 	subDir := filepath.Join(subDirs...)
-	destDir := filepath.Join(config.RealDistDir(), "soong_ui", subDir)
+	distFileToFile(ctx, config, src, subDir, filepath.Base(src))
+}
+
+// distFileToFile writes a copy of src to dest in distDir if dist is enabled.  Failures are printed but
+// non-fatal. Uses the distWaitGroup func for backgrounding (optimization).
+func distFileToFile(ctx Context, config Config, src string, destParts ...string) {
+	if !config.Dist() {
+		return
+	}
+
+	dest := filepath.Join(config.RealDistDir(), filepath.Join(destParts...))
+	destDir := filepath.Dir(dest)
 
 	if err := os.MkdirAll(destDir, 0777); err != nil { // a+rwx
 		ctx.Printf("failed to mkdir %s: %s", destDir, err.Error())
@@ -514,7 +561,7 @@ func distFile(ctx Context, config Config, src string, subDirs ...string) {
 	distWaitGroup.Add(1)
 	go func() {
 		defer distWaitGroup.Done()
-		if _, err := copyFile(src, filepath.Join(destDir, filepath.Base(src))); err != nil {
+		if _, err := copyFile(src, dest); err != nil {
 			ctx.Printf("failed to dist %s: %s", filepath.Base(src), err.Error())
 		}
 	}()

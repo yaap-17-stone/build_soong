@@ -16,6 +16,7 @@ package codegen
 
 import (
 	"fmt"
+	"strconv"
 	"testing"
 
 	"android/soong/android"
@@ -240,6 +241,68 @@ func TestUnsupportedMode(t *testing.T) {
 	testCodegenModeWithError(t, "mode: `unsupported`,", "mode: \"unsupported\" is not a supported mode")
 }
 
+func TestLegacyImplInterfaceRemoval(t *testing.T) {
+	testCases := []struct {
+		name                string
+		defaultAllowRemoval bool
+	}{
+		{
+			name:                "DefaultRemoveLegacyImpl",
+			defaultAllowRemoval: true,
+		},
+		{
+			name:                "DefaultPreserveLegacyImpl",
+			defaultAllowRemoval: false,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := android.GroupFixturePreparers(
+				PrepareForTestWithAconfigBuildComponents,
+				android.PrepareForTestWithBuildFlag(
+					"RELEASE_ACONFIG_DEFAULT_ALLOW_JAVA_IMPL_INTERFACE_REMOVAL",
+					strconv.FormatBool(tc.defaultAllowRemoval)),
+				java.PrepareForTestWithJavaDefaultModules).
+				ExtendWithErrorHandler(android.FixtureExpectsNoErrors).
+				RunTestWithBp(t, `
+					aconfig_declarations {
+						name: "my_aconfig_declarations",
+						package: "com.example.package",
+						container: "com.android.foo",
+						srcs: ["foo.aconfig"],
+					}
+
+					java_aconfig_library {
+						name: "my_library_default",
+						aconfig_declarations: "my_aconfig_declarations",
+					}
+					java_aconfig_library {
+						name: "my_library_no_legacy",
+						aconfig_declarations: "my_aconfig_declarations",
+						preserve_legacy_impl_interface: false,
+					}
+					java_aconfig_library {
+						name: "my_library_legacy",
+						aconfig_declarations: "my_aconfig_declarations",
+						preserve_legacy_impl_interface: true,
+					}
+				`)
+
+			rule := result.ModuleForTests(t, "my_library_default", "android_common").Rule("java_aconfig_library")
+			android.AssertStringEquals(t, "Legacy removal should reflect the release default",
+				rule.Args["allow_impl_interface_removal"], strconv.FormatBool(tc.defaultAllowRemoval))
+
+			rule_no_legacy := result.ModuleForTests(t, "my_library_no_legacy", "android_common").Rule("java_aconfig_library")
+			android.AssertStringEquals(t, "Legacy removal should reflect the release default even if explicit preservation disabled",
+				rule_no_legacy.Args["allow_impl_interface_removal"], strconv.FormatBool(tc.defaultAllowRemoval))
+
+			rule_legacy := result.ModuleForTests(t, "my_library_legacy", "android_common").Rule("java_aconfig_library")
+			android.AssertStringEquals(t, "Legacy impl preservation should always respected explicit target preservation",
+				rule_legacy.Args["allow_impl_interface_removal"], "false")
+		})
+	}
+}
+
 func TestMkEntriesMatchedContainer(t *testing.T) {
 	result := android.GroupFixturePreparers(
 		PrepareForTestWithAconfigBuildComponents,
@@ -288,4 +351,35 @@ func TestMkEntriesMatchedContainer(t *testing.T) {
 	info := android.AndroidMkInfoForTest(t, result.TestContext, module)
 	makeVar := info.PrimaryInfo.EntryMap["LOCAL_ACONFIG_FILES"]
 	android.EnsureListContainsSuffix(t, makeVar, "my_aconfig_declarations_foo/aconfig-cache.pb")
+}
+
+func TestCollectJavaAconfigLibraryPropertiesAddAconfigSrcs(t *testing.T) {
+	result := android.GroupFixturePreparers(
+		PrepareForTestWithAconfigBuildComponents,
+		java.PrepareForTestWithJavaDefaultModules).
+		ExtendWithErrorHandler(android.FixtureExpectsNoErrors).
+		RunTestWithBp(t, `
+			aconfig_declarations {
+				name: "my_aconfig_declarations",
+				package: "com.example.package",
+				container: "system",
+				srcs: ["foo.aconfig", "bar.aconfig"],
+			}
+
+			java_aconfig_library {
+				name: "my_java_aconfig_library",
+				aconfig_declarations: "my_aconfig_declarations",
+				mode: "force-read-only",
+			}
+		`)
+
+	module := result.ModuleForTests(t, "my_java_aconfig_library", "android_common").Module().(*java.GeneratedJavaLibraryModule)
+	info, _ := android.OtherModuleProvider(result.TestContext.OtherModuleProviderAdaptor(), module, android.CommonModuleInfoProvider)
+	ideInfo := *info.IdeInfo
+
+	expectedSrcs := []string{"foo.aconfig", "bar.aconfig"}
+	android.AssertStringEquals(t, "Aconfig.Package", "com.example.package", ideInfo.Aconfig.Package)
+	android.AssertStringEquals(t, "Aconfig.Container", "system", ideInfo.Aconfig.Container)
+	android.AssertDeepEquals(t, "Aconfig.Srcs", expectedSrcs, ideInfo.Aconfig.Srcs)
+	android.AssertStringEquals(t, "Aconfig.Mode", "force-read-only", ideInfo.Aconfig.Mode)
 }

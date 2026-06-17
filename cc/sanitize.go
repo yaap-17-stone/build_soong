@@ -28,7 +28,7 @@ import (
 	"android/soong/etc"
 )
 
-//go:generate go run ../../blueprint/gobtools/codegen/gob_gen.go
+//go:generate go run ../../blueprint/gobtools/codegen
 
 var (
 	// Any C flags added by sanitizer which libTooling tools may not
@@ -680,8 +680,8 @@ func (sanitize *sanitize) begin(ctx BaseModuleContext) {
 		s.Diag.Cfi = nil
 	}
 
-	// TODO(b/280478629): runtimes don't exist for musl arm64 yet.
-	if ctx.toolchain().Musl() && ctx.Arch().ArchType == android.Arm64 {
+	// TODO(b/280478629): runtimes don't exist for musl arm64 or LFI yet.
+	if (ctx.toolchain().Musl() && ctx.Arch().ArchType == android.Arm64) || ctx.Target().LFI {
 		s.Address = nil
 		s.Hwaddress = nil
 		s.Thread = nil
@@ -693,6 +693,13 @@ func (sanitize *sanitize) begin(ctx BaseModuleContext) {
 		s.Undefined = nil
 		s.All_undefined = nil
 		s.Integer_overflow = nil
+	}
+
+	// LFI doesn't support MTE
+	if ctx.Target().LFI {
+		s.Memtag_globals = nil
+		s.Memtag_heap = nil
+		s.Memtag_stack = nil
 	}
 
 	if ctx.inRamdisk() || ctx.inVendorRamdisk() || ctx.inRecovery() {
@@ -778,6 +785,28 @@ func toDisableUnsignedShiftBaseChange(flags []string) bool {
 	return false
 }
 
+func toDisableFunctionAndKcfiSanitizer(ctx ModuleContext, flags []string) bool {
+	// Function and kcfi sanitizers are not compatible with execute-only mode.
+	// If either of them are enabled explicitly together with XOM, then throw an error.
+	// If none of them is enabled explicitly they still need to be disabled if
+	// execute-only is on, as they still can be enabled implicitly via undefined sanitizer.
+
+	// XomEnabledForModule may return true even if a static dependency disables XOM in this module.
+	// In those cases we should still error out since it makes more sense for the module definition
+	// to be explicit with regard to XOM and this sanitizer mixing. Otherwise, changing static
+	// dependencies may result in this error appearing and disappearing in a non-obvious manner.
+	if XomEnabledForModule(ctx) {
+		for _, f := range flags {
+			if strings.HasPrefix(f, "-fsanitize") &&
+				(strings.Contains(f, "function") || strings.Contains(f, "kcfi")) {
+				ctx.ModuleErrorf("\nFunction and kcfi sanitizers are not supported with XOMenabled")
+			}
+		}
+		return true
+	}
+	return false
+}
+
 func (s *sanitize) flags(ctx ModuleContext, flags Flags) Flags {
 	if s.Properties.ForceDisable {
 		return flags
@@ -808,7 +837,14 @@ func (s *sanitize) flags(ctx ModuleContext, flags Flags) Flags {
 			}
 		} else {
 			flags.Local.CFlags = append(flags.Local.CFlags, "-mllvm", "-asan-globals=0")
-			if ctx.bootstrap() {
+
+			// Check if this module needs to use the bootstrap linker
+			useBootstrap := ctx.bootstrap()
+			if ctx.Config().GetBuildFlagBool("RELEASE_DEPRECATE_RUNTIME_APEX") {
+				useBootstrap = false
+			}
+
+			if useBootstrap {
 				flags.DynamicLinker = "/system/bin/bootstrap/linker_asan"
 			} else {
 				flags.DynamicLinker = "/system/bin/linker_asan"
@@ -833,7 +869,14 @@ func (s *sanitize) flags(ctx ModuleContext, flags Flags) Flags {
 			flags.Local.CFlags = append(flags.Local.CFlags, "-mllvm", "-hwasan-instrument-reads=0")
 		}
 		if !ctx.staticBinary() && !ctx.Host() {
-			if ctx.bootstrap() {
+
+			// Check if this module needs to use the bootstrap linker
+			useBootstrap := ctx.bootstrap()
+			if ctx.Config().GetBuildFlagBool("RELEASE_DEPRECATE_RUNTIME_APEX") {
+				useBootstrap = false
+			}
+
+			if useBootstrap {
 				flags.DynamicLinker = "/system/bin/bootstrap/linker_hwasan64"
 			} else {
 				flags.DynamicLinker = "/system/bin/linker_hwasan64"
@@ -966,6 +1009,10 @@ func (s *sanitize) flags(ctx ModuleContext, flags Flags) Flags {
 		// http://b/171275751, Android doesn't build with this sanitizer yet.
 		if toDisableUnsignedShiftBaseChange(flags.Local.CFlags) {
 			flags.Local.CFlags = append(flags.Local.CFlags, "-fno-sanitize=unsigned-shift-base")
+		}
+
+		if toDisableFunctionAndKcfiSanitizer(ctx, flags.Local.CFlags) {
+			flags.Local.CFlags = append(flags.Local.CFlags, "-fno-sanitize=function", "-fno-sanitize=kcfi")
 		}
 	}
 
@@ -1200,7 +1247,7 @@ type sanitizerSplitMutator struct {
 	sanitizer SanitizerType
 }
 
-func (s *sanitizerSplitMutator) Split(ctx android.BaseModuleContext) []string {
+func (s *sanitizerSplitMutator) split(ctx android.BaseModuleContext) []string {
 	if c, ok := ctx.Module().(PlatformSanitizeable); ok && c.SanitizePropDefined() {
 		// If the given sanitizer is not requested in the .bp file for a module, it
 		// won't automatically build the sanitized variation.
@@ -1240,6 +1287,24 @@ func (s *sanitizerSplitMutator) Split(ctx android.BaseModuleContext) []string {
 	}
 
 	return []string{""}
+}
+
+func (s *sanitizerSplitMutator) Split(ctx android.BaseModuleContext) []string {
+	allSplits := s.split(ctx)
+	if ctx.Config().GetBuildFlagBool("RELEASE_SOONG_SANITIZER_VARIANT_ON_DEMAND") {
+		return allSplits[0:1]
+	} else {
+		return allSplits
+	}
+}
+
+func (s *sanitizerSplitMutator) SplitOnDemand(ctx android.BaseModuleContext) []string {
+	allSplits := s.split(ctx)
+	if len(allSplits) <= 1 || !ctx.Config().GetBuildFlagBool("RELEASE_SOONG_SANITIZER_VARIANT_ON_DEMAND") {
+		return nil
+	} else {
+		return allSplits[1:]
+	}
 }
 
 func (s *sanitizerSplitMutator) OutgoingTransition(ctx android.OutgoingTransitionContext, sourceVariation string) string {

@@ -20,15 +20,15 @@ import (
 	"strings"
 
 	"android/soong/android"
-	_ "android/soong/cc/config"
+	cc_config "android/soong/cc/config"
 	"android/soong/remoteexec"
 )
 
 var (
 	pctx = android.NewPackageContext("android/soong/rust/config")
 
-	RustDefaultVersion = "1.88.0"
-	RustDefaultBase    = "prebuilts/rust/"
+	RustDefaultVersion = "1.93.1"
+	RustDefaultBase    = "prebuilts/rust-toolchain/"
 	DefaultEdition     = "2021"
 	Stdlibs            = []string{
 		"libstd",
@@ -39,8 +39,8 @@ var (
 		"liballoc.rust_sysroot",
 	}
 
-	// Rust versions usually look like "1.88.0", but might also get a
-	// letter or non-numeric suffix when testing (i.e. "1.88.0.test")
+	// Rust versions usually look like "1.93.1", but might also get a
+	// letter or non-numeric suffix when testing (i.e. "1.93.1.test")
 	RustVersionRe = regexp.MustCompile(`^(\d+\.\d+\.\d+).*$`)
 
 	// Mapping between Soong internal arch types and std::env constants.
@@ -91,6 +91,7 @@ var (
 		"-Z debug-info-for-profiling",
 		// Android has ELF TLS on platform
 		"-Z tls-model=global-dynamic",
+		"-Z has-thread-local=yes",
 		"-C relocation-model=pic",
 	}
 
@@ -178,6 +179,8 @@ func init() {
 func HostPrebuiltTag(config android.Config) string {
 	if config.UseHostMusl() {
 		return "linux-musl-x86"
+	} else if config.PrebuiltOS() == "darwin-x86" {
+		return "darwin"
 	} else {
 		return config.PrebuiltOS()
 	}
@@ -201,4 +204,16 @@ func GetRustVersion(ctx android.PathContext) string {
 		return matches[1]
 	}
 	panic("Invalid GetRustPrebuiltsVersion: " + ver)
+}
+
+func LinuxGccRoot() string {
+	return cc_config.LinuxGccRoot()
+}
+
+func LinuxGccVersion() string {
+	return cc_config.LinuxGccVersion()
+}
+
+func LinuxGccTriple() string {
+	return cc_config.LinuxGccTriple()
 }

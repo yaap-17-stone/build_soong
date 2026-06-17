@@ -122,7 +122,8 @@ func TestFileSystemCreatorSystemImageProps(t *testing.T) {
 		}),
 	).RunTest(t)
 
-	fooSystem := result.ModuleForTests(t, "test_product_generated_system_image", "android_common").Module().(interface {
+	module := result.ModuleForTests(t, "test_product_generated_system_image", "android_common").Module()
+	fooSystem := module.(interface {
 		FsProps() filesystem.FilesystemProperties
 	})
 	android.AssertBoolEquals(
@@ -149,11 +150,13 @@ func TestFileSystemCreatorSystemImageProps(t *testing.T) {
 		0,
 		proptools.Int(fooSystem.FsProps().Rollback_index),
 	)
+	evaluator := module.(android.Module).ConfigurableEvaluator(android.PanickingConfigAndErrorContext(result.TestContext))
+	fsProps := fooSystem.FsProps()
 	android.AssertStringEquals(
 		t,
 		"Property expected to match the product variable 'BOARD_SYSTEMIMAGE_FILE_SYSTEM_TYPE'",
 		"ext4",
-		proptools.String(fooSystem.FsProps().Type),
+		fsProps.Type.GetOrDefault(evaluator, ""),
 	)
 }
 
@@ -806,6 +809,7 @@ func TestCrossPartitionRequiredModules(t *testing.T) {
 		android.PrepareForTestWithNamespace,
 		phony.PrepareForTestWithPhony,
 		etc.PrepareForTestWithPrebuiltEtc,
+		android.PrepareForTestWithHostTools("conv_linker_config"),
 		android.FixtureMergeMockFs(android.MockFS{
 			"external/avb/test/data/testkey_rsa4096.pem": nil,
 			"mynamespace/default-permissions.xml":        nil,
@@ -882,6 +886,7 @@ func TestOverriddenDepsAreAddedToFilesystemModuleOverriddenDeps(t *testing.T) {
 		java.PrepareForTestWithJavaBuildComponents,
 		prepareMockRamdiksNodeList,
 		prepareForTestWithDefaultSystemDeps,
+		android.PrepareForTestWithHostTools("conv_linker_config"),
 		android.FixtureMergeMockFs(android.MockFS{
 			"external/avb/test/data/testkey_rsa4096.pem": nil,
 			"build/soong/fsgen/Android.bp": []byte(`
@@ -1085,4 +1090,211 @@ func TestRemoveOverriddenTransitiveDeps(t *testing.T) {
 		_, fooInDeps := (*resolvedProductDeps)["foo"]
 		android.AssertBoolEquals(t, "foo should be in deps", true, fooInDeps)
 	})
+}
+
+func TestVbmetaGenerationWithCustomPartitions(t *testing.T) {
+	result := android.GroupFixturePreparers(
+		android.PrepareForIntegrationTestWithAndroid,
+		android.PrepareForTestWithAndroidBuildComponents,
+		android.PrepareForTestWithAllowMissingDependencies,
+		prepareForTestWithFsgenBuildComponents,
+		cc.PrepareForTestWithCcBuildComponents,
+		java.PrepareForTestWithJavaBuildComponents,
+		prepareMockRamdiksNodeList,
+		filesystem.PrepareForTestWithFilesystemBuildComponents,
+		android.FixtureMergeMockFs(android.MockFS{
+			"external/avb/test/data/testkey_rsa4096.pem": nil,
+			"build/soong/fsgen/Android.bp": []byte(`
+			soong_filesystem_creator {
+				name: "foo",
+			}
+		`),
+		}),
+		android.FixtureModifyConfig(func(config android.Config) {
+			config.TestProductVariables.PartitionVarsForSoongMigrationOnlyDoNotUse.CustomImagesPartitions = []string{"custom1"}
+			config.TestProductVariables.PartitionVarsForSoongMigrationOnlyDoNotUse.BuildingVbmetaImage = true
+			config.TestProductVariables.PartitionVarsForSoongMigrationOnlyDoNotUse.PartitionQualifiedVariables =
+				map[string]android.PartitionQualifiedVariablesType{
+					"system": {
+						BoardFileSystemType:           "ext4",
+						BuildingImage:                 true,
+						BoardAvbKeyPath:               "external/avb/test/data/testkey_rsa4096.pem",
+						BoardAvbRollbackIndexLocation: "1",
+					},
+					"custom1": {
+						BoardAvbKeyPath: "external/avb/test/data/testkey_rsa4096.pem",
+					},
+				}
+			config.TestProductVariables.PartitionVarsForSoongMigrationOnlyDoNotUse.BoardAvbEnable = true
+		}),
+	).RunTestWithBp(t, `
+		android_filesystem {
+			name: "custom1",
+			use_avb: true,
+			avb_private_key: "external/avb/test/data/testkey_rsa4096.pem",
+			rollback_index_location: 5,
+		}
+	`)
+
+	generatedVbmetaImage := result.ModuleForTests(t, "test_product_generated_vbmeta_image", "android_common").Output("vbmeta.img")
+	vbmetaImageCommand := generatedVbmetaImage.RuleParams.Command
+
+	android.AssertStringDoesContain(t, "system chained partition must exist with property appending", vbmetaImageCommand, "--chain_partition system:1:out/soong/.intermediates/build/soong/fsgen/test_product_generated_system_image/android_common/system.avbpubke")
+	android.AssertStringDoesContain(t, "avb enabled custom partition must be included as chained partition", vbmetaImageCommand, "--chain_partition custom1:5:out/soong/.intermediates/custom1/android_common/custom1.avbpubkey")
+}
+
+func TestVbmetaGenerationWithPvmfw(t *testing.T) {
+	result := android.GroupFixturePreparers(
+		android.PrepareForIntegrationTestWithAndroid,
+		android.PrepareForTestWithAndroidBuildComponents,
+		android.PrepareForTestWithAllowMissingDependencies,
+		prepareForTestWithFsgenBuildComponents,
+		cc.PrepareForTestWithCcBuildComponents,
+		java.PrepareForTestWithJavaBuildComponents,
+		prepareMockRamdiksNodeList,
+		filesystem.PrepareForTestWithFilesystemBuildComponents,
+		android.FixtureMergeMockFs(android.MockFS{
+			"external/avb/test/data/testkey_rsa4096.pem": nil,
+			"build/soong/fsgen/Android.bp": []byte(`
+			soong_filesystem_creator {
+				name: "foo",
+			}
+		`),
+		}),
+		android.FixtureModifyConfig(func(config android.Config) {
+			config.TestProductVariables.PartitionVarsForSoongMigrationOnlyDoNotUse.BuildingVbmetaImage = true
+			config.TestProductVariables.PartitionVarsForSoongMigrationOnlyDoNotUse.BoardUsesPvmfwImage = true
+			config.TestProductVariables.PartitionVarsForSoongMigrationOnlyDoNotUse.PartitionQualifiedVariables =
+				map[string]android.PartitionQualifiedVariablesType{
+					"system": {
+						BoardFileSystemType:           "ext4",
+						BuildingImage:                 true,
+						BoardAvbKeyPath:               "external/avb/test/data/testkey_rsa4096.pem",
+						BoardAvbRollbackIndexLocation: "1",
+					},
+				}
+			config.TestProductVariables.PartitionVarsForSoongMigrationOnlyDoNotUse.BoardAvbEnable = true
+		}),
+	).RunTestWithBp(t, `
+		raw_binary {
+			name: "pvmfw_bin",
+		}
+		bootimg {
+			name: "pvmfw_img",
+			kernel_prebuilt: ":pvmfw_bin",
+			header_version: "3",
+			use_avb: true,
+		}
+	`)
+
+	generatedVbmetaImage := result.ModuleForTests(t, "test_product_generated_vbmeta_image", "android_common").Output("vbmeta.img")
+	vbmetaImageCommand := generatedVbmetaImage.RuleParams.Command
+
+	android.AssertStringDoesContain(t,
+		"avb enabled pvmfw partition must be included",
+		vbmetaImageCommand,
+		"--include_descriptors_from_image out/soong/.intermediates/pvmfw_img/android_arm64_armv8-a/pvmfw_img.img",
+	)
+}
+
+func TestStageDeviceFiles(t *testing.T) {
+	result := android.GroupFixturePreparers(
+		android.PrepareForIntegrationTestWithAndroid,
+		android.PrepareForTestWithAndroidBuildComponents,
+		android.PrepareForTestWithAllowMissingDependencies,
+		filesystem.PrepareForTestWithFilesystemBuildComponents,
+		filesystem.PrepareForTestWithAndroidDeviceComponents,
+		prepareForTestWithFsgenBuildComponents,
+		android.FixtureModifyConfig(func(config android.Config) {
+			config.TestProductVariables.PartitionVarsForSoongMigrationOnlyDoNotUse.ProductCopyFiles = []string{
+				"source/dir/my_staged_file:my_staged_file",
+				"source/another_file:another_file",
+				"source/file3:system/etc/file3", // This should not be staged
+			}
+		}),
+		android.FixtureMergeMockFs(android.MockFS{
+			"source/dir/my_staged_file": nil,
+			"source/another_file":       nil,
+			"source/file3":              nil,
+			"build/soong/fsgen/Android.bp": []byte(`
+			soong_filesystem_creator {
+				name: "foo",
+			}
+			`),
+		}),
+	).RunTest(t)
+
+	deviceModule := result.ModuleForTests(t, "test_product_generated_device", "android_arm64_armv8-a").Module()
+
+	var deviceProps *filesystem.DeviceProperties
+	for _, prop := range deviceModule.GetProperties() {
+		if p, ok := prop.(*filesystem.DeviceProperties); ok {
+			deviceProps = p
+			break
+		}
+	}
+
+	if deviceProps == nil {
+		t.Fatal("Could not find DeviceProperties on generated android_device module")
+	}
+
+	expected := []filesystem.StageDeviceFilePairProp{
+		{Src: proptools.StringPtr("source/another_file"), Dst: proptools.StringPtr("another_file")},
+		{Src: proptools.StringPtr("source/dir/my_staged_file"), Dst: proptools.StringPtr("my_staged_file")},
+	}
+
+	android.AssertDeepEquals(t, "Stage_device_files", expected, deviceProps.Stage_device_files)
+
+	// Verify that the files are copied to the staging dir
+	allOutputs := result.ModuleForTests(t, "test_product_generated_device", "android_arm64_armv8-a").AllOutputs()
+	allOutputsString := strings.Join(allOutputs, " ")
+
+	android.AssertStringDoesContain(t, "staging dir contains expected files", allOutputsString, "my_staged_file")
+	android.AssertStringDoesContain(t, "staging dir contains expected files", allOutputsString, "another_file")
+	android.AssertStringDoesNotContain(t, "staging dir does not contain arbitrary subdir file", allOutputsString, "file3")
+}
+
+func TestCrossPartitionRequiredDepsOfPhony(t *testing.T) {
+	result := android.GroupFixturePreparers(
+		android.PrepareForIntegrationTestWithAndroid,
+		android.PrepareForTestWithAndroidBuildComponents,
+		android.PrepareForTestWithAllowMissingDependencies,
+		prepareForTestWithFsgenBuildComponents,
+		cc.PrepareForTestWithCcBuildComponents,
+		java.PrepareForTestWithJavaBuildComponents,
+		prepareMockRamdiksNodeList,
+		android.PrepareForTestWithNamespace,
+		phony.PrepareForTestWithPhony,
+		android.FixtureMergeMockFs(android.MockFS{
+			"external/avb/test/data/testkey_rsa4096.pem": nil,
+			"build/soong/fsgen/Android.bp": []byte(`
+			soong_filesystem_creator {
+				name: "foo",
+			}
+		`),
+		}),
+		android.FixtureModifyConfig(func(config android.Config) {
+			config.TestProductVariables.PartitionVarsForSoongMigrationOnlyDoNotUse.ProductPackagesSet = createProductPackagesSet([]string{"myphony"})
+		}),
+	).RunTestWithBp(t, `
+// myphony has a required dependency on a system_ext binary,
+// but does not set system_ext_specific to true.
+phony {
+	name: "myphony",
+	required: ["system_ext_bin"],
+}
+cc_binary {
+	name: "system_ext_bin",
+	shared_libs: ["system_lib"],
+	system_ext_specific: true,
+}
+`)
+	resolvedDeps := result.TestContext.Config().Get(fsGenStateOnceKey).(*FsGenState).fsDeps["system_ext"]
+	_, exists := (*resolvedDeps)["system_ext_bin"]
+	android.AssertBoolEquals(
+		t,
+		"Expected fsgen to add cross partition required dep of myphony",
+		true,
+		exists,
+	)
 }

@@ -34,6 +34,8 @@ import (
 	"android/soong/ui/status"
 	"android/soong/ui/terminal"
 	"android/soong/ui/tracer"
+
+	"github.com/google/blueprint"
 )
 
 // A command represents an operation to be executed in the soong build
@@ -130,6 +132,13 @@ func main() {
 
 	buildStarted := time.Now()
 
+	// Resolve Soong environment variable values.
+	// If any defaults are provided for ${TARGET_RELEASE}, use them for any unset variables.
+	err := build.ResolveSoongEnvVars()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error resolving `soong` environment: %s.\n", err)
+		os.Exit(1)
+	}
 	c, args, err := getCommand(os.Args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error parsing `soong` args: %s.\n", err)
@@ -139,7 +148,10 @@ func main() {
 	// Create a terminal output that mimics Ninja's.
 	output := terminal.NewStatusOutput(c.stdio().Stdout(), os.Getenv("NINJA_STATUS"), c.simpleOutput,
 		build.OsEnvironment().IsEnvTrue("ANDROID_QUIET_BUILD"),
-		build.OsEnvironment().IsEnvTrue("SOONG_UI_ANSI_OUTPUT"))
+		build.OsEnvironment().IsEnvTrue("SOONG_UI_ANSI_OUTPUT"),
+		build.OsEnvironment().IsEnvTrue("SOONG_UI_SKIP_ACTION_PROGRESS"),
+		build.OsEnvironment().IsEnvTrue("SOONG_UI_SUPPRESS_OUTPUT"),
+	)
 
 	// Create and start a new metric record.
 	met := metrics.New()
@@ -165,7 +177,7 @@ func main() {
 	stat.AddOutput(trace.StatusTracer())
 
 	// Set up a cleanup procedure in case the normal termination process doesn't work.
-	signal.SetupSignals(log, cancel, func() {
+	sigNumFunc := signal.SetupSignals(log, cancel, func() {
 		trace.Close()
 		log.Cleanup()
 		stat.Finish()
@@ -181,6 +193,7 @@ func main() {
 		Writer:           output,
 		Status:           stat,
 		CriticalPath:     criticalPath,
+		SigNumFunc:       sigNumFunc,
 	}}
 
 	config := c.config(buildCtx, args...)
@@ -207,6 +220,9 @@ func main() {
 	defer func() {
 		emet.Finish(build.ExecutionMetricsFinishAdaptor{buildCtx})
 		stat.Finish()
+		for _, str := range buildCtx.FinalStdout {
+			fmt.Fprint(c.stdio().Stdout(), str)
+		}
 		criticalPath.WriteToMetrics(met)
 		met.Dump(soongMetricsFile)
 		emet.Dump(executionMetricsFile, args)
@@ -240,6 +256,36 @@ func main() {
 	preProductConfigSetup(buildCtx, config)
 
 	c.run(buildCtx, config, args)
+
+	writeBuildDiskUsageMetrics(met, config)
+}
+
+// Writes disk usage of Build analysis (e.g. ninja files or incremental analysis cache DB)
+// TODO (b/454665418): Add incremental analysis cache *.db file size
+func writeBuildDiskUsageMetrics(m *metrics.Metrics, config build.Config) {
+	// Sum of all ninja files.
+	var ninjaFileSize int64 = 0
+	var ninjaFiles []string
+	soongNinjaFile := config.SoongNinjaFile()
+	if _, err := os.Stat(soongNinjaFile); err != nil {
+		// Skip if the soong ninja file does not exist.
+		// This would be true in dump var mode.
+		return
+	}
+	ninjaFiles = append(ninjaFiles, soongNinjaFile)
+	ninjaFiles = append(ninjaFiles, blueprint.GetNinjaShardFiles(soongNinjaFile)...)
+	if !config.SkipKatiNinja() && config.HasKatiSuffix() {
+		ninjaFiles = append(ninjaFiles, config.KatiBuildNinjaFile())
+	}
+	for _, file := range ninjaFiles {
+		fileInfo, err := os.Stat(file)
+		if err != nil {
+			panic(fmt.Errorf("Could not open %s due to %s\n", file, err))
+		} else {
+			ninjaFileSize += fileInfo.Size()
+		}
+	}
+	m.SetNinjaFileSize(&ninjaFileSize)
 }
 
 // This function must not modify config, since product config may cause us to recreate the config,
@@ -301,6 +347,8 @@ func preProductConfigSetup(buildCtx build.Context, config build.Config) {
 	// if the job is iterating over a large number of lunch targets.
 	if !build.OsEnvironment().IsEnvTrue("_SOONG_INTERNAL_NO_FINDER") {
 		// Create a source finder.
+		e := buildCtx.BeginTrace(metrics.RunSetupTool, "Run finder")
+		defer e.End()
 		f := build.NewSourceFinder(buildCtx, config)
 		defer f.Shutdown()
 		build.FindSources(buildCtx, config, f)

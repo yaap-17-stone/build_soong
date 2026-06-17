@@ -195,7 +195,7 @@ func TestAndroidAppImport_SigningLineage(t *testing.T) {
 
 	// Check cert signing flags.
 	actualCertSigningFlags := signedApk.Args["flags"]
-	expectedCertSigningFlags := "--lineage lineage.bin --rotation-min-sdk-version 32"
+	expectedCertSigningFlags := "--lineage lineage.bin --rotation-min-sdk-version 32 --disable-v1"
 	if expectedCertSigningFlags != actualCertSigningFlags {
 		t.Errorf("Incorrect signing flags, expected: %q, got: %q", expectedCertSigningFlags, actualCertSigningFlags)
 	}
@@ -228,7 +228,7 @@ func TestAndroidAppImport_SigningLineageFilegroup(t *testing.T) {
 	signedApk := variant.Output("signed/foo.apk")
 	// Check cert signing lineage flag.
 	signingFlag := signedApk.Args["flags"]
-	expected := "--lineage lineage.bin"
+	expected := "--lineage lineage.bin --disable-v1"
 	if expected != signingFlag {
 		t.Errorf("Incorrect signing flags, expected: %q, got: %q", expected, signingFlag)
 	}
@@ -850,13 +850,13 @@ func TestAndroidTestImport_NoJinUncompressForPresigned(t *testing.T) {
 
 	variant := ctx.ModuleForTests(t, "foo", "android_common")
 	jniRule := variant.Output("jnis-uncompressed/foo.apk").BuildParams.Rule.String()
-	if jniRule == android.Cp.String() {
+	if jniRule == android.CpRule.String() {
 		t.Errorf("Unexpected JNI uncompress rule command: %s", jniRule)
 	}
 
 	variant = ctx.ModuleForTests(t, "foo_presigned", "android_common")
 	jniRule = variant.Output("jnis-uncompressed/foo_presigned.apk").BuildParams.Rule.String()
-	if jniRule != android.Cp.String() {
+	if jniRule != android.CpRule.String() {
 		t.Errorf("Unexpected JNI uncompress rule: %s", jniRule)
 	}
 	if variant.MaybeOutput("zip-aligned/foo_presigned.apk").Rule == nil {
@@ -878,7 +878,7 @@ func TestAndroidTestImport_Preprocessed(t *testing.T) {
 	apkName := "foo.apk"
 	variant := ctx.ModuleForTests(t, "foo", "android_common")
 	jniRule := variant.Output("jnis-uncompressed/" + apkName).BuildParams.Rule.String()
-	if jniRule != android.Cp.String() {
+	if jniRule != android.CpRule.String() {
 		t.Errorf("Unexpected JNI uncompress rule: %s", jniRule)
 	}
 
@@ -923,7 +923,7 @@ func TestAndroidAppImport_Preprocessed(t *testing.T) {
 			apkName := "foo.apk"
 			variant := result.ModuleForTests(t, "foo", "android_common")
 			outputBuildParams := variant.Output(apkName).BuildParams
-			if outputBuildParams.Rule.String() != android.Cp.String() {
+			if outputBuildParams.Rule.String() != android.CpRule.String() {
 				t.Errorf("Unexpected prebuilt android_app_import rule: %s", outputBuildParams.Rule.String())
 			}
 
@@ -945,7 +945,7 @@ func TestAndroidAppImport_Preprocessed(t *testing.T) {
 			apkName = "bar.apk"
 			variant = result.ModuleForTests(t, "bar", "android_common")
 			outputBuildParams = variant.Output(apkName).BuildParams
-			if outputBuildParams.Rule.String() != android.Cp.String() {
+			if outputBuildParams.Rule.String() != android.CpRule.String() {
 				t.Errorf("Unexpected prebuilt android_app_import rule: %s", outputBuildParams.Rule.String())
 			}
 
