@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -314,6 +315,9 @@ func parseAvailableEnv() map[string]string {
 }
 
 func main() {
+	debug.SetMemoryLimit(40 * 1024 * 1024 * 1024)
+	debug.SetGCPercent(25)
+
 	flag.Parse()
 
 	if cmdlineArgs.Memprofile == "" {
